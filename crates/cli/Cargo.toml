@@ -1,0 +1,19 @@
+[package]
+name = "megadrive-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+megadrive-core = { path = "../core" }
+sdl2 = { version = "0.38", features = ["bundled"] }
+
+[[bin]]
+name = "megadrive-cli"
+path = "src/main.rs"
+bench = false
+
+[[bin]]
+name = "opcode_profile"
+path = "src/bin/opcode_profile.rs"
+test = false
+bench = false
