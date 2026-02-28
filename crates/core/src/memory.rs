@@ -60,6 +60,10 @@ pub struct MemoryMap {
     vdp: Vdp,
     vdp_data_write_latch: u16,
     vdp_control_write_latch: u16,
+    vdp_data_byte_writes: u64,
+    vdp_data_word_writes: u64,
+    vdp_control_byte_writes: u64,
+    vdp_control_word_writes: u64,
     io: IoBus,
     z80: Z80,
     audio: AudioBus,
@@ -79,6 +83,10 @@ impl MemoryMap {
             vdp: Vdp::new(),
             vdp_data_write_latch: 0,
             vdp_control_write_latch: 0,
+            vdp_data_byte_writes: 0,
+            vdp_data_word_writes: 0,
+            vdp_control_byte_writes: 0,
+            vdp_control_word_writes: 0,
             io: IoBus::new(),
             z80: Z80::new(),
             audio: AudioBus::new(),
@@ -104,6 +112,12 @@ impl MemoryMap {
 
     pub fn request_z80_interrupt(&mut self) {
         self.z80.request_interrupt();
+    }
+
+    pub fn pulse_external_reset(&mut self) {
+        // 68000 RESET drives external reset low, then releases it.
+        self.z80.write_reset_byte(0x00);
+        self.z80.write_reset_byte(0x01);
     }
 
     pub fn audio(&self) -> &AudioBus {
@@ -160,6 +174,22 @@ impl MemoryMap {
 
     pub fn dma_trace(&self) -> Vec<DmaTraceEntry> {
         self.dma_trace.iter().copied().collect()
+    }
+
+    pub fn vdp_data_byte_writes(&self) -> u64 {
+        self.vdp_data_byte_writes
+    }
+
+    pub fn vdp_data_word_writes(&self) -> u64 {
+        self.vdp_data_word_writes
+    }
+
+    pub fn vdp_control_byte_writes(&self) -> u64 {
+        self.vdp_control_byte_writes
+    }
+
+    pub fn vdp_control_word_writes(&self) -> u64 {
+        self.vdp_control_word_writes
     }
 
     pub fn read_u8(&mut self, addr: u32) -> u8 {
@@ -221,10 +251,12 @@ impl MemoryMap {
             };
             match port {
                 VdpPort::Data => {
+                    self.vdp_data_byte_writes = self.vdp_data_byte_writes.saturating_add(1);
                     self.vdp_data_write_latch = next;
                     self.vdp.write_data_port(next);
                 }
                 VdpPort::Control => {
+                    self.vdp_control_byte_writes = self.vdp_control_byte_writes.saturating_add(1);
                     self.vdp_control_write_latch = next;
                     self.vdp.write_control_port(next);
                     self.run_pending_vdp_dma();
@@ -241,10 +273,12 @@ impl MemoryMap {
         if let Some(port) = decode_vdp_port(addr) {
             match port {
                 VdpPort::Data => {
+                    self.vdp_data_word_writes = self.vdp_data_word_writes.saturating_add(1);
                     self.vdp_data_write_latch = value;
                     self.vdp.write_data_port(value);
                 }
                 VdpPort::Control => {
+                    self.vdp_control_word_writes = self.vdp_control_word_writes.saturating_add(1);
                     self.vdp_control_write_latch = value;
                     self.vdp.write_control_port(value);
                     self.run_pending_vdp_dma();
@@ -473,6 +507,21 @@ mod tests {
 
         memory.write_u16(0xA11200, 0x0100);
         assert_eq!(memory.read_u16(0xA11200), 0x0100);
+    }
+
+    #[test]
+    fn pulse_external_reset_restarts_z80_core() {
+        let cart = Cartridge::from_bytes(vec![0; 0x200]).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        memory.write_u16(0xA11200, 0x0100); // release reset
+        memory.write_u16(0xA11100, 0x0000); // ensure bus is owned by Z80
+        memory.step_subsystems(40);
+        assert!(memory.z80().pc() > 0);
+
+        memory.pulse_external_reset();
+        assert_eq!(memory.z80().read_reset_byte(), 0x01);
+        assert_eq!(memory.z80().pc(), 0);
     }
 
     #[test]

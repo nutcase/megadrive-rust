@@ -7,6 +7,20 @@ use megadrive_core::cpu::M68k;
 use megadrive_core::input::Button;
 use megadrive_core::memory::MemoryMap;
 
+#[derive(Debug, Clone, Copy)]
+struct InputEvent {
+    frame: u64,
+    player: u8,
+    button: Button,
+    pressed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CliArgs {
+    rom_path: String,
+    steps: usize,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err}");
@@ -15,24 +29,9 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let mut args = env::args();
-    let _ = args.next();
-
-    let rom_path = match args.next() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "usage: cargo run -p megadrive-cli --bin opcode_profile -- <rom-path> [steps]"
-            );
-            std::process::exit(1);
-        }
-    };
-    let steps: usize = args
-        .next()
-        .as_deref()
-        .map(str::parse)
-        .transpose()?
-        .unwrap_or(2_000_000);
+    let cli = parse_cli_args(env::args().skip(1))?;
+    let rom_path = cli.rom_path;
+    let steps = cli.steps;
     let stop_on_unknown = env::var("STOP_ON_UNKNOWN").is_ok();
     let stop_on_bad_pc = env::var("STOP_ON_BAD_PC").is_ok();
     let stop_on_pc = env::var("STOP_ON_PC")
@@ -53,7 +52,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     let force_b094_sticky = env::var("FORCE_B094_STICKY").is_ok();
     let disable_sprites = env::var("DISABLE_SPRITES").is_ok();
     let force_window_off = env::var("FORCE_WINDOW_OFF").is_ok();
+    let dump_line_state = env::var("DUMP_LINE_STATE").is_ok();
     let dump_frame_path = env::var("DUMP_FRAME").ok();
+    let mut input_events = env::var("INPUT_SCRIPT")
+        .ok()
+        .map(|value| parse_input_script(&value))
+        .unwrap_or_default();
+    input_events.sort_by_key(|event| event.frame);
+    let mut next_input_event = 0usize;
 
     let rom = std::fs::read(&rom_path)?;
     let cart = Cartridge::from_bytes(rom)?;
@@ -79,6 +85,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut watch_trace_lines = 0usize;
 
     for step_idx in 0..steps {
+        while next_input_event < input_events.len()
+            && input_events[next_input_event].frame <= memory.frame_count()
+        {
+            let event = input_events[next_input_event];
+            if event.player == 2 {
+                memory.set_button2_pressed(event.button, event.pressed);
+            } else {
+                memory.set_button_pressed(event.button, event.pressed);
+            }
+            next_input_event += 1;
+        }
+
         let pc_before = cpu.pc();
         if force_b094_sticky {
             memory.write_u32(0xFFFF_B094, 0x0000_50B2);
@@ -226,6 +244,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         memory.audio().ym2612().active_channels()
     );
     let pending_audio = memory.pending_audio_samples();
+    let stale_audio = pending_audio.saturating_sub(4096);
+    if stale_audio > 0 {
+        let _ = memory.drain_audio_samples(stale_audio);
+    }
     let audio_probe = memory.drain_audio_samples(4096);
     let audio_nonzero = audio_probe.iter().filter(|&&sample| sample != 0).count();
     let audio_peak = audio_probe
@@ -271,7 +293,19 @@ fn run() -> Result<(), Box<dyn Error>> {
         framebuffer_unique_colors(memory.frame_buffer())
     );
     print_vdp_snapshot(&memory);
+    println!(
+        "vdp writes      : data byte={} word={} control byte={} word={} fill={} copy={}",
+        memory.vdp_data_byte_writes(),
+        memory.vdp_data_word_writes(),
+        memory.vdp_control_byte_writes(),
+        memory.vdp_control_word_writes(),
+        memory.vdp().dma_fill_ops(),
+        memory.vdp().dma_copy_ops()
+    );
     print_video_memory_snapshot(&memory);
+    if dump_line_state {
+        print_vdp_line_state_snapshot(&memory);
+    }
     print_dma_trace(&memory);
     print_ram_snapshot(&mut memory);
 
@@ -364,6 +398,51 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Box<dyn Error>> {
+    let mut rom_path: Option<String> = None;
+    let mut steps: Option<usize> = None;
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--steps" | "-s" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "missing value for --steps".to_string())?;
+                let parsed = value.parse::<usize>()?;
+                steps = Some(parsed);
+            }
+            "--help" | "-h" => {
+                eprintln!(
+                    "usage: cargo run -p megadrive-cli --bin opcode_profile -- <rom-path> [steps]\n       cargo run -p megadrive-cli --bin opcode_profile -- <rom-path> --steps <n>"
+                );
+                std::process::exit(0);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(format!("unknown option: {arg}").into());
+            }
+            _ => {
+                if rom_path.is_none() {
+                    rom_path = Some(arg);
+                } else if steps.is_none() {
+                    steps = Some(arg.parse::<usize>()?);
+                } else {
+                    return Err(format!("unexpected positional argument: {arg}").into());
+                }
+            }
+        }
+    }
+
+    let rom_path = rom_path.ok_or_else(|| {
+        "usage: cargo run -p megadrive-cli --bin opcode_profile -- <rom-path> [steps]".to_string()
+    })?;
+
+    Ok(CliArgs {
+        rom_path,
+        steps: steps.unwrap_or(2_000_000),
+    })
 }
 
 fn framebuffer_hash(data: &[u8]) -> u64 {
@@ -539,6 +618,94 @@ fn print_video_memory_snapshot(memory: &MemoryMap) {
     );
 }
 
+fn print_vdp_line_state_snapshot(memory: &MemoryMap) {
+    let vdp = memory.vdp();
+    println!("line state      : y r1 r2 r3 r4 r11 r13 r16 vs0 vs1 hsA hsB");
+    for &y in &[0usize, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 223] {
+        let hs = vdp.line_hscroll_words(y);
+        println!(
+            "                  {:03} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:04X} {:04X} {:04X} {:04X}",
+            y,
+            vdp.line_register(y, 1),
+            vdp.line_register(y, 2),
+            vdp.line_register(y, 3),
+            vdp.line_register(y, 4),
+            vdp.line_register(y, 11),
+            vdp.line_register(y, 13),
+            vdp.line_register(y, 16),
+            vdp.line_vsram_u16(y, 0),
+            vdp.line_vsram_u16(y, 1),
+            hs[0],
+            hs[1]
+        );
+    }
+
+    let mut changes = 0usize;
+    let mut prev_r1 = vdp.line_register(0, 1);
+    let mut prev_r2 = vdp.line_register(0, 2);
+    let mut prev_r3 = vdp.line_register(0, 3);
+    let mut prev_r4 = vdp.line_register(0, 4);
+    let mut prev_r11 = vdp.line_register(0, 11);
+    let mut prev_r13 = vdp.line_register(0, 13);
+    let mut prev_r16 = vdp.line_register(0, 16);
+    let mut prev_vs0 = vdp.line_vsram_u16(0, 0);
+    let mut prev_vs1 = vdp.line_vsram_u16(0, 1);
+    let mut prev_hs = vdp.line_hscroll_words(0);
+    for y in 1..megadrive_core::FRAME_HEIGHT {
+        let r1 = vdp.line_register(y, 1);
+        let r2 = vdp.line_register(y, 2);
+        let r3 = vdp.line_register(y, 3);
+        let r4 = vdp.line_register(y, 4);
+        let r11 = vdp.line_register(y, 11);
+        let r13 = vdp.line_register(y, 13);
+        let r16 = vdp.line_register(y, 16);
+        let vs0 = vdp.line_vsram_u16(y, 0);
+        let vs1 = vdp.line_vsram_u16(y, 1);
+        let hs = vdp.line_hscroll_words(y);
+        if r1 != prev_r1
+            || r2 != prev_r2
+            || r3 != prev_r3
+            || r4 != prev_r4
+            || r11 != prev_r11
+            || r13 != prev_r13
+            || r16 != prev_r16
+            || vs0 != prev_vs0
+            || vs1 != prev_vs1
+            || hs != prev_hs
+        {
+            if changes < 24 {
+                println!(
+                    "                  change@{:03}: r1 {:02X}->{:02X} r2 {:02X}->{:02X} r3 {:02X}->{:02X} r4 {:02X}->{:02X} r11 {:02X}->{:02X} r13 {:02X}->{:02X} r16 {:02X}->{:02X} vs0 {:04X}->{:04X} vs1 {:04X}->{:04X} hsA {:04X}->{:04X} hsB {:04X}->{:04X}",
+                    y,
+                    prev_r1, r1,
+                    prev_r2, r2,
+                    prev_r3, r3,
+                    prev_r4, r4,
+                    prev_r11, r11,
+                    prev_r13, r13,
+                    prev_r16, r16,
+                    prev_vs0, vs0,
+                    prev_vs1, vs1,
+                    prev_hs[0], hs[0],
+                    prev_hs[1], hs[1]
+                );
+            }
+            changes += 1;
+            prev_r1 = r1;
+            prev_r2 = r2;
+            prev_r3 = r3;
+            prev_r4 = r4;
+            prev_r11 = r11;
+            prev_r13 = r13;
+            prev_r16 = r16;
+            prev_vs0 = vs0;
+            prev_vs1 = vs1;
+            prev_hs = hs;
+        }
+    }
+    println!("line changes    : {}", changes);
+}
+
 fn print_dma_trace(memory: &MemoryMap) {
     let trace = memory.dma_trace();
     if trace.is_empty() {
@@ -584,6 +751,38 @@ fn parse_u32_value(value: &str) -> Option<u32> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::parse_cli_args;
+
+    #[test]
+    fn parse_cli_args_accepts_positional_steps() {
+        let args = vec!["roms/Sonic.md".to_string(), "123".to_string()];
+        let parsed = parse_cli_args(args).expect("must parse");
+        assert_eq!(parsed.rom_path, "roms/Sonic.md");
+        assert_eq!(parsed.steps, 123);
+    }
+
+    #[test]
+    fn parse_cli_args_accepts_flag_steps() {
+        let args = vec![
+            "roms/Sonic.md".to_string(),
+            "--steps".to_string(),
+            "456".to_string(),
+        ];
+        let parsed = parse_cli_args(args).expect("must parse");
+        assert_eq!(parsed.rom_path, "roms/Sonic.md");
+        assert_eq!(parsed.steps, 456);
+    }
+
+    #[test]
+    fn parse_cli_args_rejects_unknown_option() {
+        let args = vec!["roms/Sonic.md".to_string(), "--bad".to_string()];
+        let err = parse_cli_args(args).expect_err("must fail");
+        assert!(err.to_string().contains("unknown option"));
+    }
+}
+
 fn parse_addr_list(value: &str) -> Vec<u32> {
     let mut addrs = BTreeSet::new();
     for part in value.split(',') {
@@ -592,6 +791,68 @@ fn parse_addr_list(value: &str) -> Vec<u32> {
         }
     }
     addrs.into_iter().collect()
+}
+
+fn parse_input_script(value: &str) -> Vec<InputEvent> {
+    let mut events = Vec::new();
+    for raw in value.split(';') {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = token.split(',').map(|part| part.trim()).collect();
+        if parts.len() != 4 {
+            continue;
+        }
+
+        let frame = match parts[0].parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let player = if parts[1].eq_ignore_ascii_case("P2") || parts[1] == "2" {
+            2
+        } else {
+            1
+        };
+        let button = match parse_button(parts[2]) {
+            Some(button) => button,
+            None => continue,
+        };
+        let pressed = match parts[3] {
+            "1" | "on" | "ON" | "down" | "DOWN" => true,
+            "0" | "off" | "OFF" | "up" | "UP" => false,
+            _ => continue,
+        };
+        events.push(InputEvent {
+            frame,
+            player,
+            button,
+            pressed,
+        });
+    }
+    events
+}
+
+fn parse_button(value: &str) -> Option<Button> {
+    if value.eq_ignore_ascii_case("UP") {
+        Some(Button::Up)
+    } else if value.eq_ignore_ascii_case("DOWN") {
+        Some(Button::Down)
+    } else if value.eq_ignore_ascii_case("LEFT") {
+        Some(Button::Left)
+    } else if value.eq_ignore_ascii_case("RIGHT") {
+        Some(Button::Right)
+    } else if value.eq_ignore_ascii_case("A") {
+        Some(Button::A)
+    } else if value.eq_ignore_ascii_case("B") {
+        Some(Button::B)
+    } else if value.eq_ignore_ascii_case("C") {
+        Some(Button::C)
+    } else if value.eq_ignore_ascii_case("START") {
+        Some(Button::Start)
+    } else {
+        None
+    }
 }
 
 fn dump_frame_ppm(path: &str, rgb: &[u8]) -> Result<(), Box<dyn Error>> {

@@ -1,17 +1,21 @@
 pub const FRAME_WIDTH: usize = 320;
-pub const FRAME_HEIGHT: usize = 224;
+pub const FRAME_HEIGHT: usize = 240;
+const FRAME_WIDTH_32_CELL: usize = 256;
+const FRAME_HEIGHT_28_CELL: usize = 224;
 
 const VRAM_SIZE: usize = 0x10000;
 const CRAM_COLORS: usize = 64;
 const VSRAM_WORDS: usize = 40;
 const TILE_SIZE_BYTES: usize = 32;
 const REG_COUNT: usize = 0x20;
+const REG_MODE_SET_1: usize = 0;
 const REG_MODE_SET_2: usize = 1;
 const REG_PLANE_A_NAMETABLE: usize = 2;
 const REG_WINDOW_NAMETABLE: usize = 3;
 const REG_PLANE_B_NAMETABLE: usize = 4;
 const REG_SPRITE_TABLE: usize = 5;
 const REG_BACKGROUND_COLOR: usize = 7;
+const REG_H_INTERRUPT_COUNTER: usize = 10;
 const REG_HSCROLL_TABLE: usize = 13;
 const REG_WINDOW_HPOS: usize = 17;
 const REG_WINDOW_VPOS: usize = 18;
@@ -72,17 +76,24 @@ pub struct Vdp {
     vblank: bool,
     sprite_collision: bool,
     sprite_overflow: bool,
+    h_interrupt_pending: bool,
     v_interrupt_pending: bool,
+    h_interrupt_counter: u8,
     vram: [u8; VRAM_SIZE],
     cram: [u16; CRAM_COLORS],
     vsram: [u16; VSRAM_WORDS],
     frame_buffer: Vec<u8>,
     registers: [u8; REG_COUNT],
+    line_registers: [[u8; REG_COUNT]; FRAME_HEIGHT],
+    line_vsram: [[u16; VSRAM_WORDS]; FRAME_HEIGHT],
+    line_hscroll: [[u16; 2]; FRAME_HEIGHT],
     control_latch: Option<u16>,
     access_addr: u16,
     access_mode: AccessMode,
     dma_fill_pending: Option<DmaFillState>,
     dma_bus_pending: Option<BusDmaRequest>,
+    dma_fill_ops: u64,
+    dma_copy_ops: u64,
 }
 
 impl Default for Vdp {
@@ -92,9 +103,9 @@ impl Default for Vdp {
         registers[REG_PLANE_A_NAMETABLE] = 0x30; // Plane A name table base: 0xC000
         registers[REG_SPRITE_TABLE] = 0x70; // Sprite attribute table base: 0xE000
         registers[REG_HSCROLL_TABLE] = 0x3C; // Horizontal scroll table base: 0xF000
-        // Window off by default (left/up split at 0 => empty region).
-        registers[REG_WINDOW_HPOS] = 0x00;
-        registers[REG_WINDOW_VPOS] = 0x00;
+        // Window off by default.
+        registers[REG_WINDOW_HPOS] = 0x80;
+        registers[REG_WINDOW_VPOS] = 0x80;
         registers[REG_AUTO_INCREMENT] = 2; // Word access by default
 
         let mut vdp = Self {
@@ -103,20 +114,29 @@ impl Default for Vdp {
             vblank: false,
             sprite_collision: false,
             sprite_overflow: false,
+            h_interrupt_pending: false,
             v_interrupt_pending: false,
+            h_interrupt_counter: registers[REG_H_INTERRUPT_COUNTER],
             vram: [0; VRAM_SIZE],
             cram: [0; CRAM_COLORS],
             vsram: [0; VSRAM_WORDS],
             frame_buffer: vec![0; FRAME_WIDTH * FRAME_HEIGHT * 3],
             registers,
+            line_registers: [[0; REG_COUNT]; FRAME_HEIGHT],
+            line_vsram: [[0; VSRAM_WORDS]; FRAME_HEIGHT],
+            line_hscroll: [[0; 2]; FRAME_HEIGHT],
             control_latch: None,
             access_addr: 0,
             access_mode: AccessMode::default(),
             dma_fill_pending: None,
             dma_bus_pending: None,
+            dma_fill_ops: 0,
+            dma_copy_ops: 0,
         };
+        vdp.reset_line_state();
         vdp.seed_demo_scene();
         vdp.render_frame();
+        vdp.capture_line_state(0);
         vdp
     }
 }
@@ -131,18 +151,34 @@ impl Vdp {
     }
 
     pub fn step(&mut self, cpu_cycles: u32) -> bool {
-        self.frame_cycles += cpu_cycles as u64;
-        if self.frame_cycles >= Self::CYCLES_PER_FRAME {
-            self.frame_cycles -= Self::CYCLES_PER_FRAME;
-            self.frame_count += 1;
-            self.vblank = true;
-            if self.v_interrupt_enabled() {
-                self.v_interrupt_pending = true;
+        let mut remaining = cpu_cycles as u64;
+        let mut frame_ready = false;
+
+        while remaining > 0 {
+            let until_frame_end = Self::CYCLES_PER_FRAME - self.frame_cycles;
+            let advance = remaining.min(until_frame_end);
+            let start = self.frame_cycles;
+            let end = self.frame_cycles + advance;
+            self.process_line_crossings(start, end);
+            self.frame_cycles = end;
+            remaining -= advance;
+
+            if self.frame_cycles >= Self::CYCLES_PER_FRAME {
+                self.frame_cycles = 0;
+                self.frame_count += 1;
+                self.vblank = true;
+                if self.v_interrupt_enabled() {
+                    self.v_interrupt_pending = true;
+                }
+                self.render_frame();
+                self.h_interrupt_counter = self.registers[REG_H_INTERRUPT_COUNTER];
+                self.reset_line_state();
+                self.capture_line_state(0);
+                frame_ready = true;
             }
-            self.render_frame();
-            return true;
         }
-        false
+
+        frame_ready
     }
 
     pub fn frame_count(&self) -> u64 {
@@ -157,17 +193,53 @@ impl Vdp {
         self.registers.get(index).copied().unwrap_or(0)
     }
 
+    pub fn line_register(&self, line: usize, index: usize) -> u8 {
+        if line < FRAME_HEIGHT && index < REG_COUNT {
+            self.line_registers[line][index]
+        } else {
+            0
+        }
+    }
+
+    pub fn line_vsram_u16(&self, line: usize, index: usize) -> u16 {
+        if line < FRAME_HEIGHT && index < VSRAM_WORDS {
+            self.line_vsram[line][index]
+        } else {
+            0
+        }
+    }
+
+    pub fn line_hscroll_words(&self, line: usize) -> [u16; 2] {
+        if line < FRAME_HEIGHT {
+            self.line_hscroll[line]
+        } else {
+            [0; 2]
+        }
+    }
+
     pub fn pending_interrupt_level(&self) -> Option<u8> {
         if self.v_interrupt_pending {
             Some(6)
+        } else if self.h_interrupt_pending {
+            Some(4)
         } else {
             None
         }
     }
 
+    pub fn dma_fill_ops(&self) -> u64 {
+        self.dma_fill_ops
+    }
+
+    pub fn dma_copy_ops(&self) -> u64 {
+        self.dma_copy_ops
+    }
+
     pub fn acknowledge_interrupt(&mut self, level: u8) {
         if level == 6 {
             self.v_interrupt_pending = false;
+        } else if level == 4 {
+            self.h_interrupt_pending = false;
         }
     }
 
@@ -195,6 +267,66 @@ impl Vdp {
         let v = ((self.frame_cycles / cycles_per_line) % Self::TOTAL_LINES) as u8;
         let h = ((self.frame_cycles % cycles_per_line) * 256 / cycles_per_line) as u8;
         u16::from_be_bytes([v, h])
+    }
+
+    fn process_line_crossings(&mut self, start: u64, end: u64) {
+        if end <= start {
+            return;
+        }
+        let start_line = self.line_index_for_cycle(start);
+        let end_line = self.line_index_for_cycle(end);
+        for line in (start_line + 1)..=end_line {
+            let line = line as usize;
+            // Latch display state for the following scanline.
+            self.capture_line_state(line.saturating_add(1));
+            self.on_scanline_start(line);
+        }
+    }
+
+    fn line_index_for_cycle(&self, cycle: u64) -> u64 {
+        let clamped = cycle.min(Self::CYCLES_PER_FRAME);
+        (clamped * Self::TOTAL_LINES) / Self::CYCLES_PER_FRAME
+    }
+
+    fn reset_line_state(&mut self) {
+        for line in 0..FRAME_HEIGHT {
+            self.line_registers[line] = self.registers;
+            self.line_vsram[line] = self.vsram;
+            self.line_hscroll[line] = self.current_line_hscroll_words(line, &self.registers);
+        }
+    }
+
+    fn capture_line_state(&mut self, line: usize) {
+        if line < FRAME_HEIGHT {
+            self.line_registers[line] = self.registers;
+            self.line_vsram[line] = self.vsram;
+            self.line_hscroll[line] = self.current_line_hscroll_words(line, &self.registers);
+        }
+    }
+
+    fn current_line_hscroll_words(&self, line: usize, regs: &[u8; REG_COUNT]) -> [u16; 2] {
+        let hscroll_base = Self::hscroll_table_base_from_regs(regs);
+        let a_idx = Self::hscroll_word_index_for_line_from_regs(regs, 0, line);
+        let b_idx = Self::hscroll_word_index_for_line_from_regs(regs, 1, line);
+        [
+            read_u16_be_wrapped(&self.vram, hscroll_base + a_idx * 2),
+            read_u16_be_wrapped(&self.vram, hscroll_base + b_idx * 2),
+        ]
+    }
+
+    fn on_scanline_start(&mut self, line: usize) {
+        if line >= self.active_display_height() {
+            return;
+        }
+
+        if self.h_interrupt_counter == 0 {
+            if self.h_interrupt_enabled() {
+                self.h_interrupt_pending = true;
+            }
+            self.h_interrupt_counter = self.registers[REG_H_INTERRUPT_COUNTER];
+        } else {
+            self.h_interrupt_counter = self.h_interrupt_counter.wrapping_sub(1);
+        }
     }
 
     pub fn write_control_port(&mut self, value: u16) {
@@ -250,6 +382,10 @@ impl Vdp {
                 let [hi, lo] = value.to_be_bytes();
                 self.vram[addr % VRAM_SIZE] = hi;
                 self.vram[(addr + 1) % VRAM_SIZE] = lo;
+                if self.frame_cycles == 0 {
+                    self.reset_line_state();
+                    self.capture_line_state(0);
+                }
             }
             AccessMode::CramWrite => {
                 let index = ((self.access_addr >> 1) as usize) % CRAM_COLORS;
@@ -258,6 +394,10 @@ impl Vdp {
             AccessMode::VsramWrite => {
                 let index = ((self.access_addr >> 1) as usize) % VSRAM_WORDS;
                 self.vsram[index] = value & 0x07FF;
+                if self.frame_cycles == 0 {
+                    self.reset_line_state();
+                    self.capture_line_state(0);
+                }
             }
             AccessMode::VramRead
             | AccessMode::CramRead
@@ -272,6 +412,10 @@ impl Vdp {
 
     pub fn write_vram_u8(&mut self, addr: u16, value: u8) {
         self.vram[addr as usize] = value;
+        if self.frame_cycles == 0 {
+            self.reset_line_state();
+            self.capture_line_state(0);
+        }
     }
 
     pub fn read_cram_u16(&self, index: u8) -> u16 {
@@ -292,6 +436,10 @@ impl Vdp {
     pub fn write_vsram_u16(&mut self, index: u8, value: u16) {
         let i = (index as usize) % VSRAM_WORDS;
         self.vsram[i] = value & 0x07FF;
+        if self.frame_cycles == 0 {
+            self.reset_line_state();
+            self.capture_line_state(0);
+        }
     }
 
     pub(crate) fn take_bus_dma_request(&mut self) -> Option<BusDmaRequest> {
@@ -331,6 +479,10 @@ impl Vdp {
                 _ => value,
             };
             self.registers[reg] = masked;
+            if self.frame_cycles == 0 {
+                self.reset_line_state();
+                self.capture_line_state(0);
+            }
         }
     }
 
@@ -437,6 +589,7 @@ impl Vdp {
             // DMA fill: executes when the next data-port write provides fill value.
             0b10 => {
                 if self.access_mode == AccessMode::VramWrite {
+                    self.dma_fill_ops = self.dma_fill_ops.saturating_add(1);
                     self.dma_fill_pending = Some(DmaFillState {
                         remaining_words: self.dma_length(),
                     });
@@ -445,6 +598,7 @@ impl Vdp {
             // DMA copy: immediate VRAM-to-VRAM byte copy.
             0b11 => {
                 if base_code == 0x01 && self.access_mode == AccessMode::VramWrite {
+                    self.dma_copy_ops = self.dma_copy_ops.saturating_add(1);
                     self.execute_dma_copy();
                 }
             }
@@ -454,10 +608,16 @@ impl Vdp {
     }
 
     fn execute_dma_fill(&mut self, words: usize, value: u16) {
+        let fill_byte = (value & 0x00FF) as u8;
         let increment = self.auto_increment();
         for _ in 0..words {
-            self.write_data_value(value);
+            let addr = self.access_addr as usize % VRAM_SIZE;
+            self.vram[addr] = fill_byte;
             self.access_addr = self.access_addr.wrapping_add(increment);
+        }
+        if self.frame_cycles == 0 {
+            self.reset_line_state();
+            self.capture_line_state(0);
         }
         self.clear_dma_length();
     }
@@ -534,66 +694,71 @@ impl Vdp {
     }
 
     fn nametable_base(&self) -> usize {
-        ((self.registers[REG_PLANE_A_NAMETABLE] as usize & 0x38) << 10) % VRAM_SIZE
-    }
-
-    fn plane_b_nametable_base(&self) -> usize {
-        ((self.registers[REG_PLANE_B_NAMETABLE] as usize & 0x07) << 13) % VRAM_SIZE
-    }
-
-    fn hscroll_table_base(&self) -> usize {
-        ((self.registers[REG_HSCROLL_TABLE] as usize & 0x3F) << 10) % VRAM_SIZE
-    }
-
-    fn window_nametable_base(&self) -> usize {
-        ((self.registers[REG_WINDOW_NAMETABLE] as usize & 0x3E) << 10) % VRAM_SIZE
+        Self::nametable_base_from_regs(&self.registers)
     }
 
     fn sprite_table_base(&self) -> usize {
-        ((self.registers[REG_SPRITE_TABLE] as usize & 0x7F) << 9) % VRAM_SIZE
+        // In H40 mode the SAT base is 1KB aligned (bit0 ignored).
+        let mask = if self.h40_mode() { 0x7E } else { 0x7F };
+        ((self.registers[REG_SPRITE_TABLE] as usize & mask) << 9) % VRAM_SIZE
     }
 
     fn plane_tile_dimensions(&self) -> (usize, usize) {
-        let width_code = self.registers[REG_PLANE_SIZE] & 0x03;
-        let height_code = (self.registers[REG_PLANE_SIZE] >> 4) & 0x03;
+        Self::plane_tile_dimensions_from_regs(&self.registers)
+    }
+
+    fn nametable_base_from_regs(regs: &[u8; REG_COUNT]) -> usize {
+        ((regs[REG_PLANE_A_NAMETABLE] as usize & 0x38) << 10) % VRAM_SIZE
+    }
+
+    fn plane_b_nametable_base_from_regs(regs: &[u8; REG_COUNT]) -> usize {
+        ((regs[REG_PLANE_B_NAMETABLE] as usize & 0x07) << 13) % VRAM_SIZE
+    }
+
+    fn hscroll_table_base_from_regs(regs: &[u8; REG_COUNT]) -> usize {
+        ((regs[REG_HSCROLL_TABLE] as usize & 0x3F) << 10) % VRAM_SIZE
+    }
+
+    fn window_nametable_base_from_regs(regs: &[u8; REG_COUNT]) -> usize {
+        let mask = if Self::h40_mode_from_regs(regs) {
+            0x3C
+        } else {
+            0x3E
+        };
+        ((regs[REG_WINDOW_NAMETABLE] as usize & mask) << 10) % VRAM_SIZE
+    }
+
+    fn plane_tile_dimensions_from_regs(regs: &[u8; REG_COUNT]) -> (usize, usize) {
+        let width_code = regs[REG_PLANE_SIZE] & 0x03;
+        let height_code = (regs[REG_PLANE_SIZE] >> 4) & 0x03;
         (
             plane_size_code_to_tiles(width_code),
             plane_size_code_to_tiles(height_code),
         )
     }
 
-    fn plane_scroll(
-        &self,
-        hscroll_word_index: usize,
-        vsram_index: usize,
-        plane_width_px: usize,
-        plane_height_px: usize,
-    ) -> (usize, usize) {
-        let hscroll_addr = self.hscroll_table_base() + hscroll_word_index * 2;
-        let hscroll = read_u16_be_wrapped(&self.vram, hscroll_addr) as i16;
-        let vscroll = self.read_vsram_u16(vsram_index as u8) as i16;
-        (
-            normalize_scroll(hscroll, plane_width_px),
-            normalize_scroll(vscroll, plane_height_px),
-        )
+    fn window_tile_dimensions_from_regs(regs: &[u8; REG_COUNT]) -> (usize, usize) {
+        let width_tiles = if Self::h40_mode_from_regs(regs) {
+            64
+        } else {
+            32
+        };
+        (width_tiles, 32)
     }
 
-    fn vscroll_index_for_x(&self, plane: usize, x: usize) -> usize {
-        if (self.registers[11] & 0x04) == 0 {
+    fn vscroll_index_for_x_from_regs(regs: &[u8; REG_COUNT], plane: usize, x: usize) -> usize {
+        if (regs[11] & 0x04) == 0 {
             return plane;
         }
         ((x / 16) * 2 + plane) % VSRAM_WORDS
     }
 
-    fn plane_vscroll(&self, vsram_index: usize, plane_height_px: usize) -> usize {
-        normalize_scroll(
-            self.read_vsram_u16(vsram_index as u8) as i16,
-            plane_height_px,
-        )
-    }
-
-    fn hscroll_word_index_for_line(&self, plane: usize, y: usize) -> usize {
-        match self.registers[11] & 0x03 {
+    fn hscroll_word_index_for_line_from_regs(
+        regs: &[u8; REG_COUNT],
+        plane: usize,
+        y: usize,
+    ) -> usize {
+        match regs[11] & 0x03 {
             // Full-screen scroll (and reserved mode treated as full-screen).
             0x00 | 0x01 => plane,
             // 8-line strips.
@@ -611,13 +776,18 @@ impl Vdp {
         sample_y: usize,
         plane_width_tiles: usize,
         plane_height_tiles: usize,
+        scroll_plane_layout: bool,
     ) -> Option<PlaneSample> {
         let tile_x = (sample_x / 8) % plane_width_tiles.max(1);
         let tile_y = (sample_y / 8) % plane_height_tiles.max(1);
         let mut in_tile_x = sample_x & 7;
         let mut in_tile_y = sample_y & 7;
 
-        let name_addr = base + (tile_y * plane_width_tiles + tile_x) * 2;
+        let name_addr = if scroll_plane_layout {
+            self.scroll_plane_name_addr(base, tile_x, tile_y, plane_width_tiles, plane_height_tiles)
+        } else {
+            base + (tile_y * plane_width_tiles + tile_x) * 2
+        };
         let entry = read_u16_be_wrapped(&self.vram, name_addr);
         let tile_index = (entry & 0x07FF) as usize;
         let palette_line = ((entry >> 13) & 0x3) as usize;
@@ -649,6 +819,19 @@ impl Vdp {
         })
     }
 
+    fn scroll_plane_name_addr(
+        &self,
+        base: usize,
+        tile_x: usize,
+        tile_y: usize,
+        plane_width_tiles: usize,
+        plane_height_tiles: usize,
+    ) -> usize {
+        let wrapped_x = tile_x % plane_width_tiles.max(1);
+        let wrapped_y = tile_y % plane_height_tiles.max(1);
+        base + (wrapped_y * plane_width_tiles + wrapped_x) * 2
+    }
+
     fn compose_plane_samples(
         &self,
         front: Option<PlaneSample>,
@@ -672,15 +855,17 @@ impl Vdp {
         }
     }
 
-    fn window_active_at(&self, x: usize, y: usize) -> bool {
-        let hreg = self.registers[REG_WINDOW_HPOS];
-        let vreg = self.registers[REG_WINDOW_VPOS];
-        let hsplit = (((hreg & 0x1F) as usize) * 16).min(FRAME_WIDTH);
-        let vsplit = (((vreg & 0x1F) as usize) * 8).min(FRAME_HEIGHT);
+    fn window_active_at(&self, regs: &[u8; REG_COUNT], x: usize, y: usize) -> bool {
+        let active_height = Self::active_display_height_from_regs(regs);
+        let active_width = Self::active_display_width_from_regs(regs);
+        let hreg = regs[REG_WINDOW_HPOS];
+        let vreg = regs[REG_WINDOW_VPOS];
+        let hsplit = (((hreg & 0x1F) as usize) * 16).min(active_width);
+        let vsplit = (((vreg & 0x1F) as usize) * 8).min(active_height);
         let hactive = if (hreg & 0x80) != 0 {
-            x >= hsplit
-        } else {
             x < hsplit
+        } else {
+            x >= hsplit
         };
         let vactive = if (vreg & 0x80) != 0 {
             y >= vsplit
@@ -698,49 +883,77 @@ impl Vdp {
             return;
         }
 
-        let plane_a_base = self.nametable_base();
-        let plane_b_base = self.plane_b_nametable_base();
-        let window_base = self.window_nametable_base();
-        let (plane_width_tiles, plane_height_tiles) = self.plane_tile_dimensions();
-        let plane_width_px = plane_width_tiles * 8;
-        let plane_height_px = plane_height_tiles * 8;
+        let active_height = self.active_display_height();
+        let active_width = self.active_display_width();
+        let regs = self.registers;
         let mut plane_meta = vec![0u8; FRAME_WIDTH * FRAME_HEIGHT];
-        let bg_color_index = self.background_color_index();
         for y in 0..FRAME_HEIGHT {
-            let a_hscroll_word = self.hscroll_word_index_for_line(0, y);
-            let b_hscroll_word = self.hscroll_word_index_for_line(1, y);
-            let a_hscroll = self
-                .plane_scroll(a_hscroll_word, 0, plane_width_px, plane_height_px)
-                .0;
-            let b_hscroll = self
-                .plane_scroll(b_hscroll_word, 1, plane_width_px, plane_height_px)
-                .0;
+            let vsram = self.line_vsram.get(y).copied().unwrap_or(self.vsram);
+            let row = y * FRAME_WIDTH * 3;
+            let line_active_height = Self::active_display_height_from_regs(&regs);
+            if y >= line_active_height {
+                self.frame_buffer[row..row + FRAME_WIDTH * 3].fill(0);
+                continue;
+            }
+
+            let line_active_width = Self::active_display_width_from_regs(&regs);
+            let plane_a_base = Self::nametable_base_from_regs(&regs);
+            let plane_b_base = Self::plane_b_nametable_base_from_regs(&regs);
+            let window_base = Self::window_nametable_base_from_regs(&regs);
+            let (plane_width_tiles, plane_height_tiles) = Self::plane_tile_dimensions_from_regs(&regs);
+            let (window_width_tiles, window_height_tiles) = Self::window_tile_dimensions_from_regs(&regs);
+            let plane_width_px = plane_width_tiles * 8;
+            let plane_height_px = plane_height_tiles * 8;
+            let window_width_px = window_width_tiles * 8;
+            let window_height_px = window_height_tiles * 8;
+            let bg_color_index = Self::background_color_index_from_regs(&regs);
+
+            let hscroll_words = self.current_line_hscroll_words(y, &regs);
+            let a_hscroll = normalize_scroll(hscroll_words[0] as i16, plane_width_px);
+            let b_hscroll = normalize_scroll(hscroll_words[1] as i16, plane_width_px);
+
             for x in 0..FRAME_WIDTH {
-                let a_vscroll = self.plane_vscroll(self.vscroll_index_for_x(0, x), plane_height_px);
-                let b_vscroll = self.plane_vscroll(self.vscroll_index_for_x(1, x), plane_height_px);
+                if x >= line_active_width {
+                    let out = row + x * 3;
+                    self.frame_buffer[out] = 0;
+                    self.frame_buffer[out + 1] = 0;
+                    self.frame_buffer[out + 2] = 0;
+                    continue;
+                }
+                let a_vscroll = normalize_scroll(
+                    vsram[Self::vscroll_index_for_x_from_regs(&regs, 0, x) % VSRAM_WORDS] as i16,
+                    plane_height_px,
+                );
+                let b_vscroll = normalize_scroll(
+                    vsram[Self::vscroll_index_for_x_from_regs(&regs, 1, x) % VSRAM_WORDS] as i16,
+                    plane_height_px,
+                );
                 let plane_b = self.sample_plane_pixel(
                     plane_b_base,
-                    (x + b_hscroll) % plane_width_px,
+                    (x + plane_width_px - b_hscroll) % plane_width_px,
                     (y + b_vscroll) % plane_height_px,
                     plane_width_tiles,
                     plane_height_tiles,
+                    true,
                 );
 
-                let front_plane = if self.window_active_at(x, y) {
+                let front_plane = if self.window_active_at(&regs, x, y) {
                     self.sample_plane_pixel(
                         window_base,
-                        x % plane_width_px,
-                        y % plane_height_px,
-                        plane_width_tiles,
-                        plane_height_tiles,
+                        x % window_width_px,
+                        y % window_height_px,
+                        window_width_tiles,
+                        window_height_tiles,
+                        false,
                     )
                 } else {
                     self.sample_plane_pixel(
                         plane_a_base,
-                        (x + a_hscroll) % plane_width_px,
+                        (x + plane_width_px - a_hscroll) % plane_width_px,
                         (y + a_vscroll) % plane_height_px,
                         plane_width_tiles,
                         plane_height_tiles,
+                        true,
                     )
                 };
 
@@ -751,7 +964,7 @@ impl Vdp {
                 let color = self.cram[color_index % CRAM_COLORS];
                 let (r, g, b) = md_color_to_rgb888(color);
 
-                let out = (y * FRAME_WIDTH + x) * 3;
+                let out = row + x * 3;
                 self.frame_buffer[out] = r;
                 self.frame_buffer[out + 1] = g;
                 self.frame_buffer[out + 2] = b;
@@ -765,15 +978,16 @@ impl Vdp {
                 }
             }
         }
-        self.render_sprites(&plane_meta);
+
+        self.render_sprites(&plane_meta, active_width, active_height);
     }
 
-    fn render_sprites(&mut self, plane_meta: &[u8]) {
+    fn render_sprites(&mut self, plane_meta: &[u8], active_width: usize, active_height: usize) {
         const MAX_SPRITES: usize = 80;
         let (max_sprites_per_line, max_pixels_per_line) = if self.h40_mode() {
-            (20usize, FRAME_WIDTH)
+            (20usize, active_width)
         } else {
-            (16usize, 256usize)
+            (16usize, active_width)
         };
         let mut sprites_on_line = [0u8; FRAME_HEIGHT];
         let mut sprite_pixels_on_line = [0u16; FRAME_HEIGHT];
@@ -800,13 +1014,15 @@ impl Vdp {
                 &mut sprite_pixels_on_line,
                 max_sprites_per_line,
                 max_pixels_per_line,
+                active_width,
+                active_height,
             );
 
             let link = (size_link & 0x007F) as usize;
-            if link == 0 || link == index {
+            if link == 0 || link == index || link >= MAX_SPRITES {
                 break;
             }
-            index = link.min(MAX_SPRITES - 1);
+            index = link;
         }
     }
 
@@ -823,8 +1039,11 @@ impl Vdp {
         sprite_pixels_on_line: &mut [u16; FRAME_HEIGHT],
         max_sprites_per_line: usize,
         max_pixels_per_line: usize,
+        active_width: usize,
+        active_height: usize,
     ) {
-        let x = (x_word & 0x03FF) as i32 - 128;
+        // Sprite X coordinate is 9-bit (0..511), offset by 128.
+        let x = (x_word & 0x01FF) as i32 - 128;
         let y = (y_word & 0x03FF) as i32 - 128;
         let width_tiles = ((size_link >> 10) & 0x3) as usize + 1;
         let height_tiles = ((size_link >> 8) & 0x3) as usize + 1;
@@ -835,12 +1054,12 @@ impl Vdp {
         let vflip = (attr & 0x1000) != 0;
         let width_px = width_tiles * 8;
         let height_px = height_tiles * 8;
-        let is_mask_sprite = (x_word & 0x03FF) == 0;
+        let is_mask_sprite = (x_word & 0x01FF) == 0;
 
         for sy in 0..height_px {
             let src_y = if vflip { height_px - 1 - sy } else { sy };
             let dy = y + sy as i32;
-            if !(0..FRAME_HEIGHT as i32).contains(&dy) {
+            if !(0..active_height as i32).contains(&dy) {
                 continue;
             }
             let dy_index = dy as usize;
@@ -862,7 +1081,7 @@ impl Vdp {
             for sx in 0..width_px {
                 let src_x = if hflip { width_px - 1 - sx } else { sx };
                 let dx = x + sx as i32;
-                if !(0..FRAME_WIDTH as i32).contains(&dx) {
+                if !(0..active_width as i32).contains(&dx) {
                     continue;
                 }
                 if sprite_pixels_on_line[dy_index] as usize >= max_pixels_per_line {
@@ -875,6 +1094,7 @@ impl Vdp {
 
                 let tile_col = src_x / 8;
                 let in_tile_x = src_x & 7;
+                // Sprite pattern index advances in column-major order on the MD VDP.
                 let tile_index = tile_base + tile_col * height_tiles + tile_row;
                 let tile_addr = tile_index * TILE_SIZE_BYTES + in_tile_y * 4 + in_tile_x / 2;
                 let tile_byte = self.vram[tile_addr % VRAM_SIZE];
@@ -895,6 +1115,29 @@ impl Vdp {
                     continue;
                 }
 
+                if self.shadow_highlight_mode() && palette_line == 3 && (pixel == 14 || pixel == 15)
+                {
+                    if sprite_filled[meta_index] {
+                        self.sprite_collision = true;
+                        continue;
+                    }
+                    let out = meta_index * 3;
+                    if pixel == 15 {
+                        // Shadow control color.
+                        self.frame_buffer[out] = shadow_channel(self.frame_buffer[out]);
+                        self.frame_buffer[out + 1] = shadow_channel(self.frame_buffer[out + 1]);
+                        self.frame_buffer[out + 2] = shadow_channel(self.frame_buffer[out + 2]);
+                    } else {
+                        // Highlight control color.
+                        self.frame_buffer[out] = highlight_channel(self.frame_buffer[out]);
+                        self.frame_buffer[out + 1] = highlight_channel(self.frame_buffer[out + 1]);
+                        self.frame_buffer[out + 2] = highlight_channel(self.frame_buffer[out + 2]);
+                    }
+                    // Control sprite pixels still consume per-pixel sprite priority.
+                    sprite_filled[meta_index] = true;
+                    continue;
+                }
+
                 let color_index = palette_line * 16 + pixel as usize;
                 let color = self.cram[color_index % CRAM_COLORS];
                 let (r, g, b) = md_color_to_rgb888(color);
@@ -912,7 +1155,11 @@ impl Vdp {
     }
 
     fn display_enabled(&self) -> bool {
-        (self.registers[REG_MODE_SET_2] & 0x40) != 0
+        Self::display_enabled_from_regs(&self.registers)
+    }
+
+    fn h_interrupt_enabled(&self) -> bool {
+        (self.registers[REG_MODE_SET_1] & 0x10) != 0
     }
 
     fn v_interrupt_enabled(&self) -> bool {
@@ -920,11 +1167,48 @@ impl Vdp {
     }
 
     fn h40_mode(&self) -> bool {
-        (self.registers[12] & 0x01) != 0
+        Self::h40_mode_from_regs(&self.registers)
     }
 
-    fn background_color_index(&self) -> usize {
-        let bg = self.registers[REG_BACKGROUND_COLOR];
+    fn shadow_highlight_mode(&self) -> bool {
+        // Mode register 12 bit 3 enables shadow/highlight processing.
+        (self.registers[12] & 0x08) != 0
+    }
+
+    fn active_display_height(&self) -> usize {
+        Self::active_display_height_from_regs(&self.registers)
+    }
+
+    fn active_display_width(&self) -> usize {
+        Self::active_display_width_from_regs(&self.registers)
+    }
+
+    fn display_enabled_from_regs(regs: &[u8; REG_COUNT]) -> bool {
+        (regs[REG_MODE_SET_2] & 0x40) != 0
+    }
+
+    fn h40_mode_from_regs(regs: &[u8; REG_COUNT]) -> bool {
+        (regs[12] & 0x01) != 0
+    }
+
+    fn active_display_height_from_regs(regs: &[u8; REG_COUNT]) -> usize {
+        if (regs[REG_MODE_SET_2] & 0x08) != 0 {
+            FRAME_HEIGHT
+        } else {
+            FRAME_HEIGHT_28_CELL
+        }
+    }
+
+    fn active_display_width_from_regs(regs: &[u8; REG_COUNT]) -> usize {
+        if Self::h40_mode_from_regs(regs) {
+            FRAME_WIDTH
+        } else {
+            FRAME_WIDTH_32_CELL
+        }
+    }
+
+    fn background_color_index_from_regs(regs: &[u8; REG_COUNT]) -> usize {
+        let bg = regs[REG_BACKGROUND_COLOR];
         let palette = ((bg >> 4) & 0x3) as usize;
         let color = (bg & 0x0F) as usize;
         palette * 16 + color
@@ -949,6 +1233,23 @@ fn md_color_to_rgb888(color: u16) -> (u8, u8, u8) {
     let g = ((color >> 5) & 0x7) as u8;
     let b = ((color >> 9) & 0x7) as u8;
     (r * 36, g * 36, b * 36)
+}
+
+fn rgb888_to_md_level(channel: u8) -> u8 {
+    ((channel as u16 + 18) / 36).min(7) as u8
+}
+
+fn md_level_to_rgb888(level: u8) -> u8 {
+    (level.min(7) as u16 * 36) as u8
+}
+
+fn shadow_channel(channel: u8) -> u8 {
+    md_level_to_rgb888(rgb888_to_md_level(channel) / 2)
+}
+
+fn highlight_channel(channel: u8) -> u8 {
+    let level = ((rgb888_to_md_level(channel) as u16 * 3) / 2).min(7) as u8;
+    md_level_to_rgb888(level)
 }
 
 fn plane_size_code_to_tiles(code: u8) -> usize {
@@ -1135,6 +1436,33 @@ mod tests {
     }
 
     #[test]
+    fn hblank_interrupt_becomes_pending_when_enabled() {
+        let mut vdp = Vdp::new();
+        // Register 0 bit4 enables H-INT. Register 10 = 0 triggers every line.
+        vdp.write_control_port(0x8010);
+        vdp.write_control_port(0x8A00);
+        let cycles_per_line = (Vdp::CYCLES_PER_FRAME / Vdp::TOTAL_LINES) as u32;
+        vdp.step(cycles_per_line * 2);
+
+        assert_eq!(vdp.pending_interrupt_level(), Some(4));
+        vdp.acknowledge_interrupt(4);
+        assert_eq!(vdp.pending_interrupt_level(), None);
+    }
+
+    #[test]
+    fn vblank_interrupt_has_priority_over_hblank_interrupt() {
+        let mut vdp = Vdp::new();
+        vdp.write_control_port(0x8010); // H-INT enable
+        vdp.write_control_port(0x8160); // V-INT enable + display on
+        vdp.write_control_port(0x8A00); // H-INT every line
+
+        vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+        assert_eq!(vdp.pending_interrupt_level(), Some(6));
+        vdp.acknowledge_interrupt(6);
+        assert_eq!(vdp.pending_interrupt_level(), Some(4));
+    }
+
+    #[test]
     fn hv_counter_changes_as_cycles_advance() {
         let mut vdp = Vdp::new();
         let before = vdp.read_hv_counter();
@@ -1184,11 +1512,37 @@ mod tests {
         vdp.step(Vdp::CYCLES_PER_FRAME as u32);
         assert_eq!(&vdp.frame_buffer()[0..3], &[252, 0, 0]);
 
-        // Apply +8 pixel scroll so x=0 samples tile 1.
-        vdp.write_vram_u8(0xF000, 0x00);
-        vdp.write_vram_u8(0xF001, 0x08);
+        // Apply -8 pixel scroll so x=0 samples tile 1.
+        vdp.write_vram_u8(0xF000, 0xFF);
+        vdp.write_vram_u8(0xF001, 0xF8);
         vdp.step(Vdp::CYCLES_PER_FRAME as u32);
         assert_eq!(&vdp.frame_buffer()[0..3], &[0, 252, 0]);
+    }
+
+    #[test]
+    fn h32_mode_blacks_right_border_outside_active_width() {
+        let mut vdp = Vdp::new();
+        let base = 0xC000usize;
+
+        // H32 mode (256 active pixels).
+        vdp.write_control_port(0x8C80);
+
+        // Tile 0 uses palette color 1 for all pixels.
+        for i in 0..32u16 {
+            vdp.write_vram_u8(i, 0x11);
+        }
+        // Plane A (0,0) = tile 0.
+        vdp.write_vram_u8(base as u16, 0x00);
+        vdp.write_vram_u8((base + 1) as u16, 0x00);
+        vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
+
+        vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+
+        let x255 = (255usize * 3, 255usize * 3 + 3);
+        assert_ne!(&vdp.frame_buffer()[x255.0..x255.1], &[0, 0, 0]);
+
+        let x256 = (256usize * 3, 256usize * 3 + 3);
+        assert_eq!(&vdp.frame_buffer()[x256.0..x256.1], &[0, 0, 0]);
     }
 
     #[test]
@@ -1207,9 +1561,9 @@ mod tests {
         // Line 0: no scroll (plane A word at 0xF000).
         vdp.write_vram_u8(0xF000, 0x00);
         vdp.write_vram_u8(0xF001, 0x00);
-        // Line 1: +8 scroll (plane A word at 0xF004).
-        vdp.write_vram_u8(0xF004, 0x00);
-        vdp.write_vram_u8(0xF005, 0x08);
+        // Line 1: -8 scroll (plane A word at 0xF004).
+        vdp.write_vram_u8(0xF004, 0xFF);
+        vdp.write_vram_u8(0xF005, 0xF8);
 
         // Place tile 0 at (0,0), tile 1 at (1,0).
         vdp.write_vram_u8(base as u16, 0x00);
@@ -1393,7 +1747,7 @@ mod tests {
         }
 
         // Enable window over the full screen.
-        vdp.write_control_port(0x9180);
+        vdp.write_control_port(0x9100);
         vdp.write_control_port(0x9280);
 
         vdp.step(Vdp::CYCLES_PER_FRAME as u32);
@@ -1435,12 +1789,170 @@ mod tests {
         }
 
         // x<16: Plane A, x>=16: Window.
-        vdp.write_control_port(0x9181);
+        vdp.write_control_port(0x9101);
         vdp.write_control_port(0x9280);
 
         vdp.step(Vdp::CYCLES_PER_FRAME as u32);
         assert_eq!(&vdp.frame_buffer()[0..3], &[252, 0, 0]);
         assert_eq!(&vdp.frame_buffer()[16 * 3..16 * 3 + 3], &[0, 252, 0]);
+    }
+
+    #[test]
+    fn window_vertical_split_bit7_set_uses_bottom_region() {
+        let mut vdp = Vdp::new();
+        let plane_a_base = 0xC000u16;
+        let window_base = 0xD000u16;
+
+        vdp.vram.fill(0);
+        vdp.cram.fill(0);
+        vdp.vsram.fill(0);
+        vdp.write_control_port(0x8D3C);
+        vdp.write_vram_u8(0xF000, 0x00);
+        vdp.write_vram_u8(0xF001, 0x00);
+
+        // Plane A (row0/row1) = tile 1 (red).
+        vdp.write_vram_u8(plane_a_base, 0x00);
+        vdp.write_vram_u8(plane_a_base + 1, 0x01);
+        vdp.write_vram_u8((plane_a_base + 64) as u16, 0x00);
+        vdp.write_vram_u8((plane_a_base + 65) as u16, 0x01);
+
+        // Window (row0/row1) = tile 2 (green).
+        vdp.write_control_port(0x8334);
+        vdp.write_vram_u8(window_base, 0x00);
+        vdp.write_vram_u8(window_base + 1, 0x02);
+        vdp.write_vram_u8((window_base + 64) as u16, 0x00);
+        vdp.write_vram_u8((window_base + 65) as u16, 0x02);
+
+        vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
+        vdp.write_cram_u16(2, encode_md_color(0, 7, 0));
+        for i in 0..32u16 {
+            vdp.write_vram_u8(32 + i, 0x11);
+            vdp.write_vram_u8(64 + i, 0x22);
+        }
+
+        // Full width window, vertical split at y=8, bit7=1 => window on/below split.
+        vdp.write_control_port(0x9100);
+        vdp.write_control_port(0x9281);
+
+        vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+        // y=0 => plane A (red)
+        assert_eq!(&vdp.frame_buffer()[0..3], &[252, 0, 0]);
+        // y=8 => window (green)
+        let y8 = 8 * FRAME_WIDTH * 3;
+        assert_eq!(&vdp.frame_buffer()[y8..y8 + 3], &[0, 252, 0]);
+    }
+
+    #[test]
+    fn window_vertical_split_bit7_clear_uses_top_region() {
+        let mut vdp = Vdp::new();
+        let plane_a_base = 0xC000u16;
+        let window_base = 0xD000u16;
+
+        vdp.vram.fill(0);
+        vdp.cram.fill(0);
+        vdp.vsram.fill(0);
+        vdp.write_control_port(0x8D3C);
+        vdp.write_vram_u8(0xF000, 0x00);
+        vdp.write_vram_u8(0xF001, 0x00);
+
+        // Plane A (row0/row1) = tile 1 (red).
+        vdp.write_vram_u8(plane_a_base, 0x00);
+        vdp.write_vram_u8(plane_a_base + 1, 0x01);
+        vdp.write_vram_u8((plane_a_base + 64) as u16, 0x00);
+        vdp.write_vram_u8((plane_a_base + 65) as u16, 0x01);
+
+        // Window (row0/row1) = tile 2 (green).
+        vdp.write_control_port(0x8334);
+        vdp.write_vram_u8(window_base, 0x00);
+        vdp.write_vram_u8(window_base + 1, 0x02);
+        vdp.write_vram_u8((window_base + 64) as u16, 0x00);
+        vdp.write_vram_u8((window_base + 65) as u16, 0x02);
+
+        vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
+        vdp.write_cram_u16(2, encode_md_color(0, 7, 0));
+        for i in 0..32u16 {
+            vdp.write_vram_u8(32 + i, 0x11);
+            vdp.write_vram_u8(64 + i, 0x22);
+        }
+
+        // Full width window, vertical split at y=8, bit7=0 => window above split.
+        vdp.write_control_port(0x9100);
+        vdp.write_control_port(0x9201);
+
+        vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+        // y=0 => window (green)
+        assert_eq!(&vdp.frame_buffer()[0..3], &[0, 252, 0]);
+        // y=8 => plane A (red)
+        let y8 = 8 * FRAME_WIDTH * 3;
+        assert_eq!(&vdp.frame_buffer()[y8..y8 + 3], &[252, 0, 0]);
+    }
+
+    #[test]
+    fn window_plane_uses_h40_width_of_64_tiles_without_wrapping_at_32() {
+        let mut vdp = Vdp::new();
+        vdp.vram.fill(0);
+        vdp.cram.fill(0);
+        vdp.vsram.fill(0);
+
+        // H40 mode on (default), full-screen window.
+        vdp.write_control_port(0x8C81);
+        vdp.write_control_port(0x9100);
+        vdp.write_control_port(0x9280);
+
+        // Window base at 0xD000.
+        vdp.write_control_port(0x8334);
+        let window_base = 0xD000usize;
+        // Tile at x=0 -> red.
+        vdp.write_vram_u8(window_base as u16, 0x00);
+        vdp.write_vram_u8((window_base + 1) as u16, 0x01);
+        // Tile at x=32 cells (pixel x=256) -> green.
+        let x32 = window_base + 32 * 2;
+        vdp.write_vram_u8(x32 as u16, 0x00);
+        vdp.write_vram_u8((x32 + 1) as u16, 0x02);
+
+        vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
+        vdp.write_cram_u16(2, encode_md_color(0, 7, 0));
+        for i in 0..4u16 {
+            vdp.write_vram_u8(32 + i, 0x11);
+            vdp.write_vram_u8(64 + i, 0x22);
+        }
+
+        vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+        assert_eq!(&vdp.frame_buffer()[0..3], &[252, 0, 0]);
+        let x256 = 256 * 3;
+        assert_eq!(&vdp.frame_buffer()[x256..x256 + 3], &[0, 252, 0]);
+    }
+
+    #[test]
+    fn window_nametable_base_masks_bit1_in_h40_mode() {
+        let mut vdp = Vdp::new();
+        vdp.vram.fill(0);
+        vdp.cram.fill(0);
+        vdp.vsram.fill(0);
+
+        // H40 mode on, full-screen window.
+        vdp.write_control_port(0x8C81);
+        vdp.write_control_port(0x9100);
+        vdp.write_control_port(0x9280);
+
+        // reg3=0x22: in H40 bit1 must be ignored => base 0x8000 (not 0x8800).
+        vdp.write_control_port(0x8322);
+
+        // Put red tile at 0x8000 and green tile at 0x8800 to detect wrong base decode.
+        vdp.write_vram_u8(0x8000, 0x00);
+        vdp.write_vram_u8(0x8001, 0x01);
+        vdp.write_vram_u8(0x8800, 0x00);
+        vdp.write_vram_u8(0x8801, 0x02);
+
+        vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
+        vdp.write_cram_u16(2, encode_md_color(0, 7, 0));
+        for i in 0..4u16 {
+            vdp.write_vram_u8(32 + i, 0x11);
+            vdp.write_vram_u8(64 + i, 0x22);
+        }
+
+        vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+        assert_eq!(&vdp.frame_buffer()[0..3], &[252, 0, 0]);
     }
 
     #[test]
@@ -1733,6 +2245,42 @@ mod tests {
     }
 
     #[test]
+    fn shadow_highlight_control_colors_affect_underlying_pixel() {
+        let mut vdp = Vdp::new();
+        let plane_a_base = 0xC000u16;
+        let sat = 0xE000u16;
+
+        // Enable shadow/highlight mode while keeping H40.
+        vdp.write_control_port(0x8C89);
+
+        // Plane pixel: tile 0, color index 1 -> medium red (level 4).
+        vdp.write_vram_u8(plane_a_base, 0x00);
+        vdp.write_vram_u8(plane_a_base + 1, 0x00);
+        vdp.write_vram_u8(0, 0x11);
+        vdp.write_cram_u16(1, encode_md_color(4, 0, 0));
+
+        // Sprite tile 3, first pixel uses control color 15 (shadow).
+        vdp.write_vram_u8(3 * 32, 0xF0);
+        vdp.write_vram_u8(sat, 0x00);
+        vdp.write_vram_u8(sat + 1, 0x80);
+        vdp.write_vram_u8(sat + 2, 0x00);
+        vdp.write_vram_u8(sat + 3, 0x00);
+        // Attr: palette 3, tile 3.
+        vdp.write_vram_u8(sat + 4, 0x60);
+        vdp.write_vram_u8(sat + 5, 0x03);
+        vdp.write_vram_u8(sat + 6, 0x00);
+        vdp.write_vram_u8(sat + 7, 0x80);
+
+        vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+        assert_eq!(&vdp.frame_buffer()[0..3], &[72, 0, 0]);
+
+        // Switch to control color 14 (highlight).
+        vdp.write_vram_u8(3 * 32, 0xE0);
+        vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+        assert_eq!(&vdp.frame_buffer()[0..3], &[216, 0, 0]);
+    }
+
+    #[test]
     fn defaults_plane_size_to_32x32_cells() {
         let mut vdp = Vdp::new();
         vdp.vram.fill(0);
@@ -1759,6 +2307,47 @@ mod tests {
         vdp.write_vsram_u16(0, 256);
         vdp.step(Vdp::CYCLES_PER_FRAME as u32);
         assert_eq!(&vdp.frame_buffer()[0..3], &[252, 0, 0]);
+    }
+
+    #[test]
+    fn out_of_range_sprite_link_stops_traversal() {
+        let mut vdp = Vdp::new();
+        vdp.vram.fill(0);
+        vdp.cram.fill(0);
+        vdp.vsram.fill(0);
+
+        vdp.write_control_port(0x8570); // SAT @ 0xE000
+        vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
+
+        // Tile 1 = solid red.
+        for i in 0..32u16 {
+            vdp.write_vram_u8(32 + i, 0x11);
+        }
+
+        let sat = 0xE000usize;
+        // Sprite 0: offscreen mask-like position, but link points out of range (0x7F).
+        vdp.write_vram_u8(sat as u16, 0x00);
+        vdp.write_vram_u8((sat + 1) as u16, 0x80);
+        vdp.write_vram_u8((sat + 2) as u16, 0x00);
+        vdp.write_vram_u8((sat + 3) as u16, 0x7F);
+        vdp.write_vram_u8((sat + 4) as u16, 0x00);
+        vdp.write_vram_u8((sat + 5) as u16, 0x00);
+        vdp.write_vram_u8((sat + 6) as u16, 0x00);
+        vdp.write_vram_u8((sat + 7) as u16, 0x00);
+
+        // Sprite 79: visible red sprite at (0,0). Must not be reached from out-of-range link.
+        let sat79 = sat + 79 * 8;
+        vdp.write_vram_u8(sat79 as u16, 0x00);
+        vdp.write_vram_u8((sat79 + 1) as u16, 0x80);
+        vdp.write_vram_u8((sat79 + 2) as u16, 0x00);
+        vdp.write_vram_u8((sat79 + 3) as u16, 0x00);
+        vdp.write_vram_u8((sat79 + 4) as u16, 0x00);
+        vdp.write_vram_u8((sat79 + 5) as u16, 0x01);
+        vdp.write_vram_u8((sat79 + 6) as u16, 0x00);
+        vdp.write_vram_u8((sat79 + 7) as u16, 0x80);
+
+        vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+        assert_eq!(&vdp.frame_buffer()[0..3], &[0, 0, 0]);
     }
 
     #[test]
@@ -1794,7 +2383,73 @@ mod tests {
     }
 
     #[test]
-    fn dma_fill_writes_repeated_words_to_vram() {
+    fn scroll_plane_64_cell_width_uses_linear_nametable_layout() {
+        let mut vdp = Vdp::new();
+        vdp.vram.fill(0);
+        vdp.cram.fill(0);
+        vdp.vsram.fill(0);
+
+        // reg16 = 0x11 => 64x64 cells.
+        vdp.write_control_port(0x8C81);
+        vdp.write_control_port(0x9011);
+        let plane_a = 0xC000usize;
+        // Tile at (0,0) -> red.
+        vdp.write_vram_u8(plane_a as u16, 0x00);
+        vdp.write_vram_u8((plane_a + 1) as u16, 0x01);
+        // Tile at (32,0) -> green.
+        let x32 = plane_a + 32 * 2;
+        vdp.write_vram_u8(x32 as u16, 0x00);
+        vdp.write_vram_u8((x32 + 1) as u16, 0x02);
+
+        vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
+        vdp.write_cram_u16(2, encode_md_color(0, 7, 0));
+        for i in 0..4u16 {
+            vdp.write_vram_u8(32 + i, 0x11);
+            vdp.write_vram_u8(64 + i, 0x22);
+        }
+
+        vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+        assert_eq!(&vdp.frame_buffer()[0..3], &[252, 0, 0]);
+        let x256 = 256 * 3;
+        assert_eq!(&vdp.frame_buffer()[x256..x256 + 3], &[0, 252, 0]);
+    }
+
+    #[test]
+    fn plane_size_code_3_decodes_to_128_cells() {
+        let mut vdp = Vdp::new();
+        vdp.vram.fill(0);
+        vdp.cram.fill(0);
+        vdp.vsram.fill(0);
+
+        // reg16=0x03 decodes to 128x32.
+        vdp.write_control_port(0x9003);
+        vdp.write_control_port(0x8D3C); // hscroll table @ 0xF000
+        let plane_a = 0xC000usize;
+        // x=0 tile -> red
+        vdp.write_vram_u8(plane_a as u16, 0x00);
+        vdp.write_vram_u8((plane_a + 1) as u16, 0x01);
+        // x=64 tile -> green. Width=64 would wrap this position to x=0,
+        // while width=128 keeps it distinct.
+        let x64 = plane_a + 64 * 2;
+        vdp.write_vram_u8(x64 as u16, 0x00);
+        vdp.write_vram_u8((x64 + 1) as u16, 0x02);
+
+        vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
+        vdp.write_cram_u16(2, encode_md_color(0, 7, 0));
+        for i in 0..4u16 {
+            vdp.write_vram_u8(32 + i, 0x11);
+            vdp.write_vram_u8(64 + i, 0x22);
+        }
+        // Scroll by -64 cells so x=0 samples cell 64 on 128-cell maps.
+        vdp.write_vram_u8(0xF000, 0xFE);
+        vdp.write_vram_u8(0xF001, 0x00);
+
+        vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+        assert_eq!(&vdp.frame_buffer()[0..3], &[0, 252, 0]);
+    }
+
+    #[test]
+    fn dma_fill_writes_repeated_bytes_to_vram() {
         let mut vdp = Vdp::new();
         // Register 1: display + DMA enable.
         vdp.write_control_port(0x8150);
@@ -1812,12 +2467,12 @@ mod tests {
         // Fill value provided via data port.
         vdp.write_data_port(0xA1B2);
 
-        assert_eq!(vdp.read_vram_u8(0x0000), 0xA1);
-        assert_eq!(vdp.read_vram_u8(0x0001), 0xB2);
-        assert_eq!(vdp.read_vram_u8(0x0002), 0xA1);
-        assert_eq!(vdp.read_vram_u8(0x0003), 0xB2);
-        assert_eq!(vdp.read_vram_u8(0x0004), 0xA1);
-        assert_eq!(vdp.read_vram_u8(0x0005), 0xB2);
+        assert_eq!(vdp.read_vram_u8(0x0000), 0xB2);
+        assert_eq!(vdp.read_vram_u8(0x0001), 0x00);
+        assert_eq!(vdp.read_vram_u8(0x0002), 0xB2);
+        assert_eq!(vdp.read_vram_u8(0x0003), 0x00);
+        assert_eq!(vdp.read_vram_u8(0x0004), 0xB2);
+        assert_eq!(vdp.read_vram_u8(0x0005), 0x00);
     }
 
     #[test]
