@@ -18,6 +18,7 @@ pub struct M68k {
     sr: u16,
     pc: u32,
     cycles: u64,
+    stopped: bool,
     unknown_opcode_total: u64,
     unknown_opcode_histogram: BTreeMap<u16, u64>,
     unknown_opcode_pc_histogram: BTreeMap<u32, u64>,
@@ -34,6 +35,7 @@ impl Default for M68k {
             sr: 0x2700,
             pc: 0,
             cycles: 0,
+            stopped: false,
             unknown_opcode_total: 0,
             unknown_opcode_histogram: BTreeMap::new(),
             unknown_opcode_pc_histogram: BTreeMap::new(),
@@ -57,6 +59,7 @@ impl M68k {
         self.a_regs[7] = self.ssp;
         self.pc = memory.read_u32(0x000004);
         self.cycles = 0;
+        self.stopped = false;
         self.unknown_opcode_total = 0;
         self.unknown_opcode_histogram.clear();
         self.unknown_opcode_pc_histogram.clear();
@@ -71,6 +74,12 @@ impl M68k {
                 self.cycles += cycles as u64;
                 return cycles;
             }
+        }
+
+        if self.stopped {
+            let cycles = 4;
+            self.cycles += cycles as u64;
+            return cycles;
         }
 
         let opcode = self.fetch_u16(memory);
@@ -88,8 +97,12 @@ impl M68k {
 
         let cycles = match opcode {
             0x4E71 => 4, // NOP
+            0x4E70 => self.exec_reset(memory),
             0x4E75 => self.exec_rts(memory),
             0x4E73 => self.exec_rte(memory),
+            0x4E72 => self.exec_stop(memory),
+            0x4E76 => self.exec_trapv(memory),
+            0x4E77 => self.exec_rtr(memory),
             0x4AFC => self.exec_illegal(memory),
             _ if (opcode & 0xFFF0) == 0x4E60 => self.exec_move_usp(opcode, memory),
             _ if (opcode & 0xFFF8) == 0x4E50 => self.exec_link(opcode, memory),
@@ -98,16 +111,19 @@ impl M68k {
             _ if (opcode & 0xFFC0) == 0x4EC0 => opt_cycles!(self.exec_jmp(opcode, memory)),
             _ if (opcode & 0xFFC0) == 0x40C0 => opt_cycles!(self.exec_move_from_sr(opcode, memory)),
             _ if (opcode & 0xFFC0) == 0x46C0 => opt_cycles!(self.exec_move_to_sr(opcode, memory)),
+            _ if (opcode & 0xFFF8) == 0x4848 => self.exec_bkpt_68000(memory),
             _ if (opcode & 0xFFC0) == 0x4840 && ((opcode >> 3) & 0x7) != 0b000 => {
                 opt_cycles!(self.exec_pea(opcode, memory))
             }
             _ if (opcode & 0xFFF8) == 0x4840 => self.exec_swap(opcode),
             _ if (opcode & 0xFFF8) == 0x4880 => self.exec_ext_w(opcode),
             _ if (opcode & 0xFFF8) == 0x48C0 => self.exec_ext_l(opcode),
+            _ if (opcode & 0xFFC0) == 0x4800 => opt_cycles!(self.exec_nbcd(opcode, memory)),
             _ if (opcode & 0xFB80) == 0x4880 && ((opcode >> 3) & 0x7) >= 0b010 => {
                 opt_cycles!(self.exec_movem(opcode, memory))
             }
             _ if (opcode & 0xFFF0) == 0x4E40 => self.exec_trap(opcode, memory),
+            _ if (opcode & 0xFF00) == 0x4000 => opt_cycles!(self.exec_negx(opcode, memory)),
             _ if (opcode & 0xFF00) == 0x6000 => self.exec_branch(opcode, memory, 0x0),
             _ if (opcode & 0xFF00) == 0x6100 => self.exec_bsr(opcode, memory),
             _ if (opcode & 0xFF00) == 0x6600 => self.exec_branch(opcode, memory, 0x6),
@@ -116,6 +132,7 @@ impl M68k {
             _ if (opcode & 0xF000) == 0x5000 => opt_cycles!(self.exec_addq_subq(opcode, memory)),
             _ if (opcode & 0xF100) == 0x7000 => self.exec_moveq(opcode),
             _ if (opcode & 0xFFC0) == 0x44C0 => opt_cycles!(self.exec_move_to_ccr(opcode, memory)),
+            _ if (opcode & 0xFFC0) == 0x42C0 => opt_cycles!(self.exec_move_from_ccr(opcode, memory)),
             _ if (opcode & 0xFF00) == 0x4200 => opt_cycles!(self.exec_clr(opcode, memory)),
             _ if (opcode & 0xFF00) == 0x4400 => opt_cycles!(self.exec_neg(opcode, memory)),
             _ if (opcode & 0xFF00) == 0x4600 => opt_cycles!(self.exec_not(opcode, memory)),
@@ -136,12 +153,17 @@ impl M68k {
             0x0A7C => self.exec_eori_to_sr(memory),
             _ if (opcode & 0xFF00) == 0x0A00 => opt_cycles!(self.exec_eori(opcode, memory)),
             _ if (opcode & 0xFF00) == 0x0C00 => opt_cycles!(self.exec_cmpi(opcode, memory)),
+            _ if (opcode & 0xF138) == 0xB108 && ((opcode >> 6) & 0x3) != 0b11 => {
+                opt_cycles!(self.exec_cmpm(opcode, memory))
+            }
             _ if (opcode & 0xF1C0) == 0xB0C0 => opt_cycles!(self.exec_cmpa_w(opcode, memory)),
             _ if (opcode & 0xF1C0) == 0xB1C0 => opt_cycles!(self.exec_cmpa_l(opcode, memory)),
             _ if (opcode & 0xF000) == 0xB000 => opt_cycles!(self.exec_cmp_ea_to_dn(opcode, memory)),
+            _ if (opcode & 0xFFC0) == 0x4AC0 => opt_cycles!(self.exec_tas(opcode, memory)),
             _ if (opcode & 0xFF00) == 0x4A00 => opt_cycles!(self.exec_tst(opcode, memory)),
             _ if (opcode & 0xF1C0) == 0x3040 => opt_cycles!(self.exec_movea_w(opcode, memory)),
             _ if (opcode & 0xF1C0) == 0x2040 => opt_cycles!(self.exec_movea_l(opcode, memory)),
+            _ if (opcode & 0xF1C0) == 0x4180 => opt_cycles!(self.exec_chk_w(opcode, memory)),
             _ if (opcode & 0xF1C0) == 0x80C0 => opt_cycles!(self.exec_divu_w(opcode, memory)),
             _ if (opcode & 0xF1C0) == 0x81C0 => opt_cycles!(self.exec_divs_w(opcode, memory)),
             _ if (opcode & 0xF1F8) == 0x8108 => opt_cycles!(self.exec_sbcd(opcode, memory)),
@@ -157,6 +179,8 @@ impl M68k {
             _ if (opcode & 0xF1C0) == 0xD1C0 => opt_cycles!(self.exec_adda_l(opcode, memory)),
             _ if (opcode & 0xF1C0) == 0x90C0 => opt_cycles!(self.exec_suba_w(opcode, memory)),
             _ if (opcode & 0xF1C0) == 0x91C0 => opt_cycles!(self.exec_suba_l(opcode, memory)),
+            _ if (opcode & 0xF130) == 0x9100 => opt_cycles!(self.exec_subx(opcode, memory)),
+            _ if (opcode & 0xF130) == 0xD100 => opt_cycles!(self.exec_addx(opcode, memory)),
             _ if (opcode & 0xF000) == 0x9000 => opt_cycles!(self.exec_sub_ea_to_dn(opcode, memory)),
             _ if (opcode & 0xF000) == 0xD000 => opt_cycles!(self.exec_add_ea_to_dn(opcode, memory)),
             _ if (opcode & 0xF000) == 0xE000 => opt_cycles!(self.exec_shift_rotate(opcode, memory)),
@@ -173,6 +197,8 @@ impl M68k {
             _ if (opcode & 0xF000) == 0x2000 => {
                 opt_cycles!(self.exec_move_l_family(opcode, memory))
             }
+            _ if (opcode & 0xF000) == 0xA000 => self.exec_line_a(memory),
+            _ if (opcode & 0xF000) == 0xF000 => self.exec_line_f(memory),
             _ => {
                 self.record_unknown_opcode(opcode, self.pc.wrapping_sub(2));
                 4 // Unknown opcodes are treated as NOP for now.
@@ -1254,6 +1280,149 @@ impl M68k {
         Some(8)
     }
 
+    fn exec_addx(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
+        self.exec_addx_subx(opcode, memory, true)
+    }
+
+    fn exec_subx(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
+        self.exec_addx_subx(opcode, memory, false)
+    }
+
+    fn exec_addx_subx(
+        &mut self,
+        opcode: u16,
+        memory: &mut MemoryMap,
+        add: bool,
+    ) -> Option<u32> {
+        let dst = ((opcode >> 9) & 0x7) as usize;
+        let size = ((opcode >> 6) & 0x3) as u8;
+        let mem_mode = (opcode & 0x0008) != 0;
+        let src = (opcode & 0x7) as usize;
+        let x_in = if self.flag_set(CCR_X) { 1u32 } else { 0u32 };
+        let prev_z = self.flag_set(CCR_Z);
+
+        match size {
+            0b00 => {
+                let (src_v, dst_v, dst_addr) = if mem_mode {
+                    self.a_regs[src] = self.a_regs[src].wrapping_sub(self.byte_addr_step(src));
+                    self.a_regs[dst] = self.a_regs[dst].wrapping_sub(self.byte_addr_step(dst));
+                    (
+                        memory.read_u8(self.a_regs[src]),
+                        memory.read_u8(self.a_regs[dst]),
+                        Some(self.a_regs[dst]),
+                    )
+                } else {
+                    (self.d_regs[src] as u8, self.d_regs[dst] as u8, None)
+                };
+
+                let rhs = src_v as u16 + x_in as u16;
+                let (result, carry, overflow) = if add {
+                    let sum = dst_v as u16 + rhs;
+                    let result = sum as u8;
+                    let carry = sum > 0xFF;
+                    let overflow = ((!(dst_v ^ src_v)) & (dst_v ^ result) & 0x80) != 0;
+                    (result, carry, overflow)
+                } else {
+                    let result = (dst_v as u16).wrapping_sub(rhs) as u8;
+                    let carry = rhs > dst_v as u16;
+                    let overflow = ((dst_v ^ src_v) & (dst_v ^ result) & 0x80) != 0;
+                    (result, carry, overflow)
+                };
+
+                if let Some(addr) = dst_addr {
+                    memory.write_u8(addr, result);
+                } else {
+                    self.d_regs[dst] = (self.d_regs[dst] & 0xFFFF_FF00) | result as u32;
+                }
+                self.set_flag(CCR_N, (result & 0x80) != 0);
+                self.set_flag(CCR_Z, prev_z && result == 0);
+                self.set_flag(CCR_V, overflow);
+                self.set_flag(CCR_C, carry);
+                self.set_flag(CCR_X, carry);
+                Some(if mem_mode { 18 } else { 4 })
+            }
+            0b01 => {
+                let (src_v, dst_v, dst_addr) = if mem_mode {
+                    self.a_regs[src] = self.a_regs[src].wrapping_sub(2);
+                    self.a_regs[dst] = self.a_regs[dst].wrapping_sub(2);
+                    (
+                        memory.read_u16(self.a_regs[src]),
+                        memory.read_u16(self.a_regs[dst]),
+                        Some(self.a_regs[dst]),
+                    )
+                } else {
+                    (self.d_regs[src] as u16, self.d_regs[dst] as u16, None)
+                };
+
+                let rhs = src_v as u32 + x_in;
+                let (result, carry, overflow) = if add {
+                    let sum = dst_v as u32 + rhs;
+                    let result = sum as u16;
+                    let carry = sum > 0xFFFF;
+                    let overflow = ((!(dst_v ^ src_v)) & (dst_v ^ result) & 0x8000) != 0;
+                    (result, carry, overflow)
+                } else {
+                    let result = (dst_v as u32).wrapping_sub(rhs) as u16;
+                    let carry = rhs > dst_v as u32;
+                    let overflow = ((dst_v ^ src_v) & (dst_v ^ result) & 0x8000) != 0;
+                    (result, carry, overflow)
+                };
+
+                if let Some(addr) = dst_addr {
+                    memory.write_u16(addr, result);
+                } else {
+                    self.d_regs[dst] = (self.d_regs[dst] & 0xFFFF_0000) | result as u32;
+                }
+                self.set_flag(CCR_N, (result & 0x8000) != 0);
+                self.set_flag(CCR_Z, prev_z && result == 0);
+                self.set_flag(CCR_V, overflow);
+                self.set_flag(CCR_C, carry);
+                self.set_flag(CCR_X, carry);
+                Some(if mem_mode { 18 } else { 4 })
+            }
+            0b10 => {
+                let (src_v, dst_v, dst_addr) = if mem_mode {
+                    self.a_regs[src] = self.a_regs[src].wrapping_sub(4);
+                    self.a_regs[dst] = self.a_regs[dst].wrapping_sub(4);
+                    (
+                        memory.read_u32(self.a_regs[src]),
+                        memory.read_u32(self.a_regs[dst]),
+                        Some(self.a_regs[dst]),
+                    )
+                } else {
+                    (self.d_regs[src], self.d_regs[dst], None)
+                };
+
+                let rhs = src_v as u64 + x_in as u64;
+                let (result, carry, overflow) = if add {
+                    let sum = dst_v as u64 + rhs;
+                    let result = sum as u32;
+                    let carry = sum > 0xFFFF_FFFF;
+                    let overflow = ((!(dst_v ^ src_v)) & (dst_v ^ result) & 0x8000_0000) != 0;
+                    (result, carry, overflow)
+                } else {
+                    let result = (dst_v as u64).wrapping_sub(rhs) as u32;
+                    let carry = rhs > dst_v as u64;
+                    let overflow = ((dst_v ^ src_v) & (dst_v ^ result) & 0x8000_0000) != 0;
+                    (result, carry, overflow)
+                };
+
+                if let Some(addr) = dst_addr {
+                    memory.write_u32(addr, result);
+                } else {
+                    self.d_regs[dst] = result;
+                }
+                self.set_flag(CCR_N, (result & 0x8000_0000) != 0);
+                self.set_flag(CCR_Z, prev_z && result == 0);
+                self.set_flag(CCR_V, overflow);
+                self.set_flag(CCR_C, carry);
+                self.set_flag(CCR_X, carry);
+                Some(if mem_mode { 30 } else { 8 })
+            }
+            _ => None,
+        }
+    }
+
     fn exec_lea(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
         let dst = ((opcode >> 9) & 0x7) as usize;
         let mode = ((opcode >> 3) & 0x7) as u8;
@@ -1388,6 +1557,71 @@ impl M68k {
         let result = dst_val.wrapping_sub(src);
         self.update_sub_flags_long(dst_val, src, result);
         Some(6)
+    }
+
+    fn exec_cmpm(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
+        let ax = ((opcode >> 9) & 0x7) as usize;
+        let size = ((opcode >> 6) & 0x3) as u8;
+        let ay = (opcode & 0x7) as usize;
+
+        match size {
+            0b00 => {
+                let src_addr = self.a_regs[ay];
+                let dst_addr = self.a_regs[ax];
+                let src = memory.read_u8(src_addr);
+                let dst = memory.read_u8(dst_addr);
+                self.a_regs[ay] = self.a_regs[ay].wrapping_add(self.byte_addr_step(ay));
+                self.a_regs[ax] = self.a_regs[ax].wrapping_add(self.byte_addr_step(ax));
+                let result = dst.wrapping_sub(src);
+                self.update_sub_flags_byte(dst, src, result);
+                Some(12)
+            }
+            0b01 => {
+                let src_addr = self.a_regs[ay];
+                let dst_addr = self.a_regs[ax];
+                let src = memory.read_u16(src_addr);
+                let dst = memory.read_u16(dst_addr);
+                self.a_regs[ay] = self.a_regs[ay].wrapping_add(2);
+                self.a_regs[ax] = self.a_regs[ax].wrapping_add(2);
+                let result = dst.wrapping_sub(src);
+                self.update_sub_flags_word(dst, src, result);
+                Some(12)
+            }
+            0b10 => {
+                let src_addr = self.a_regs[ay];
+                let dst_addr = self.a_regs[ax];
+                let src = memory.read_u32(src_addr);
+                let dst = memory.read_u32(dst_addr);
+                self.a_regs[ay] = self.a_regs[ay].wrapping_add(4);
+                self.a_regs[ax] = self.a_regs[ax].wrapping_add(4);
+                let result = dst.wrapping_sub(src);
+                self.update_sub_flags_long(dst, src, result);
+                Some(20)
+            }
+            _ => None,
+        }
+    }
+
+    fn exec_chk_w(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
+        let dn = ((opcode >> 9) & 0x7) as usize;
+        let mode = ((opcode >> 3) & 0x7) as u8;
+        let reg = (opcode & 0x7) as usize;
+        if mode == 0b001 {
+            return None;
+        }
+        let upper = self.read_ea_word(mode, reg, memory)? as i16 as i32;
+        let value = self.d_regs[dn] as i16 as i32;
+        if value < 0 {
+            self.set_flag(CCR_N, true);
+            self.raise_exception(6, memory, None);
+            return Some(40);
+        }
+        if value > upper {
+            self.set_flag(CCR_N, false);
+            self.raise_exception(6, memory, None);
+            return Some(40);
+        }
+        Some(10)
     }
 
     fn exec_eor_dn_to_ea(
@@ -1869,6 +2103,17 @@ impl M68k {
         })
     }
 
+    fn exec_move_from_ccr(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
+        let mode = ((opcode >> 3) & 0x7) as u8;
+        let reg = (opcode & 0x7) as usize;
+        // Destination must be data alterable; An direct and immediate are invalid.
+        if mode == 0b001 || (mode == 0b111 && reg == 0b100) {
+            return None;
+        }
+        self.write_ea_word(mode, reg, self.sr & 0x001F, memory)?;
+        Some(if mode == 0b000 { 6 } else { 8 })
+    }
+
     fn exec_neg(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
         let size = ((opcode >> 6) & 0x3) as u8;
         let mode = ((opcode >> 3) & 0x7) as u8;
@@ -1996,6 +2241,155 @@ impl M68k {
             }
             _ => None,
         }
+    }
+
+    fn exec_negx(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
+        let size = ((opcode >> 6) & 0x3) as u8;
+        let mode = ((opcode >> 3) & 0x7) as u8;
+        let reg = (opcode & 0x7) as usize;
+
+        // NEGX supports data alterable destinations only.
+        if mode == 0b001 || (mode == 0b111 && reg == 0b100) {
+            return None;
+        }
+
+        let x_in = if self.flag_set(CCR_X) { 1u32 } else { 0u32 };
+        let prev_z = self.flag_set(CCR_Z);
+        match size {
+            0b00 => {
+                let (dst, addr) = if mode == 0b000 {
+                    (self.d_regs[reg] as u8, None)
+                } else {
+                    let addr = self.resolve_data_alterable_address(mode, reg, 1, memory)?;
+                    (memory.read_u8(addr), Some(addr))
+                };
+                let src = (dst as u16) + x_in as u16;
+                let result = (0u16).wrapping_sub(src) as u8;
+                let borrow = src != 0;
+                let overflow = ((0u8 ^ src as u8) & (0u8 ^ result) & 0x80) != 0;
+                if mode == 0b000 {
+                    self.d_regs[reg] = (self.d_regs[reg] & 0xFFFF_FF00) | result as u32;
+                } else {
+                    memory.write_u8(addr.expect("memory mode must resolve address"), result);
+                }
+                self.set_flag(CCR_N, (result & 0x80) != 0);
+                self.set_flag(CCR_Z, prev_z && result == 0);
+                self.set_flag(CCR_V, overflow);
+                self.set_flag(CCR_C, borrow);
+                self.set_flag(CCR_X, borrow);
+                Some(if mode == 0b000 { 4 } else { 8 })
+            }
+            0b01 => {
+                let (dst, addr) = if mode == 0b000 {
+                    (self.d_regs[reg] as u16, None)
+                } else {
+                    let addr = self.resolve_data_alterable_address(mode, reg, 2, memory)?;
+                    (memory.read_u16(addr), Some(addr))
+                };
+                let src = (dst as u32) + x_in;
+                let result = (0u32).wrapping_sub(src) as u16;
+                let borrow = src != 0;
+                let overflow = ((0u16 ^ src as u16) & (0u16 ^ result) & 0x8000) != 0;
+                if mode == 0b000 {
+                    self.d_regs[reg] = (self.d_regs[reg] & 0xFFFF_0000) | result as u32;
+                } else {
+                    memory.write_u16(addr.expect("memory mode must resolve address"), result);
+                }
+                self.set_flag(CCR_N, (result & 0x8000) != 0);
+                self.set_flag(CCR_Z, prev_z && result == 0);
+                self.set_flag(CCR_V, overflow);
+                self.set_flag(CCR_C, borrow);
+                self.set_flag(CCR_X, borrow);
+                Some(if mode == 0b000 { 4 } else { 8 })
+            }
+            0b10 => {
+                let (dst, addr) = if mode == 0b000 {
+                    (self.d_regs[reg], None)
+                } else {
+                    let addr = self.resolve_data_alterable_address(mode, reg, 4, memory)?;
+                    (memory.read_u32(addr), Some(addr))
+                };
+                let src = (dst as u64) + x_in as u64;
+                let result = (0u64).wrapping_sub(src) as u32;
+                let borrow = src != 0;
+                let overflow = ((0u32 ^ src as u32) & (0u32 ^ result) & 0x8000_0000) != 0;
+                if mode == 0b000 {
+                    self.d_regs[reg] = result;
+                } else {
+                    memory.write_u32(addr.expect("memory mode must resolve address"), result);
+                }
+                self.set_flag(CCR_N, (result & 0x8000_0000) != 0);
+                self.set_flag(CCR_Z, prev_z && result == 0);
+                self.set_flag(CCR_V, overflow);
+                self.set_flag(CCR_C, borrow);
+                self.set_flag(CCR_X, borrow);
+                Some(if mode == 0b000 { 6 } else { 12 })
+            }
+            _ => None,
+        }
+    }
+
+    fn exec_nbcd(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
+        let mode = ((opcode >> 3) & 0x7) as u8;
+        let reg = (opcode & 0x7) as usize;
+        if mode == 0b001 || (mode == 0b111 && reg == 0b100) {
+            return None;
+        }
+
+        let x_in = if self.flag_set(CCR_X) { 1i32 } else { 0i32 };
+        let prev_z = self.flag_set(CCR_Z);
+        let (dst, addr) = if mode == 0b000 {
+            (self.d_regs[reg] as u8, None)
+        } else {
+            let addr = self.resolve_data_alterable_address(mode, reg, 1, memory)?;
+            (memory.read_u8(addr), Some(addr))
+        };
+        let dst_dec = ((dst >> 4) as i32) * 10 + (dst & 0x0F) as i32;
+        let mut diff = -dst_dec - x_in;
+        let borrow = diff < 0;
+        if borrow {
+            diff += 100;
+        }
+        let result = (((diff / 10) as u8) << 4) | ((diff % 10) as u8);
+        if mode == 0b000 {
+            self.d_regs[reg] = (self.d_regs[reg] & 0xFFFF_FF00) | result as u32;
+        } else {
+            memory.write_u8(addr.expect("memory mode must resolve address"), result);
+        }
+
+        self.set_flag(CCR_N, (result & 0x80) != 0);
+        self.set_flag(CCR_Z, prev_z && result == 0);
+        self.set_flag(CCR_V, false);
+        self.set_flag(CCR_C, borrow);
+        self.set_flag(CCR_X, borrow);
+        Some(if mode == 0b000 { 6 } else { 8 })
+    }
+
+    fn exec_tas(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
+        let mode = ((opcode >> 3) & 0x7) as u8;
+        let reg = (opcode & 0x7) as usize;
+        if mode == 0b001 || (mode == 0b111 && reg == 0b100) {
+            return None;
+        }
+
+        let value = if mode == 0b000 {
+            self.d_regs[reg] as u8
+        } else {
+            let addr = self.resolve_data_alterable_address(mode, reg, 1, memory)?;
+            let value = memory.read_u8(addr);
+            memory.write_u8(addr, value | 0x80);
+            value
+        };
+        if mode == 0b000 {
+            let result = value | 0x80;
+            self.d_regs[reg] = (self.d_regs[reg] & 0xFFFF_FF00) | result as u32;
+        }
+
+        self.set_flag(CCR_N, (value & 0x80) != 0);
+        self.set_flag(CCR_Z, value == 0);
+        self.set_flag(CCR_V, false);
+        self.set_flag(CCR_C, false);
+        Some(if mode == 0b000 { 4 } else { 10 })
     }
 
     fn exec_swap(&mut self, opcode: u16) -> u32 {
@@ -2507,6 +2901,33 @@ impl M68k {
         20
     }
 
+    fn exec_rtr(&mut self, memory: &mut MemoryMap) -> u32 {
+        let ccr = self.pop_u16(memory) & 0x001F;
+        self.sr = (self.sr & !0x001F) | ccr;
+        self.pc = self.pop_u32(memory);
+        20
+    }
+
+    fn exec_trapv(&mut self, memory: &mut MemoryMap) -> u32 {
+        if self.flag_set(CCR_V) {
+            self.raise_exception(7, memory, None);
+            34
+        } else {
+            4
+        }
+    }
+
+    fn exec_stop(&mut self, memory: &mut MemoryMap) -> u32 {
+        if (self.sr & SR_SUPERVISOR) == 0 {
+            self.raise_exception(8, memory, None);
+            return 34;
+        }
+        let value = self.fetch_u16(memory);
+        self.write_sr(value);
+        self.stopped = true;
+        4
+    }
+
     fn exec_branch(&mut self, opcode: u16, memory: &mut MemoryMap, cond: u8) -> u32 {
         let displacement = (opcode & 0x00FF) as u8;
         let should_branch = self.condition_true(cond);
@@ -2515,12 +2936,19 @@ impl M68k {
             let disp16 = self.fetch_u16(memory) as i16 as i32;
             if should_branch {
                 self.pc = base_pc.wrapping_add_signed(disp16);
+                10
+            } else {
+                12
             }
-        } else if should_branch {
-            let disp8 = displacement as i8 as i32;
-            self.pc = self.pc.wrapping_add_signed(disp8);
+        } else {
+            if should_branch {
+                let disp8 = displacement as i8 as i32;
+                self.pc = self.pc.wrapping_add_signed(disp8);
+                10
+            } else {
+                8
+            }
         }
-        10
     }
 
     fn exec_bcc(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -2559,6 +2987,31 @@ impl M68k {
         34
     }
 
+    fn exec_bkpt_68000(&mut self, memory: &mut MemoryMap) -> u32 {
+        // BKPT is not implemented on MC68000; treat it as ILLEGAL.
+        self.exec_illegal(memory)
+    }
+
+    fn exec_line_a(&mut self, memory: &mut MemoryMap) -> u32 {
+        self.raise_exception(10, memory, None);
+        34
+    }
+
+    fn exec_line_f(&mut self, memory: &mut MemoryMap) -> u32 {
+        self.raise_exception(11, memory, None);
+        34
+    }
+
+    fn exec_reset(&mut self, memory: &mut MemoryMap) -> u32 {
+        if (self.sr & SR_SUPERVISOR) == 0 {
+            self.raise_exception(8, memory, None);
+            34
+        } else {
+            memory.pulse_external_reset();
+            132
+        }
+    }
+
     fn service_interrupt(&mut self, level: u8, memory: &mut MemoryMap) -> bool {
         if !(1..=7).contains(&level) {
             return false;
@@ -2569,6 +3022,7 @@ impl M68k {
         }
 
         self.raise_exception(24 + level as u32, memory, Some(level));
+        self.stopped = false;
         true
     }
 
@@ -2579,6 +3033,7 @@ impl M68k {
         interrupt_level: Option<u8>,
     ) {
         *self.exception_histogram.entry(vector).or_insert(0) += 1;
+        self.stopped = false;
         let old_sr = self.sr;
 
         // Exceptions always stack on the supervisor stack.
@@ -4013,6 +4468,46 @@ mod tests {
         assert_eq!(memory.read_u16(0x00FF_0002), 0x2222);
         assert_eq!(memory.read_u16(0x00FF_0004), 0x0000);
         assert_eq!(memory.read_u16(0x00FF_0006), 0x4444);
+    }
+
+    #[test]
+    fn bcc_cycle_counts_differ_for_short_and_word_not_taken() {
+        let mut rom = vec![0u8; 0x400];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+        // moveq #0, d0
+        rom[0x100..0x102].copy_from_slice(&0x7000u16.to_be_bytes());
+        // cmpi.w #1, d0 (C=1)
+        rom[0x102..0x104].copy_from_slice(&0x0C40u16.to_be_bytes());
+        rom[0x104..0x106].copy_from_slice(&0x0001u16.to_be_bytes());
+        // bcc.s +2 (not taken)
+        rom[0x106..0x108].copy_from_slice(&0x6402u16.to_be_bytes());
+        // bcc.w +2 (not taken)
+        rom[0x108..0x10A].copy_from_slice(&0x6400u16.to_be_bytes());
+        rom[0x10A..0x10C].copy_from_slice(&0x0002u16.to_be_bytes());
+        // bcs.s +2 (taken)
+        rom[0x10C..0x10E].copy_from_slice(&0x6502u16.to_be_bytes());
+        // nop (skipped by bcs)
+        rom[0x10E..0x110].copy_from_slice(&0x4E71u16.to_be_bytes());
+        // nop
+        rom[0x110..0x112].copy_from_slice(&0x4E71u16.to_be_bytes());
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+
+        cpu.step(&mut memory); // moveq
+        cpu.step(&mut memory); // cmpi
+        let c1 = cpu.step(&mut memory); // bcc.s not taken
+        let c2 = cpu.step(&mut memory); // bcc.w not taken
+        let c3 = cpu.step(&mut memory); // bcs.s taken
+
+        assert_eq!(c1, 8);
+        assert_eq!(c2, 12);
+        assert_eq!(c3, 10);
+        assert_eq!(cpu.pc(), 0x0000_0110);
     }
 
     #[test]
@@ -6025,5 +6520,420 @@ mod tests {
         assert_eq!(cpu.a_regs[7], 0x00FF_0FFA);
         assert_eq!(memory.read_u16(0x00FF_0FFA), 0x2700);
         assert_eq!(memory.read_u32(0x00FF_0FFC), 0x0000_0102);
+    }
+
+    #[test]
+    fn trapv_vectors_only_when_overflow_is_set() {
+        let mut rom = vec![0u8; 0x400];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        // Trap #7 vector.
+        rom[0x1C..0x20].copy_from_slice(&0x0000_0180u32.to_be_bytes());
+        rom[0x100..0x102].copy_from_slice(&0x4E76u16.to_be_bytes()); // trapv
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+
+        // V clear: no trap.
+        let cycles_no_trap = cpu.step(&mut memory);
+        assert_eq!(cycles_no_trap, 4);
+        assert_eq!(cpu.pc(), 0x0000_0102);
+
+        cpu.pc = 0x0000_0100;
+        cpu.sr |= CCR_V;
+        let cycles_trap = cpu.step(&mut memory);
+        assert_eq!(cycles_trap, 34);
+        assert_eq!(cpu.pc(), 0x0000_0180);
+    }
+
+    #[test]
+    fn rtr_restores_ccr_and_pc_from_stack() {
+        let mut rom = vec![0u8; 0x400];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        rom[0x100..0x102].copy_from_slice(&0x4E77u16.to_be_bytes()); // rtr
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+
+        memory.write_u16(cpu.a_regs[7], 0x0015);
+        memory.write_u32(cpu.a_regs[7] + 2, 0x0000_0120);
+        let cycles = cpu.step(&mut memory);
+        assert_eq!(cycles, 20);
+        assert_eq!(cpu.pc(), 0x0000_0120);
+        assert_eq!(cpu.sr() & 0x001F, 0x0015);
+    }
+
+    #[test]
+    fn negx_byte_uses_extend_and_updates_flags() {
+        let mut rom = vec![0u8; 0x400];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        rom[0x100..0x102].copy_from_slice(&0x4000u16.to_be_bytes()); // negx.b d0
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+        cpu.d_regs[0] = 0x0000_0000;
+        cpu.sr |= CCR_X | CCR_Z;
+
+        cpu.step(&mut memory);
+        assert_eq!(cpu.d_regs[0] & 0xFF, 0xFF);
+        assert_ne!(cpu.sr() & CCR_X, 0);
+        assert_ne!(cpu.sr() & CCR_C, 0);
+        assert_ne!(cpu.sr() & CCR_N, 0);
+        assert_eq!(cpu.sr() & CCR_Z, 0);
+    }
+
+    #[test]
+    fn nbcd_and_tas_are_decoded() {
+        let mut rom = vec![0u8; 0x500];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        rom[0x100..0x102].copy_from_slice(&0x4800u16.to_be_bytes()); // nbcd d0
+        rom[0x102..0x104].copy_from_slice(&0x4AC1u16.to_be_bytes()); // tas d1
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+        cpu.d_regs[0] = 0x0000_0001;
+        cpu.d_regs[1] = 0x0000_0001;
+        cpu.sr |= CCR_Z;
+
+        cpu.step(&mut memory);
+        assert_eq!(cpu.d_regs[0] & 0xFF, 0x99);
+        assert_ne!(cpu.sr() & CCR_C, 0);
+        assert_ne!(cpu.sr() & CCR_X, 0);
+        assert_eq!(cpu.sr() & CCR_Z, 0);
+
+        cpu.step(&mut memory);
+        assert_eq!(cpu.d_regs[1] & 0xFF, 0x81);
+        assert_eq!(cpu.unknown_opcode_total(), 0);
+    }
+
+    #[test]
+    fn chk_w_raises_vector_6_for_negative_or_out_of_range() {
+        let mut rom = vec![0u8; 0x500];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        // CHK vector #6
+        rom[0x18..0x1C].copy_from_slice(&0x0000_0180u32.to_be_bytes());
+        // chk.w d1,d0
+        rom[0x100..0x102].copy_from_slice(&0x4181u16.to_be_bytes());
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+        cpu.d_regs[1] = 10;
+
+        cpu.d_regs[0] = 5;
+        let ok_cycles = cpu.step(&mut memory);
+        assert_eq!(ok_cycles, 10);
+        assert_eq!(cpu.pc(), 0x0000_0102);
+
+        cpu.pc = 0x0000_0100;
+        cpu.d_regs[0] = 11;
+        let trap_cycles = cpu.step(&mut memory);
+        assert_eq!(trap_cycles, 40);
+        assert_eq!(cpu.pc(), 0x0000_0180);
+
+        cpu.pc = 0x0000_0100;
+        cpu.a_regs[7] = cpu.ssp;
+        cpu.d_regs[0] = 0xFFFF_FFFF;
+        let trap_neg_cycles = cpu.step(&mut memory);
+        assert_eq!(trap_neg_cycles, 40);
+        assert_eq!(cpu.pc(), 0x0000_0180);
+    }
+
+    #[test]
+    fn reset_requires_supervisor_mode() {
+        let mut rom = vec![0u8; 0x500];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        // Privilege violation vector #8
+        rom[0x20..0x24].copy_from_slice(&0x0000_0180u32.to_be_bytes());
+        rom[0x100..0x102].copy_from_slice(&0x4E70u16.to_be_bytes()); // reset
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+
+        let sup_cycles = cpu.step(&mut memory);
+        assert_eq!(sup_cycles, 132);
+        assert_eq!(cpu.pc(), 0x0000_0102);
+
+        cpu.pc = 0x0000_0100;
+        cpu.sr &= !SR_SUPERVISOR;
+        let user_cycles = cpu.step(&mut memory);
+        assert_eq!(user_cycles, 34);
+        assert_eq!(cpu.pc(), 0x0000_0180);
+    }
+
+    #[test]
+    fn reset_instruction_pulses_external_reset_line() {
+        let mut rom = vec![0u8; 0x500];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        rom[0x100..0x102].copy_from_slice(&0x4E70u16.to_be_bytes()); // reset
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+
+        // Run Z80 first so we can verify RESET drives it back to initial state.
+        memory.write_u16(0xA11200, 0x0100); // release reset
+        memory.write_u16(0xA11100, 0x0000); // bus owned by Z80
+        memory.step_subsystems(64);
+        assert!(memory.z80().pc() > 0);
+
+        let cycles = cpu.step(&mut memory);
+        assert_eq!(cycles, 132);
+        assert_eq!(memory.z80().read_reset_byte(), 0x01);
+        assert_eq!(memory.z80().pc(), 0);
+    }
+
+    #[test]
+    fn addx_and_subx_data_register_mode_are_decoded() {
+        let mut rom = vec![0u8; 0x500];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        // addx.b d1,d0
+        rom[0x100..0x102].copy_from_slice(&0xD101u16.to_be_bytes());
+        // subx.b d1,d0
+        rom[0x102..0x104].copy_from_slice(&0x9101u16.to_be_bytes());
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+        cpu.d_regs[0] = 0x0000_0010;
+        cpu.d_regs[1] = 0x0000_0001;
+        cpu.sr |= CCR_X | CCR_Z;
+
+        cpu.step(&mut memory);
+        assert_eq!(cpu.d_regs[0] & 0xFF, 0x12);
+        assert_eq!(cpu.sr() & CCR_Z, 0);
+
+        cpu.step(&mut memory);
+        assert_eq!(cpu.d_regs[0] & 0xFF, 0x11);
+        assert_eq!(cpu.unknown_opcode_total(), 0);
+    }
+
+    #[test]
+    fn addx_subx_memory_predecrement_mode_updates_memory() {
+        let mut rom = vec![0u8; 0x600];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        // addx.b -(a0),-(a1)
+        rom[0x100..0x102].copy_from_slice(&0xD308u16.to_be_bytes());
+        // subx.b -(a0),-(a1)
+        rom[0x102..0x104].copy_from_slice(&0x9308u16.to_be_bytes());
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+        cpu.a_regs[0] = 0x00FF_0012;
+        cpu.a_regs[1] = 0x00FF_0022;
+        memory.write_u8(0x00FF_0011, 0x01);
+        memory.write_u8(0x00FF_0021, 0x10);
+        memory.write_u8(0x00FF_0010, 0x01);
+        memory.write_u8(0x00FF_0020, 0x12);
+        cpu.sr &= !CCR_X;
+        cpu.sr |= CCR_Z;
+
+        cpu.step(&mut memory);
+        assert_eq!(memory.read_u8(0x00FF_0021), 0x11);
+        assert_eq!(cpu.a_regs[0], 0x00FF_0011);
+        assert_eq!(cpu.a_regs[1], 0x00FF_0021);
+
+        cpu.step(&mut memory);
+        assert_eq!(memory.read_u8(0x00FF_0020), 0x11);
+        assert_eq!(cpu.a_regs[0], 0x00FF_0010);
+        assert_eq!(cpu.a_regs[1], 0x00FF_0020);
+        assert_eq!(cpu.unknown_opcode_total(), 0);
+    }
+
+    #[test]
+    fn cmpm_byte_word_long_are_decoded() {
+        let mut rom = vec![0u8; 0x700];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        // cmpm.b (a1)+,(a0)+
+        rom[0x100..0x102].copy_from_slice(&0xB109u16.to_be_bytes());
+        // cmpm.w (a1)+,(a0)+
+        rom[0x102..0x104].copy_from_slice(&0xB149u16.to_be_bytes());
+        // cmpm.l (a1)+,(a0)+
+        rom[0x104..0x106].copy_from_slice(&0xB189u16.to_be_bytes());
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+        cpu.a_regs[0] = 0x00FF_0100;
+        cpu.a_regs[1] = 0x00FF_0200;
+        // byte compare: 0x10 - 0x20 => negative
+        memory.write_u8(0x00FF_0100, 0x10);
+        memory.write_u8(0x00FF_0200, 0x20);
+        // word compare: 0x1234 - 0x1234 => zero
+        memory.write_u16(0x00FF_0101, 0x1234);
+        memory.write_u16(0x00FF_0201, 0x1234);
+        // long compare: 0x00000005 - 0x00000007 => negative
+        memory.write_u32(0x00FF_0103, 0x0000_0005);
+        memory.write_u32(0x00FF_0203, 0x0000_0007);
+
+        let c1 = cpu.step(&mut memory);
+        assert_eq!(c1, 12);
+        assert_ne!(cpu.sr() & CCR_N, 0);
+        assert_eq!(cpu.a_regs[0], 0x00FF_0101);
+        assert_eq!(cpu.a_regs[1], 0x00FF_0201);
+
+        let c2 = cpu.step(&mut memory);
+        assert_eq!(c2, 12);
+        assert_ne!(cpu.sr() & CCR_Z, 0);
+        assert_eq!(cpu.a_regs[0], 0x00FF_0103);
+        assert_eq!(cpu.a_regs[1], 0x00FF_0203);
+
+        let c3 = cpu.step(&mut memory);
+        assert_eq!(c3, 20);
+        assert_ne!(cpu.sr() & CCR_N, 0);
+        assert_eq!(cpu.a_regs[0], 0x00FF_0107);
+        assert_eq!(cpu.a_regs[1], 0x00FF_0207);
+        assert_eq!(cpu.unknown_opcode_total(), 0);
+    }
+
+    #[test]
+    fn cmpm_byte_on_a7_uses_byte_addr_step() {
+        let mut rom = vec![0u8; 0x700];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        // cmpm.b (a7)+,(a7)+
+        rom[0x100..0x102].copy_from_slice(&0xBF0F_u16.to_be_bytes());
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+        cpu.a_regs[7] = 0x00FF_0300;
+        memory.write_u8(0x00FF_0300, 0x11);
+        memory.write_u8(0x00FF_0302, 0x11);
+
+        cpu.step(&mut memory);
+        assert_eq!(cpu.a_regs[7], 0x00FF_0304);
+        assert_ne!(cpu.sr() & CCR_Z, 0);
+        assert_eq!(cpu.unknown_opcode_total(), 0);
+    }
+
+    #[test]
+    fn line_a_and_line_f_vector_to_10_and_11() {
+        let mut rom = vec![0u8; 0x600];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        // vector 10 @ 0x28
+        rom[0x28..0x2C].copy_from_slice(&0x0000_0180u32.to_be_bytes());
+        // vector 11 @ 0x2C
+        rom[0x2C..0x30].copy_from_slice(&0x0000_01A0u32.to_be_bytes());
+        rom[0x100..0x102].copy_from_slice(&0xA000u16.to_be_bytes());
+        rom[0x102..0x104].copy_from_slice(&0xF000u16.to_be_bytes());
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+
+        let c1 = cpu.step(&mut memory);
+        assert_eq!(c1, 34);
+        assert_eq!(cpu.pc(), 0x0000_0180);
+
+        cpu.pc = 0x0000_0102;
+        cpu.a_regs[7] = cpu.ssp;
+        let c2 = cpu.step(&mut memory);
+        assert_eq!(c2, 34);
+        assert_eq!(cpu.pc(), 0x0000_01A0);
+    }
+
+    #[test]
+    fn bkpt_on_68000_behaves_like_illegal() {
+        let mut rom = vec![0u8; 0x500];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        // illegal vector #4
+        rom[0x10..0x14].copy_from_slice(&0x0000_0180u32.to_be_bytes());
+        // bkpt #0
+        rom[0x100..0x102].copy_from_slice(&0x4848u16.to_be_bytes());
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+
+        let cycles = cpu.step(&mut memory);
+        assert_eq!(cycles, 34);
+        assert_eq!(cpu.pc(), 0x0000_0180);
+        assert_eq!(cpu.unknown_opcode_total(), 0);
+    }
+
+    #[test]
+    fn stop_halts_fetch_until_interrupt() {
+        let mut rom = vec![0u8; 0x600];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        // Level-6 autovector
+        rom[0x78..0x7C].copy_from_slice(&0x0000_0180u32.to_be_bytes());
+        // stop #$2000 ; moveq #1,d0
+        rom[0x100..0x102].copy_from_slice(&0x4E72u16.to_be_bytes());
+        rom[0x102..0x104].copy_from_slice(&0x2000u16.to_be_bytes());
+        rom[0x104..0x106].copy_from_slice(&0x7001u16.to_be_bytes());
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+
+        let stop_cycles = cpu.step(&mut memory);
+        assert_eq!(stop_cycles, 4);
+        assert_eq!(cpu.pc(), 0x0000_0104);
+
+        // Still stopped: PC does not advance.
+        let idle_cycles = cpu.step(&mut memory);
+        assert_eq!(idle_cycles, 4);
+        assert_eq!(cpu.pc(), 0x0000_0104);
+        assert_eq!(cpu.d_regs[0], 0);
+
+        // Raise VINT level 6 and ensure STOP is released by interrupt service.
+        memory.write_u16(0xC00004, 0x8160); // display+vint enable
+        memory.step_vdp(127_800);
+        let int_cycles = cpu.step(&mut memory);
+        assert_eq!(int_cycles, 44);
+        assert_eq!(cpu.pc(), 0x0000_0180);
+    }
+
+    #[test]
+    fn move_from_ccr_writes_low_five_flags() {
+        let mut rom = vec![0u8; 0x500];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        // move from ccr to d0
+        rom[0x100..0x102].copy_from_slice(&0x42C0u16.to_be_bytes());
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+        cpu.sr = 0x27_1B;
+
+        let cycles = cpu.step(&mut memory);
+        assert_eq!(cycles, 6);
+        assert_eq!(cpu.d_regs[0] & 0xFFFF, 0x001B);
+        assert_eq!(cpu.unknown_opcode_total(), 0);
     }
 }

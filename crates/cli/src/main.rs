@@ -1,7 +1,6 @@
 use std::error::Error;
 use std::io;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use megadrive_core::{Button, Cartridge, Emulator, FRAME_HEIGHT, FRAME_WIDTH};
 use sdl2::audio::AudioSpecDesired;
@@ -41,7 +40,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("Region       : {}", header.region);
     if boot_frames > 0 {
         fast_forward_boot_frames(&mut emulator, boot_frames);
+        let dropped = clear_audio_backlog(&mut emulator);
         println!("Boot skip    : {} frames", boot_frames);
+        if dropped > 0 {
+            println!("Boot audio   : dropped {dropped} stale samples");
+        }
     }
 
     run_window_loop(
@@ -115,6 +118,14 @@ fn fast_forward_boot_frames(emulator: &mut Emulator, frames: u64) {
     }
 }
 
+fn clear_audio_backlog(emulator: &mut Emulator) -> usize {
+    let pending = emulator.pending_audio_samples();
+    if pending > 0 {
+        let _ = emulator.drain_audio_samples(pending);
+    }
+    pending
+}
+
 fn run_window_loop(
     domestic_title: &str,
     overseas_title: &str,
@@ -122,6 +133,7 @@ fn run_window_loop(
 ) -> Result<(), Box<dyn Error>> {
     const AUDIO_QUEUE_TARGET_SAMPLES: usize = 4_096;
     const AUDIO_QUEUE_FEED_SAMPLES: usize = 2_048;
+    const AUDIO_PENDING_MAX_BACKLOG_SAMPLES: usize = AUDIO_QUEUE_TARGET_SAMPLES * 3;
 
     let sdl = sdl2::init().map_err(sdl_error)?;
     let video = sdl.video().map_err(|err| {
@@ -156,7 +168,7 @@ fn run_window_loop(
     };
 
     let window = video
-        .window(&title, 960, 672)
+        .window(&title, (FRAME_WIDTH as u32) * 3, (FRAME_HEIGHT as u32) * 3)
         .position_centered()
         .resizable()
         .build()
@@ -194,11 +206,7 @@ fn run_window_loop(
         .map_err(|err| io::Error::other(err.to_string()))?;
     audio_queue.resume();
 
-    let frame_budget = Duration::from_nanos(16_666_667);
-
     'running: loop {
-        let frame_start = Instant::now();
-
         for event in events.poll_iter() {
             match event {
                 Event::Quit { .. } => break 'running,
@@ -235,9 +243,17 @@ fn run_window_loop(
             }
         }
 
+        let pending_samples = emulator.pending_audio_samples();
+        if pending_samples > AUDIO_PENDING_MAX_BACKLOG_SAMPLES {
+            let stale = pending_samples - AUDIO_PENDING_MAX_BACKLOG_SAMPLES;
+            let _ = emulator.drain_audio_samples(stale);
+        }
+
         let queued_samples = (audio_queue.size() as usize) / std::mem::size_of::<i16>();
         if queued_samples < AUDIO_QUEUE_TARGET_SAMPLES && emulator.pending_audio_samples() > 0 {
-            let samples = emulator.drain_audio_samples(AUDIO_QUEUE_FEED_SAMPLES);
+            let needed =
+                (AUDIO_QUEUE_TARGET_SAMPLES - queued_samples).min(AUDIO_QUEUE_FEED_SAMPLES);
+            let samples = emulator.drain_audio_samples(needed);
             if !samples.is_empty() {
                 audio_queue
                     .queue_audio(&samples)
@@ -255,11 +271,6 @@ fn run_window_loop(
             .copy(&frame_texture, None, None)
             .map_err(|err| io::Error::other(err.to_string()))?;
         canvas.present();
-
-        let elapsed = frame_start.elapsed();
-        if elapsed < frame_budget {
-            std::thread::sleep(frame_budget - elapsed);
-        }
     }
 
     Ok(())
@@ -303,7 +314,8 @@ fn map_keycode_to_player_button(key: Keycode) -> Option<(u8, Button)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliOptions, parse_cli_options};
+    use super::{CliOptions, clear_audio_backlog, parse_cli_options};
+    use megadrive_core::{Cartridge, Emulator};
 
     #[test]
     fn parses_rom_only() {
@@ -352,5 +364,23 @@ mod tests {
         ])
         .expect_err("must fail");
         assert!(err.to_string().contains("--boot-frames requires a value"));
+    }
+
+    #[test]
+    fn clears_stale_audio_backlog_after_boot_fast_forward() {
+        let mut rom = vec![0; 0x200];
+        rom[4..8].copy_from_slice(&0x00000100u32.to_be_bytes());
+        rom[0x100..0x102].copy_from_slice(&0x4E71u16.to_be_bytes()); // NOP
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut emulator = Emulator::new(cart);
+        for _ in 0..128 {
+            emulator.step();
+        }
+
+        assert!(emulator.pending_audio_samples() > 0);
+        let dropped = clear_audio_backlog(&mut emulator);
+        assert!(dropped > 0);
+        assert_eq!(emulator.pending_audio_samples(), 0);
     }
 }
