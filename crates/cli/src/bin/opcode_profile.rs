@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::error::Error;
 
+use megadrive_core::ControllerType;
 use megadrive_core::cartridge::Cartridge;
 use megadrive_core::cpu::M68k;
 use megadrive_core::input::Button;
@@ -50,10 +51,24 @@ fn run() -> Result<(), Box<dyn Error>> {
     let hold_a = env::var("HOLD_A").is_ok();
     let force_b094 = env::var("FORCE_B094").is_ok();
     let force_b094_sticky = env::var("FORCE_B094_STICKY").is_ok();
-    let disable_sprites = env::var("DISABLE_SPRITES").is_ok();
-    let force_window_off = env::var("FORCE_WINDOW_OFF").is_ok();
     let dump_line_state = env::var("DUMP_LINE_STATE").is_ok();
+    let dump_plane_state = env::var("DUMP_PLANE_STATE").is_ok();
+    let dump_sprite_state = env::var("DUMP_SPRITE_STATE").is_ok();
+    let stop_frame = env::var("STOP_FRAME")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let dma_trace_limit = env::var("DMA_TRACE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8)
+        .clamp(1, 128);
     let dump_frame_path = env::var("DUMP_FRAME").ok();
+    let dump_frames: BTreeSet<u64> = env::var("DUMP_FRAMES")
+        .ok()
+        .map(|value| parse_frame_list(&value))
+        .unwrap_or_default();
+    let dump_frame_prefix = env::var("DUMP_FRAME_PREFIX").ok();
+    let mut dumped_frames = BTreeSet::new();
     let mut input_events = env::var("INPUT_SCRIPT")
         .ok()
         .map(|value| parse_input_script(&value))
@@ -64,6 +79,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     let rom = std::fs::read(&rom_path)?;
     let cart = Cartridge::from_bytes(rom)?;
     let mut memory = MemoryMap::new(cart);
+    if let Some(controller_type) = env::var("MEGADRIVE_PAD1")
+        .ok()
+        .and_then(|value| parse_controller_type(&value))
+    {
+        memory.set_controller_type(1, controller_type);
+    }
+    if let Some(controller_type) = env::var("MEGADRIVE_PAD2")
+        .ok()
+        .and_then(|value| parse_controller_type(&value))
+    {
+        memory.set_controller_type(2, controller_type);
+    }
     let mut cpu = M68k::new();
     if hold_start {
         memory.set_button_pressed(Button::Start, true);
@@ -83,8 +110,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut last_r1 = memory.vdp().register(1);
     let mut r1_trace_lines = 0usize;
     let mut watch_trace_lines = 0usize;
+    let mut steps_executed = 0usize;
 
     for step_idx in 0..steps {
+        steps_executed = step_idx + 1;
         while next_input_event < input_events.len()
             && input_events[next_input_event].frame <= memory.frame_count()
         {
@@ -126,17 +155,20 @@ fn run() -> Result<(), Box<dyn Error>> {
         memory.step_subsystems(cycles);
         if memory.step_vdp(cycles) {
             memory.request_z80_interrupt();
-        }
-        if force_window_off {
-            memory.vdp_mut().write_control_port(0x9100);
-            memory.vdp_mut().write_control_port(0x9200);
-        }
-        if disable_sprites {
-            let sat_base = ((memory.vdp().register(5) as usize & 0x7F) << 9) & 0xFFFF;
-            for offset in 0..(80 * 8) {
-                memory
-                    .vdp_mut()
-                    .write_vram_u8((sat_base + offset) as u16, 0);
+            let frame = memory.frame_count();
+            if !dump_frames.is_empty()
+                && dump_frames.contains(&frame)
+                && dumped_frames.insert(frame)
+                && let Some(prefix) = dump_frame_prefix.as_deref()
+            {
+                let path = format!("{prefix}_{frame:06}.ppm");
+                dump_frame_ppm(&path, memory.frame_buffer())?;
+                println!("dump frame seq   : frame={} path={}", frame, path);
+            }
+            if let Some(target) = stop_frame
+                && frame >= target
+            {
+                break;
             }
         }
         if !watch_addrs.is_empty() {
@@ -221,6 +253,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     println!("ROM             : {rom_path}");
     println!("steps           : {steps}");
+    println!("steps executed  : {steps_executed}");
     println!("pc              : 0x{:08X}", cpu.pc());
     println!("cycles          : {}", cpu.cycles());
     println!("frames          : {}", memory.frame_count());
@@ -230,25 +263,55 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("z80 cycles      : {}", memory.z80().cycles());
     println!("z80 unknown     : {}", memory.z80().unknown_opcode_total());
     println!(
-        "z80 state       : pc=0x{:04X} halted={} reset={} busreq={} busack={}",
+        "z80 state       : pc=0x{:04X} sp=0x{:04X} a={:02X} f={:02X} bc=0x{:04X} de=0x{:04X} hl=0x{:04X} halted={} reset={} busreq={} busack={}",
         memory.z80().pc(),
+        memory.z80().sp(),
+        memory.z80().a(),
+        memory.z80().f(),
+        memory.z80().bc_reg(),
+        memory.z80().de_reg(),
+        memory.z80().hl_reg(),
         memory.z80().halted(),
         memory.z80().reset_asserted(),
         memory.z80().bus_requested(),
         memory.z80().bus_granted()
     );
     println!("ym writes       : {}", memory.audio().ym_write_count());
+    println!("ym dac writes   : {}", memory.audio().ym_dac_write_count());
+    println!(
+        "ym src          : 68k={} z80={}",
+        memory.audio().ym_writes_from_68k(),
+        memory.audio().ym_writes_from_z80()
+    );
     println!("psg writes      : {}", memory.audio().psg_write_count());
+    println!(
+        "psg src         : 68k={} z80={}",
+        memory.audio().psg_writes_from_68k(),
+        memory.audio().psg_writes_from_z80()
+    );
     println!(
         "ym active ch    : {}",
         memory.audio().ym2612().active_channels()
     );
+    println!(
+        "ym regs         : 24={:02X} 25={:02X} 26={:02X} 27={:02X} 2A={:02X} 2B={:02X}",
+        memory.audio().ym2612().register(0, 0x24),
+        memory.audio().ym2612().register(0, 0x25),
+        memory.audio().ym2612().register(0, 0x26),
+        memory.audio().ym2612().register(0, 0x27),
+        memory.audio().ym2612().register(0, 0x2A),
+        memory.audio().ym2612().register(0, 0x2B)
+    );
+    let audio_channels = memory.audio().output_channels().max(1) as usize;
     let pending_audio = memory.pending_audio_samples();
-    let stale_audio = pending_audio.saturating_sub(4096);
+    let pending_audio_frames = pending_audio / audio_channels;
+    let probe_frames = 4096usize;
+    let probe_samples = probe_frames * audio_channels;
+    let stale_audio = pending_audio.saturating_sub(probe_samples);
     if stale_audio > 0 {
         let _ = memory.drain_audio_samples(stale_audio);
     }
-    let audio_probe = memory.drain_audio_samples(4096);
+    let audio_probe = memory.drain_audio_samples(probe_samples);
     let audio_nonzero = audio_probe.iter().filter(|&&sample| sample != 0).count();
     let audio_peak = audio_probe
         .iter()
@@ -268,9 +331,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         (sum_sq / audio_probe.len() as f64).sqrt()
     };
     println!(
-        "audio samples   : pending={} probe={} nonzero={} peak={} rms={:.1}",
+        "audio samples   : pending={} ({} frames @ {} ch) probe={} ({} frames) nonzero={} peak={} rms={:.1}",
         pending_audio,
+        pending_audio_frames,
+        audio_channels,
         audio_probe.len(),
+        audio_probe.len() / audio_channels,
         audio_nonzero,
         audio_peak,
         audio_rms
@@ -283,6 +349,24 @@ fn run() -> Result<(), Box<dyn Error>> {
             .map(|byte| format!("{byte:02X}"))
             .collect::<Vec<String>>()
             .join(" ")
+    );
+    println!(
+        "z80 ram[1B20..] : {:02X} {:02X} {:02X} {:02X}",
+        memory.z80().read_ram_u8(0x1B20),
+        memory.z80().read_ram_u8(0x1B21),
+        memory.z80().read_ram_u8(0x1B22),
+        memory.z80().read_ram_u8(0x1B23),
+    );
+    println!(
+        "z80 ram[03B0..] : {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+        memory.z80().read_ram_u8(0x03B0),
+        memory.z80().read_ram_u8(0x03B1),
+        memory.z80().read_ram_u8(0x03B2),
+        memory.z80().read_ram_u8(0x03B3),
+        memory.z80().read_ram_u8(0x03B4),
+        memory.z80().read_ram_u8(0x03B5),
+        memory.z80().read_ram_u8(0x03B6),
+        memory.z80().read_ram_u8(0x03B7),
     );
     print_register_snapshot(&cpu);
     let final_hash = framebuffer_hash(memory.frame_buffer());
@@ -306,7 +390,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     if dump_line_state {
         print_vdp_line_state_snapshot(&memory);
     }
-    print_dma_trace(&memory);
+    if dump_plane_state {
+        print_vdp_plane_state_snapshot(&memory);
+    }
+    if dump_sprite_state {
+        print_vdp_sprite_state_snapshot(&memory);
+    }
+    print_dma_trace(&memory, dma_trace_limit);
     print_ram_snapshot(&mut memory);
 
     for (idx, (opcode, count)) in cpu.unknown_opcode_histogram().iter().take(32).enumerate() {
@@ -620,11 +710,13 @@ fn print_video_memory_snapshot(memory: &MemoryMap) {
 
 fn print_vdp_line_state_snapshot(memory: &MemoryMap) {
     let vdp = memory.vdp();
-    println!("line state      : y r1 r2 r3 r4 r11 r13 r16 vs0 vs1 hsA hsB");
-    for &y in &[0usize, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 223] {
+    println!("line state      : y r1 r2 r3 r4 r11 r13 r16 r17 r18 vs0 vs1 hsA hsB");
+    for &y in &[
+        0usize, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 223,
+    ] {
         let hs = vdp.line_hscroll_words(y);
         println!(
-            "                  {:03} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:04X} {:04X} {:04X} {:04X}",
+            "                  {:03} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:04X} {:04X} {:04X} {:04X}",
             y,
             vdp.line_register(y, 1),
             vdp.line_register(y, 2),
@@ -633,6 +725,8 @@ fn print_vdp_line_state_snapshot(memory: &MemoryMap) {
             vdp.line_register(y, 11),
             vdp.line_register(y, 13),
             vdp.line_register(y, 16),
+            vdp.line_register(y, 17),
+            vdp.line_register(y, 18),
             vdp.line_vsram_u16(y, 0),
             vdp.line_vsram_u16(y, 1),
             hs[0],
@@ -648,6 +742,8 @@ fn print_vdp_line_state_snapshot(memory: &MemoryMap) {
     let mut prev_r11 = vdp.line_register(0, 11);
     let mut prev_r13 = vdp.line_register(0, 13);
     let mut prev_r16 = vdp.line_register(0, 16);
+    let mut prev_r17 = vdp.line_register(0, 17);
+    let mut prev_r18 = vdp.line_register(0, 18);
     let mut prev_vs0 = vdp.line_vsram_u16(0, 0);
     let mut prev_vs1 = vdp.line_vsram_u16(0, 1);
     let mut prev_hs = vdp.line_hscroll_words(0);
@@ -659,6 +755,8 @@ fn print_vdp_line_state_snapshot(memory: &MemoryMap) {
         let r11 = vdp.line_register(y, 11);
         let r13 = vdp.line_register(y, 13);
         let r16 = vdp.line_register(y, 16);
+        let r17 = vdp.line_register(y, 17);
+        let r18 = vdp.line_register(y, 18);
         let vs0 = vdp.line_vsram_u16(y, 0);
         let vs1 = vdp.line_vsram_u16(y, 1);
         let hs = vdp.line_hscroll_words(y);
@@ -669,25 +767,42 @@ fn print_vdp_line_state_snapshot(memory: &MemoryMap) {
             || r11 != prev_r11
             || r13 != prev_r13
             || r16 != prev_r16
+            || r17 != prev_r17
+            || r18 != prev_r18
             || vs0 != prev_vs0
             || vs1 != prev_vs1
             || hs != prev_hs
         {
             if changes < 24 {
                 println!(
-                    "                  change@{:03}: r1 {:02X}->{:02X} r2 {:02X}->{:02X} r3 {:02X}->{:02X} r4 {:02X}->{:02X} r11 {:02X}->{:02X} r13 {:02X}->{:02X} r16 {:02X}->{:02X} vs0 {:04X}->{:04X} vs1 {:04X}->{:04X} hsA {:04X}->{:04X} hsB {:04X}->{:04X}",
+                    "                  change@{:03}: r1 {:02X}->{:02X} r2 {:02X}->{:02X} r3 {:02X}->{:02X} r4 {:02X}->{:02X} r11 {:02X}->{:02X} r13 {:02X}->{:02X} r16 {:02X}->{:02X} r17 {:02X}->{:02X} r18 {:02X}->{:02X} vs0 {:04X}->{:04X} vs1 {:04X}->{:04X} hsA {:04X}->{:04X} hsB {:04X}->{:04X}",
                     y,
-                    prev_r1, r1,
-                    prev_r2, r2,
-                    prev_r3, r3,
-                    prev_r4, r4,
-                    prev_r11, r11,
-                    prev_r13, r13,
-                    prev_r16, r16,
-                    prev_vs0, vs0,
-                    prev_vs1, vs1,
-                    prev_hs[0], hs[0],
-                    prev_hs[1], hs[1]
+                    prev_r1,
+                    r1,
+                    prev_r2,
+                    r2,
+                    prev_r3,
+                    r3,
+                    prev_r4,
+                    r4,
+                    prev_r11,
+                    r11,
+                    prev_r13,
+                    r13,
+                    prev_r16,
+                    r16,
+                    prev_r17,
+                    r17,
+                    prev_r18,
+                    r18,
+                    prev_vs0,
+                    vs0,
+                    prev_vs1,
+                    vs1,
+                    prev_hs[0],
+                    hs[0],
+                    prev_hs[1],
+                    hs[1]
                 );
             }
             changes += 1;
@@ -698,6 +813,8 @@ fn print_vdp_line_state_snapshot(memory: &MemoryMap) {
             prev_r11 = r11;
             prev_r13 = r13;
             prev_r16 = r16;
+            prev_r17 = r17;
+            prev_r18 = r18;
             prev_vs0 = vs0;
             prev_vs1 = vs1;
             prev_hs = hs;
@@ -706,17 +823,269 @@ fn print_vdp_line_state_snapshot(memory: &MemoryMap) {
     println!("line changes    : {}", changes);
 }
 
-fn print_dma_trace(memory: &MemoryMap) {
+fn print_vdp_plane_state_snapshot(memory: &MemoryMap) {
+    fn plane_size_code_to_tiles(code: u8) -> usize {
+        match code & 0x3 {
+            0x0 => 32,
+            0x1 => 64,
+            0x3 => 128,
+            _ => 32,
+        }
+    }
+
+    fn read_name_entry(
+        vdp: &megadrive_core::vdp::Vdp,
+        base: usize,
+        width: usize,
+        x: usize,
+        y: usize,
+    ) -> u16 {
+        let addr = (base + (y * width + x) * 2) & 0xFFFF;
+        let hi = vdp.read_vram_u8(addr as u16) as u16;
+        let lo = vdp.read_vram_u8(((addr + 1) & 0xFFFF) as u16) as u16;
+        (hi << 8) | lo
+    }
+
+    let vdp = memory.vdp();
+    let reg16 = vdp.register(16);
+    let width = plane_size_code_to_tiles(reg16 & 0x03);
+    let height = plane_size_code_to_tiles((reg16 >> 4) & 0x03);
+    let plane_a_base = ((vdp.register(2) as usize & 0x38) << 10) & 0xFFFF;
+    let plane_b_base = ((vdp.register(4) as usize & 0x07) << 13) & 0xFFFF;
+
+    let mut a_nonzero = 0usize;
+    let mut b_nonzero = 0usize;
+    let mut a_priority = 0usize;
+    let mut b_priority = 0usize;
+    let mut a_row_nonzero = vec![0usize; height];
+    let mut b_row_nonzero = vec![0usize; height];
+    for y in 0..height {
+        for x in 0..width {
+            let a = read_name_entry(vdp, plane_a_base, width, x, y);
+            let b = read_name_entry(vdp, plane_b_base, width, x, y);
+            if a != 0 {
+                a_nonzero += 1;
+                a_row_nonzero[y] += 1;
+            }
+            if b != 0 {
+                b_nonzero += 1;
+                b_row_nonzero[y] += 1;
+            }
+            if (a & 0x8000) != 0 {
+                a_priority += 1;
+            }
+            if (b & 0x8000) != 0 {
+                b_priority += 1;
+            }
+        }
+    }
+
+    println!(
+        "plane snapshot  : size={}x{} A_base={:04X} B_base={:04X}",
+        width, height, plane_a_base, plane_b_base
+    );
+    println!(
+        "                 A_nonzero={}/{} A_prio={} B_nonzero={}/{} B_prio={}",
+        a_nonzero,
+        width * height,
+        a_priority,
+        b_nonzero,
+        width * height,
+        b_priority
+    );
+
+    let mut rows_to_print = vec![0usize, 1, 2, 8, 16, 24, 31];
+    if let Ok(range) = std::env::var("DUMP_PLANE_ROW_RANGE") {
+        if let Some((start, end)) = range.split_once(':') {
+            if let (Ok(start), Ok(end)) =
+                (start.trim().parse::<usize>(), end.trim().parse::<usize>())
+            {
+                rows_to_print.clear();
+                for y in start..=end {
+                    if y < height {
+                        rows_to_print.push(y);
+                    }
+                }
+            }
+        }
+    }
+    let row_cols = std::env::var("DUMP_PLANE_ROW_COLS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3)
+        .clamp(1, width.max(1));
+    println!(
+        "                 row_detail rows={} cols={}",
+        rows_to_print.len(),
+        row_cols
+    );
+    for y in rows_to_print {
+        if y >= height {
+            continue;
+        }
+        let mut a_vals = Vec::with_capacity(row_cols);
+        let mut b_vals = Vec::with_capacity(row_cols);
+        for x in 0..row_cols {
+            a_vals.push(format!(
+                "{:04X}",
+                read_name_entry(vdp, plane_a_base, width, x, y)
+            ));
+            b_vals.push(format!(
+                "{:04X}",
+                read_name_entry(vdp, plane_b_base, width, x, y)
+            ));
+        }
+        println!(
+            "                 row{:02} A:{}  B:{}  nzA={:02}/{:02} nzB={:02}/{:02}",
+            y,
+            a_vals.join(" "),
+            b_vals.join(" "),
+            a_row_nonzero[y],
+            width,
+            b_row_nonzero[y],
+            width
+        );
+    }
+}
+
+fn print_vdp_sprite_state_snapshot(memory: &MemoryMap) {
+    let vdp = memory.vdp();
+    let h40 = (vdp.register(12) & 0x01) != 0;
+    let sat_mask = if h40 { 0x7E } else { 0x7F };
+    let sat_base = ((vdp.register(5) as usize & sat_mask) << 9) & 0xFFFF;
+    let read_word = |addr: usize| -> u16 {
+        let hi = vdp.read_vram_u8((addr & 0xFFFF) as u16) as u16;
+        let lo = vdp.read_vram_u8(((addr + 1) & 0xFFFF) as u16) as u16;
+        (hi << 8) | lo
+    };
+
+    println!(
+        "sprite snapshot : sat_base={:04X} mode={} (showing up to 40 linked entries)",
+        sat_base,
+        if h40 { "H40" } else { "H32" }
+    );
+    println!("                  idx link x y size tile attr pal prio hflip vflip mask nz c14 c15");
+
+    let mut idx = 0usize;
+    let mut visited = [false; 80];
+    let mut traversed = 0usize;
+    for _ in 0..80 {
+        if idx >= 80 || visited[idx] {
+            break;
+        }
+        visited[idx] = true;
+        let entry = sat_base + idx * 8;
+        let y_word = read_word(entry);
+        let size_link = read_word(entry + 2);
+        let attr = read_word(entry + 4);
+        let x_word = read_word(entry + 6);
+
+        let link = (size_link & 0x007F) as usize;
+        let width_tiles = ((size_link >> 10) & 0x3) as usize + 1;
+        let height_tiles = ((size_link >> 8) & 0x3) as usize + 1;
+        let x = (x_word & 0x01FF) as i32 - 128;
+        let y = (y_word & 0x03FF) as i32 - 128;
+        let tile_start = (attr & 0x07FF) as usize;
+        let pal = ((attr >> 13) & 0x3) as usize;
+        let prio = (attr & 0x8000) != 0;
+        let hflip = (attr & 0x0800) != 0;
+        let vflip = (attr & 0x1000) != 0;
+        let is_mask = (x_word & 0x01FF) == 0;
+        let mut nonzero = 0usize;
+        let mut control14 = 0usize;
+        let mut control15 = 0usize;
+        let tile_count = width_tiles * height_tiles;
+        for tile_offset in 0..tile_count {
+            let base = (tile_start + tile_offset) * 32;
+            for row in 0..8usize {
+                for col in 0..8usize {
+                    let addr = (base + row * 4 + col / 2) & 0xFFFF;
+                    let byte = vdp.read_vram_u8(addr as u16);
+                    let px = if (col & 1) == 0 {
+                        byte >> 4
+                    } else {
+                        byte & 0x0F
+                    };
+                    if px != 0 {
+                        nonzero += 1;
+                        if px == 14 {
+                            control14 += 1;
+                        } else if px == 15 {
+                            control15 += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let control14_ratio = if nonzero == 0 {
+            0usize
+        } else {
+            (control14 * 100) / nonzero
+        };
+        let control15_ratio = if nonzero == 0 {
+            0usize
+        } else {
+            (control15 * 100) / nonzero
+        };
+
+        if traversed < 40 {
+            println!(
+                "                  {:02}  {:02}  {:4} {:4} {}x{} {:04X} {:04X}  {}    {}     {}     {}    {}  {:4} {:3}% {:3}%",
+                idx,
+                link,
+                x,
+                y,
+                width_tiles,
+                height_tiles,
+                tile_start,
+                attr,
+                pal,
+                u8::from(prio),
+                u8::from(hflip),
+                u8::from(vflip),
+                u8::from(is_mask),
+                nonzero,
+                control14_ratio,
+                control15_ratio,
+            );
+        }
+        traversed += 1;
+
+        if link == 0 || link == idx {
+            break;
+        }
+        idx = link;
+    }
+    println!("sprite entries  : {traversed}");
+}
+
+fn print_dma_trace(memory: &MemoryMap, limit: usize) {
     let trace = memory.dma_trace();
     if trace.is_empty() {
         println!("dma trace       : (none)");
         return;
     }
-    println!("dma trace       : {} entries (latest first)", trace.len());
-    for entry in trace.iter().rev().take(8) {
+    println!(
+        "dma trace       : {} entries (latest first, showing {})",
+        trace.len(),
+        limit.min(trace.len())
+    );
+    for entry in trace.iter().rev().take(limit) {
+        let last_dest = entry.dest_addr.wrapping_add(
+            entry
+                .auto_increment
+                .saturating_mul(entry.words.saturating_sub(1) as u16),
+        );
         println!(
-            "                  {:?} src=0x{:08X} words={} first={:04X} last={:04X}",
-            entry.target, entry.source_addr, entry.words, entry.first_word, entry.last_word
+            "                  {:?} src=0x{:08X} dst=0x{:04X}..0x{:04X} inc={} words={} first={:04X} last={:04X}",
+            entry.target,
+            entry.source_addr,
+            entry.dest_addr,
+            last_dest,
+            entry.auto_increment,
+            entry.words,
+            entry.first_word,
+            entry.last_word
         );
     }
 }
@@ -751,6 +1120,35 @@ fn parse_u32_value(value: &str) -> Option<u32> {
     }
 }
 
+fn parse_frame_list(value: &str) -> BTreeSet<u64> {
+    let mut out = BTreeSet::new();
+    for token in value.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = token.split_once('-') {
+            let start = start.trim().parse::<u64>().ok();
+            let end = end.trim().parse::<u64>().ok();
+            if let (Some(start), Some(end)) = (start, end) {
+                let (lo, hi) = if start <= end {
+                    (start, end)
+                } else {
+                    (end, start)
+                };
+                for frame in lo..=hi {
+                    out.insert(frame);
+                }
+                continue;
+            }
+        }
+        if let Ok(frame) = token.parse::<u64>() {
+            out.insert(frame);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_cli_args;
@@ -780,6 +1178,21 @@ mod tests {
         let args = vec!["roms/Sonic.md".to_string(), "--bad".to_string()];
         let err = parse_cli_args(args).expect_err("must fail");
         assert!(err.to_string().contains("unknown option"));
+    }
+
+    #[test]
+    fn parse_frame_list_accepts_single_values_and_ranges() {
+        let frames = super::parse_frame_list("1,3-5,8");
+        assert_eq!(
+            frames.into_iter().collect::<Vec<u64>>(),
+            vec![1, 3, 4, 5, 8]
+        );
+    }
+
+    #[test]
+    fn parse_frame_list_ignores_invalid_tokens() {
+        let frames = super::parse_frame_list("2,foo,9-bar,7");
+        assert_eq!(frames.into_iter().collect::<Vec<u64>>(), vec![2, 7]);
     }
 }
 
@@ -848,10 +1261,27 @@ fn parse_button(value: &str) -> Option<Button> {
         Some(Button::B)
     } else if value.eq_ignore_ascii_case("C") {
         Some(Button::C)
+    } else if value.eq_ignore_ascii_case("X") {
+        Some(Button::X)
+    } else if value.eq_ignore_ascii_case("Y") {
+        Some(Button::Y)
+    } else if value.eq_ignore_ascii_case("Z") {
+        Some(Button::Z)
+    } else if value.eq_ignore_ascii_case("MODE") {
+        Some(Button::Mode)
     } else if value.eq_ignore_ascii_case("START") {
         Some(Button::Start)
     } else {
         None
+    }
+}
+
+fn parse_controller_type(value: &str) -> Option<ControllerType> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "3" | "3b" | "3btn" | "3button" | "three" => Some(ControllerType::ThreeButton),
+        "6" | "6b" | "6btn" | "6button" | "six" => Some(ControllerType::SixButton),
+        _ => None,
     }
 }
 

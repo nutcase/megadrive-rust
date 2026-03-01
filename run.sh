@@ -16,7 +16,10 @@ if [[ ! -f "$ROM_PATH" ]]; then
   exit 1
 fi
 
-: "${MEGADRIVE_BOOT_FRAMES:=600}"
+# Default to no boot skip. You can still override with:
+#   MEGADRIVE_BOOT_FRAMES=<N> ./run.sh <rom>
+#   ./run.sh <rom> --boot-frames <N>
+: "${MEGADRIVE_BOOT_FRAMES:=0}"
 export MEGADRIVE_BOOT_FRAMES
 
 exec cargo run --release --manifest-path "$SCRIPT_DIR/Cargo.toml" -p megadrive-cli --bin megadrive-cli -- "$ROM_PATH" "$@"

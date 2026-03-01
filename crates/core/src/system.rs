@@ -1,6 +1,6 @@
 use crate::cartridge::Cartridge;
 use crate::cpu::M68k;
-use crate::input::Button;
+use crate::input::{Button, ControllerType};
 use crate::memory::MemoryMap;
 use crate::vdp::{FRAME_HEIGHT, FRAME_WIDTH};
 
@@ -65,12 +65,24 @@ impl Emulator {
         self.memory.set_button2_pressed(button, pressed);
     }
 
+    pub fn set_controller_type(&mut self, player: u8, controller_type: ControllerType) {
+        self.memory.set_controller_type(player, controller_type);
+    }
+
     pub fn pending_audio_samples(&self) -> usize {
         self.memory.pending_audio_samples()
     }
 
     pub fn drain_audio_samples(&mut self, max_samples: usize) -> Vec<i16> {
         self.memory.drain_audio_samples(max_samples)
+    }
+
+    pub fn set_audio_output_sample_rate_hz(&mut self, hz: u32) {
+        self.memory.set_audio_output_sample_rate_hz(hz);
+    }
+
+    pub fn audio_output_channels(&self) -> u8 {
+        self.memory.audio_output_channels()
     }
 }
 

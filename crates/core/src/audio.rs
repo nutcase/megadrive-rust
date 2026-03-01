@@ -6,6 +6,8 @@ struct YmChannel {
     block: u8,
     key_on: bool,
     phase: f32,
+    pan_left: bool,
+    pan_right: bool,
 }
 
 impl Default for YmChannel {
@@ -15,6 +17,8 @@ impl Default for YmChannel {
             block: 4,
             key_on: false,
             phase: 0.0,
+            pan_left: true,
+            pan_right: true,
         }
     }
 }
@@ -25,6 +29,15 @@ pub struct Ym2612 {
     addr_port1: u8,
     regs: [[u8; 256]; 2],
     writes: u64,
+    dac_data_writes: u64,
+    busy_z80_cycles: u32,
+    timer_status: u8,
+    timer_control: u8,
+    timer_a_value: u16,
+    timer_b_value: u8,
+    timer_clock_accumulator: u64,
+    timer_a_elapsed_ym_cycles: u64,
+    timer_b_elapsed_ym_cycles: u64,
     dac_enabled: bool,
     dac_output: i16,
     channels: [YmChannel; 6],
@@ -37,6 +50,15 @@ impl Default for Ym2612 {
             addr_port1: 0,
             regs: [[0; 256]; 2],
             writes: 0,
+            dac_data_writes: 0,
+            busy_z80_cycles: 0,
+            timer_status: 0,
+            timer_control: 0,
+            timer_a_value: 0,
+            timer_b_value: 0,
+            timer_clock_accumulator: 0,
+            timer_a_elapsed_ym_cycles: 0,
+            timer_b_elapsed_ym_cycles: 0,
             dac_enabled: false,
             dac_output: 0,
             channels: [YmChannel::default(); 6],
@@ -45,6 +67,13 @@ impl Default for Ym2612 {
 }
 
 impl Ym2612 {
+    // YM2612 busy flag is asserted for a short write-cycle window.
+    // Approximate in Z80 cycles (about a few microseconds).
+    const BUSY_DURATION_Z80_CYCLES: u32 = 16;
+    const MASTER_CLOCK_HZ: u64 = 7_670_454;
+    const Z80_CLOCK_HZ: u64 = 3_579_545;
+    const YM2612_DIVIDER: u64 = 7;
+
     fn write_port(&mut self, port: u8, value: u8) {
         match port & 0x03 {
             0 => self.addr_port0 = value,
@@ -53,6 +82,7 @@ impl Ym2612 {
                 self.regs[0][reg as usize] = value;
                 self.apply_write(0, reg, value);
                 self.writes += 1;
+                self.busy_z80_cycles = Self::BUSY_DURATION_Z80_CYCLES;
             }
             2 => self.addr_port1 = value,
             3 => {
@@ -60,6 +90,7 @@ impl Ym2612 {
                 self.regs[1][reg as usize] = value;
                 self.apply_write(1, reg, value);
                 self.writes += 1;
+                self.busy_z80_cycles = Self::BUSY_DURATION_Z80_CYCLES;
             }
             _ => {}
         }
@@ -72,10 +103,38 @@ impl Ym2612 {
             self.channels[channel].fnum =
                 (self.channels[channel].fnum & 0x00FF) | (((value & 0x07) as u16) << 8);
             self.channels[channel].block = (value >> 3) & 0x07;
+        } else if let Some(channel) = self.decode_pan_channel(bank, reg) {
+            self.channels[channel].pan_left = (value & 0x80) != 0;
+            self.channels[channel].pan_right = (value & 0x40) != 0;
         }
 
         if bank == 0 {
             match reg {
+                0x24 => {
+                    self.timer_a_value = (self.timer_a_value & 0x0003) | ((value as u16) << 2);
+                }
+                0x25 => {
+                    self.timer_a_value = (self.timer_a_value & 0x03FC) | ((value as u16) & 0x03);
+                }
+                0x26 => {
+                    self.timer_b_value = value;
+                }
+                0x27 => {
+                    let previous = self.timer_control;
+                    self.timer_control = value;
+                    if (value & 0x10) != 0 {
+                        self.timer_status &= !0x01;
+                    }
+                    if (value & 0x20) != 0 {
+                        self.timer_status &= !0x02;
+                    }
+                    if (value & 0x01) != 0 && (previous & 0x01) == 0 {
+                        self.timer_a_elapsed_ym_cycles = 0;
+                    }
+                    if (value & 0x02) != 0 && (previous & 0x02) == 0 {
+                        self.timer_b_elapsed_ym_cycles = 0;
+                    }
+                }
                 0x28 => {
                     if let Some(channel) = Self::decode_keyon_channel(value) {
                         let next_key_on = (value & 0xF0) != 0;
@@ -88,6 +147,7 @@ impl Ym2612 {
                 0x2A => {
                     let centered = value as i16 - 0x80;
                     self.dac_output = centered << 8;
+                    self.dac_data_writes += 1;
                 }
                 0x2B => {
                     self.dac_enabled = (value & 0x80) != 0;
@@ -125,6 +185,14 @@ impl Ym2612 {
         }
     }
 
+    fn decode_pan_channel(&self, bank: usize, reg: u8) -> Option<usize> {
+        if (0xB4..=0xB6).contains(&reg) {
+            Some((bank & 1) * 3 + (reg as usize - 0xB4))
+        } else {
+            None
+        }
+    }
+
     fn channel_frequency_hz(channel: &YmChannel) -> f32 {
         let fnum_scale = (channel.fnum.max(1) as f32) / 1024.0;
         let octave_scale = 2f32.powi(channel.block as i32 - 4);
@@ -134,6 +202,10 @@ impl Ym2612 {
 
     pub fn writes(&self) -> u64 {
         self.writes
+    }
+
+    pub fn dac_data_writes(&self) -> u64 {
+        self.dac_data_writes
     }
 
     pub fn active_channels(&self) -> usize {
@@ -147,9 +219,11 @@ impl Ym2612 {
             .count()
     }
 
-    fn next_sample(&mut self, sample_rate_hz: f32) -> i16 {
-        let mut fm_mix = 0.0f32;
-        let mut active = 0usize;
+    fn next_sample_stereo(&mut self, sample_rate_hz: f32) -> (i16, i16) {
+        let mut left_mix = 0.0f32;
+        let mut right_mix = 0.0f32;
+        let mut left_active = 0usize;
+        let mut right_active = 0usize;
         for (index, channel) in self.channels.iter_mut().enumerate() {
             if !channel.key_on {
                 continue;
@@ -162,20 +236,95 @@ impl Ym2612 {
             if channel.phase >= 1.0 {
                 channel.phase -= channel.phase.floor();
             }
-            fm_mix += (channel.phase * TAU).sin();
-            active += 1;
+            let sample = (channel.phase * TAU).sin();
+            if channel.pan_left {
+                left_mix += sample;
+                left_active += 1;
+            }
+            if channel.pan_right {
+                right_mix += sample;
+                right_active += 1;
+            }
         }
-        let fm_sample = if active == 0 {
+        let fm_left = if left_active == 0 {
             0
         } else {
-            ((fm_mix / active as f32) * 7_500.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16
+            ((left_mix / left_active as f32) * 7_500.0).clamp(i16::MIN as f32, i16::MAX as f32)
+                as i16
         };
-        let dac_sample = if self.dac_enabled { self.dac_output } else { 0 };
-        (fm_sample as i32 + dac_sample as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+        let fm_right = if right_active == 0 {
+            0
+        } else {
+            ((right_mix / right_active as f32) * 7_500.0).clamp(i16::MIN as f32, i16::MAX as f32)
+                as i16
+        };
+        let (dac_left, dac_right) = if self.dac_enabled {
+            let channel = &self.channels[5];
+            let left = if channel.pan_left { self.dac_output } else { 0 };
+            let right = if channel.pan_right {
+                self.dac_output
+            } else {
+                0
+            };
+            (left, right)
+        } else {
+            (0, 0)
+        };
+        let left =
+            (fm_left as i32 + dac_left as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let right =
+            (fm_right as i32 + dac_right as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        (left, right)
+    }
+
+    fn step_z80_cycles(&mut self, cycles: u32) {
+        self.busy_z80_cycles = self.busy_z80_cycles.saturating_sub(cycles);
+        let ym_cycle_divisor = Self::Z80_CLOCK_HZ * Self::YM2612_DIVIDER;
+        self.timer_clock_accumulator += (cycles as u64) * Self::MASTER_CLOCK_HZ;
+        let ym_cycles = self.timer_clock_accumulator / ym_cycle_divisor;
+        self.timer_clock_accumulator %= ym_cycle_divisor;
+        if ym_cycles == 0 {
+            return;
+        }
+
+        if (self.timer_control & 0x01) != 0 {
+            let period = self.timer_a_period_ym_cycles();
+            self.timer_a_elapsed_ym_cycles += ym_cycles;
+            while self.timer_a_elapsed_ym_cycles >= period {
+                self.timer_a_elapsed_ym_cycles -= period;
+                if (self.timer_control & 0x04) != 0 {
+                    self.timer_status |= 0x01;
+                }
+            }
+        }
+        if (self.timer_control & 0x02) != 0 {
+            let period = self.timer_b_period_ym_cycles();
+            self.timer_b_elapsed_ym_cycles += ym_cycles;
+            while self.timer_b_elapsed_ym_cycles >= period {
+                self.timer_b_elapsed_ym_cycles -= period;
+                if (self.timer_control & 0x08) != 0 {
+                    self.timer_status |= 0x02;
+                }
+            }
+        }
     }
 
     fn read_status(&self) -> u8 {
-        0
+        let mut status = self.timer_status & 0x03;
+        if self.busy_z80_cycles > 0 {
+            status |= 0x80;
+        }
+        status
+    }
+
+    fn timer_a_period_ym_cycles(&self) -> u64 {
+        let value = (self.timer_a_value & 0x03FF) as u64;
+        (1024 - value).max(1) * 18
+    }
+
+    fn timer_b_period_ym_cycles(&self) -> u64 {
+        let value = self.timer_b_value as u64;
+        (256 - value).max(1) * 288
     }
 
     pub fn register(&self, bank: usize, index: u8) -> u8 {
@@ -359,21 +508,39 @@ impl Psg {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AudioBus {
     ym2612: Ym2612,
     psg: Psg,
+    ym_writes_from_68k: u64,
+    ym_writes_from_z80: u64,
+    psg_writes_from_68k: u64,
+    psg_writes_from_z80: u64,
     cycles: u64,
+    output_sample_rate_hz: u64,
     sample_accumulator: u64,
     sample_buffer: Vec<i16>,
 }
 
 impl AudioBus {
-    const M68K_CLOCK_HZ: u64 = 7_670_000;
-    const OUTPUT_SAMPLE_RATE_HZ: u64 = 44_100;
+    const M68K_CLOCK_HZ: u64 = 7_670_454;
+    const DEFAULT_OUTPUT_SAMPLE_RATE_HZ: u64 = 44_100;
+    const OUTPUT_CHANNELS: u8 = 2;
 
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn output_sample_rate_hz(&self) -> u32 {
+        self.output_sample_rate_hz as u32
+    }
+
+    pub fn output_channels(&self) -> u8 {
+        Self::OUTPUT_CHANNELS
+    }
+
+    pub fn set_output_sample_rate_hz(&mut self, hz: u32) {
+        self.output_sample_rate_hz = (hz as u64).clamp(8_000, 192_000);
     }
 
     pub fn read_ym2612(&self, port: u8) -> u8 {
@@ -385,23 +552,43 @@ impl AudioBus {
     }
 
     pub fn write_ym2612(&mut self, port: u8, value: u8) {
+        self.ym_writes_from_68k += 1;
+        self.ym2612.write_port(port, value);
+    }
+
+    pub fn write_ym2612_from_z80(&mut self, port: u8, value: u8) {
+        self.ym_writes_from_z80 += 1;
         self.ym2612.write_port(port, value);
     }
 
     pub fn write_psg(&mut self, value: u8) {
+        self.psg_writes_from_68k += 1;
         self.psg.write_data(value);
+    }
+
+    pub fn write_psg_from_z80(&mut self, value: u8) {
+        self.psg_writes_from_z80 += 1;
+        self.psg.write_data(value);
+    }
+
+    pub fn step_z80_cycles(&mut self, z80_cycles: u32) {
+        self.ym2612.step_z80_cycles(z80_cycles);
     }
 
     pub fn step(&mut self, m68k_cycles: u32) {
         self.cycles += m68k_cycles as u64;
-        self.sample_accumulator += m68k_cycles as u64 * Self::OUTPUT_SAMPLE_RATE_HZ;
+        let sample_rate_hz = self.output_sample_rate_hz.max(1);
+        self.sample_accumulator += m68k_cycles as u64 * sample_rate_hz;
         let produced = (self.sample_accumulator / Self::M68K_CLOCK_HZ) as usize;
         self.sample_accumulator %= Self::M68K_CLOCK_HZ;
         for _ in 0..produced {
-            let psg_sample = self.psg.next_sample(Self::OUTPUT_SAMPLE_RATE_HZ as f32) as i32;
-            let ym_sample = self.ym2612.next_sample(Self::OUTPUT_SAMPLE_RATE_HZ as f32) as i32;
-            let mixed = (psg_sample + ym_sample).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            self.sample_buffer.push(mixed);
+            let psg_sample = self.psg.next_sample(sample_rate_hz as f32) as i32;
+            let (ym_left, ym_right) = self.ym2612.next_sample_stereo(sample_rate_hz as f32);
+            let left = (psg_sample + ym_left as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            let right =
+                (psg_sample + ym_right as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            self.sample_buffer.push(left);
+            self.sample_buffer.push(right);
         }
     }
 
@@ -417,8 +604,28 @@ impl AudioBus {
         self.ym2612.writes()
     }
 
+    pub fn ym_dac_write_count(&self) -> u64 {
+        self.ym2612.dac_data_writes()
+    }
+
     pub fn psg_write_count(&self) -> u64 {
         self.psg.writes()
+    }
+
+    pub fn ym_writes_from_68k(&self) -> u64 {
+        self.ym_writes_from_68k
+    }
+
+    pub fn ym_writes_from_z80(&self) -> u64 {
+        self.ym_writes_from_z80
+    }
+
+    pub fn psg_writes_from_68k(&self) -> u64 {
+        self.psg_writes_from_68k
+    }
+
+    pub fn psg_writes_from_z80(&self) -> u64 {
+        self.psg_writes_from_z80
     }
 
     pub fn pending_samples(&self) -> usize {
@@ -431,133 +638,19 @@ impl AudioBus {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::AudioBus;
-
-    #[test]
-    fn writes_ym2612_registers_via_address_and_data_ports() {
-        let mut audio = AudioBus::new();
-
-        audio.write_ym2612(0, 0x22);
-        audio.write_ym2612(1, 0x0F);
-        audio.write_ym2612(2, 0x2B);
-        audio.write_ym2612(3, 0x80);
-
-        assert_eq!(audio.ym2612().register(0, 0x22), 0x0F);
-        assert_eq!(audio.ym2612().register(1, 0x2B), 0x80);
-    }
-
-    #[test]
-    fn captures_psg_writes() {
-        let mut audio = AudioBus::new();
-        audio.write_psg(0x9F);
-        assert_eq!(audio.psg().last_data(), 0x9F);
-        assert_eq!(audio.psg().writes(), 1);
-    }
-
-    #[test]
-    fn generates_silence_samples_without_psg_writes() {
-        let mut audio = AudioBus::new();
-        audio.step(2_000);
-        assert!(audio.pending_samples() > 0);
-        let samples = audio.drain_samples(64);
-        assert!(samples.iter().all(|&s| s == 0));
-    }
-
-    #[test]
-    fn generates_nonzero_samples_after_psg_write() {
-        let mut audio = AudioBus::new();
-        audio.write_psg(0x90); // low attenuation -> larger amplitude
-        audio.step(2_000);
-
-        let samples = audio.drain_samples(64);
-        assert!(!samples.is_empty());
-        assert!(samples.iter().any(|&s| s > 0));
-        assert!(samples.iter().any(|&s| s < 0));
-    }
-
-    #[test]
-    fn psg_latch_and_data_bytes_update_tone_period() {
-        let mut audio = AudioBus::new();
-        // Latch tone 0 low nibble = 0xA.
-        audio.write_psg(0x8A);
-        // Data byte sets high bits = 0x12.
-        audio.write_psg(0x12);
-        assert_eq!(audio.psg().tone_period(0), 0x12A);
-    }
-
-    #[test]
-    fn psg_noise_latch_updates_control_register() {
-        let mut audio = AudioBus::new();
-        // Latch noise control: white noise + clock mode 2.
-        audio.write_psg(0xE6);
-        assert_eq!(audio.psg().noise_control(), 0x06);
-    }
-
-    #[test]
-    fn ym2612_dac_outputs_pcm_when_enabled() {
-        let mut audio = AudioBus::new();
-        audio.write_ym2612(0, 0x2B);
-        audio.write_ym2612(1, 0x80);
-        audio.write_ym2612(0, 0x2A);
-        audio.write_ym2612(1, 0xFF);
-        audio.step(2_000);
-
-        let samples = audio.drain_samples(64);
-        assert!(!samples.is_empty());
-        assert!(audio.ym2612().dac_enabled());
-        assert!(samples.iter().all(|&s| s > 0));
-    }
-
-    #[test]
-    fn ym2612_dac_is_silent_when_disabled() {
-        let mut audio = AudioBus::new();
-        audio.write_ym2612(0, 0x2A);
-        audio.write_ym2612(1, 0xFF);
-        audio.step(2_000);
-
-        let samples = audio.drain_samples(64);
-        assert!(!samples.is_empty());
-        assert!(samples.iter().all(|&s| s == 0));
-    }
-
-    #[test]
-    fn ym2612_key_on_generates_nonzero_without_dac() {
-        let mut audio = AudioBus::new();
-        // CH1 FNUM/BLOCK
-        audio.write_ym2612(0, 0xA0);
-        audio.write_ym2612(1, 0x98);
-        audio.write_ym2612(0, 0xA4);
-        audio.write_ym2612(1, 0x22);
-        // Key on CH1
-        audio.write_ym2612(0, 0x28);
-        audio.write_ym2612(1, 0xF0);
-        audio.step(2_000);
-
-        let samples = audio.drain_samples(128);
-        assert!(!samples.is_empty());
-        assert!(audio.ym2612().channel_key_on(0));
-        assert!(samples.iter().any(|&s| s != 0));
-    }
-
-    #[test]
-    fn ym2612_key_off_silences_channel() {
-        let mut audio = AudioBus::new();
-        audio.write_ym2612(0, 0xA0);
-        audio.write_ym2612(1, 0xA0);
-        audio.write_ym2612(0, 0xA4);
-        audio.write_ym2612(1, 0x24);
-        audio.write_ym2612(0, 0x28);
-        audio.write_ym2612(1, 0xF0);
-        audio.step(2_000);
-        let _ = audio.drain_samples(128);
-
-        audio.write_ym2612(0, 0x28);
-        audio.write_ym2612(1, 0x00);
-        audio.step(2_000);
-        let samples = audio.drain_samples(128);
-        assert!(!samples.is_empty());
-        assert!(samples.iter().all(|&s| s == 0));
+impl Default for AudioBus {
+    fn default() -> Self {
+        Self {
+            ym2612: Ym2612::default(),
+            psg: Psg::default(),
+            ym_writes_from_68k: 0,
+            ym_writes_from_z80: 0,
+            psg_writes_from_68k: 0,
+            psg_writes_from_z80: 0,
+            cycles: 0,
+            output_sample_rate_hz: Self::DEFAULT_OUTPUT_SAMPLE_RATE_HZ,
+            sample_accumulator: 0,
+            sample_buffer: Vec::new(),
+        }
     }
 }

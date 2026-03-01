@@ -6,8 +6,15 @@ use std::collections::BTreeMap;
 
 const FLAG_S: u8 = 0x80;
 const FLAG_Z: u8 = 0x40;
+const FLAG_Y: u8 = 0x20;
 const FLAG_PV: u8 = 0x04;
+const FLAG_H: u8 = 0x10;
+const FLAG_X: u8 = 0x08;
+const FLAG_N: u8 = 0x02;
 const FLAG_C: u8 = 0x01;
+const M68K_CLOCK_HZ: u64 = 7_670_454;
+const Z80_CLOCK_HZ: u64 = 3_579_545;
+const AUDIO_IO_WAIT_CYCLES: u16 = 8;
 const IO_VERSION_ADDR: u32 = 0xA10000;
 const IO_PORT1_DATA_ADDR: u32 = 0xA10002;
 const IO_PORT2_DATA_ADDR: u32 = 0xA10004;
@@ -29,6 +36,10 @@ pub struct Z80 {
     bus_grant_delay_cycles: u32,
     reset_asserted: bool,
     cycles: u64,
+    audio_clock_ratio_accumulator: u64,
+    clock_ratio_accumulator: u64,
+    execution_credit_cycles: i64,
+    io_wait_cycles: u16,
     ram: [u8; 0x2000],
     a: u8,
     f: u8,
@@ -51,15 +62,16 @@ pub struct Z80 {
     pc: u16,
     sp: u16,
     bank_address: u32,
+    vdp_data_write_latch: u16,
+    vdp_control_write_latch: u16,
     i_reg: u8,
     r_reg: u8,
     interrupt_mode: u8,
-    vdp_data_write_latch: u16,
-    vdp_control_write_latch: u16,
     iff1: bool,
     iff2: bool,
-    ei_block: u8,
+    interrupt_inhibit_count: u8,
     interrupt_pending: bool,
+    nmi_pending: bool,
     halted: bool,
     unknown_opcode_total: u64,
     unknown_opcode_histogram: BTreeMap<u8, u64>,
@@ -74,6 +86,10 @@ impl Default for Z80 {
             bus_grant_delay_cycles: 0,
             reset_asserted: true,
             cycles: 0,
+            audio_clock_ratio_accumulator: 0,
+            clock_ratio_accumulator: 0,
+            execution_credit_cycles: 0,
+            io_wait_cycles: 0,
             ram: [0; 0x2000],
             a: 0,
             f: 0,
@@ -96,15 +112,16 @@ impl Default for Z80 {
             pc: 0,
             sp: 0x1FFF,
             bank_address: 0,
+            vdp_data_write_latch: 0,
+            vdp_control_write_latch: 0,
             i_reg: 0,
             r_reg: 0,
             interrupt_mode: 0,
-            vdp_data_write_latch: 0,
-            vdp_control_write_latch: 0,
             iff1: false,
             iff2: false,
-            ei_block: 0,
+            interrupt_inhibit_count: 0,
             interrupt_pending: false,
+            nmi_pending: false,
             halted: false,
             unknown_opcode_total: 0,
             unknown_opcode_histogram: BTreeMap::new(),
@@ -177,18 +194,23 @@ impl Z80 {
             self.pc = 0;
             self.sp = 0x1FFF;
             self.bank_address = 0;
+            self.vdp_data_write_latch = 0;
+            self.vdp_control_write_latch = 0;
             self.i_reg = 0;
             self.r_reg = 0;
             self.interrupt_mode = 0;
-            self.vdp_data_write_latch = 0;
-            self.vdp_control_write_latch = 0;
             self.iff1 = false;
             self.iff2 = false;
-            self.ei_block = 0;
+            self.interrupt_inhibit_count = 0;
             self.interrupt_pending = false;
+            self.nmi_pending = false;
             self.halted = false;
             self.f = 0;
             self.f_alt = 0;
+            self.audio_clock_ratio_accumulator = 0;
+            self.clock_ratio_accumulator = 0;
+            self.execution_credit_cycles = 0;
+            self.io_wait_cycles = 0;
             self.unknown_opcode_total = 0;
             self.unknown_opcode_histogram.clear();
             self.unknown_opcode_pc_histogram.clear();
@@ -202,6 +224,10 @@ impl Z80 {
 
     pub fn request_interrupt(&mut self) {
         self.interrupt_pending = true;
+    }
+
+    pub fn request_nmi(&mut self) {
+        self.nmi_pending = true;
     }
 
     pub fn read_ram_u8(&self, addr: u16) -> u8 {
@@ -228,9 +254,15 @@ impl Z80 {
             vdp,
             io,
         };
-        let z80_can_run = !self.reset_asserted && (!self.bus_requested || !self.bus_granted);
+        self.audio_clock_ratio_accumulator += (m68k_cycles as u64) * Z80_CLOCK_HZ;
+        let audio_granted_cycles = (self.audio_clock_ratio_accumulator / M68K_CLOCK_HZ) as u32;
+        self.audio_clock_ratio_accumulator %= M68K_CLOCK_HZ;
+        let was_granted = self.bus_granted;
+        let mut runnable_m68k_cycles = m68k_cycles;
         if self.bus_requested && !self.bus_granted {
             if m68k_cycles >= self.bus_grant_delay_cycles {
+                // Run only until BUSACK is asserted in this timeslice.
+                runnable_m68k_cycles = self.bus_grant_delay_cycles;
                 self.bus_granted = true;
                 self.bus_grant_delay_cycles = 0;
             } else {
@@ -238,51 +270,105 @@ impl Z80 {
             }
         }
 
-        if !z80_can_run {
+        if self.reset_asserted || was_granted || runnable_m68k_cycles == 0 {
+            if audio_granted_cycles > 0 {
+                bus.audio.step_z80_cycles(audio_granted_cycles);
+            }
             return;
         }
 
-        let budget = (m68k_cycles as usize) / 2;
-        if budget == 0 {
+        self.clock_ratio_accumulator += (runnable_m68k_cycles as u64) * Z80_CLOCK_HZ;
+        let granted_cycles = (self.clock_ratio_accumulator / M68K_CLOCK_HZ) as usize;
+        self.clock_ratio_accumulator %= M68K_CLOCK_HZ;
+        if granted_cycles == 0 {
+            if audio_granted_cycles > 0 {
+                bus.audio.step_z80_cycles(audio_granted_cycles);
+            }
             return;
         }
+        self.execution_credit_cycles += granted_cycles as i64;
 
-        let mut used = 0usize;
+        let mut time_to_advance = granted_cycles as i64;
         let mut guard = 0usize;
-        while used < budget && guard < 2048 {
+        while self.execution_credit_cycles > 0 && guard < 2048 {
             guard += 1;
-            if self.interrupt_pending && self.iff1 && self.ei_block == 0 {
-                self.interrupt_pending = false;
+            if self.nmi_pending {
+                self.nmi_pending = false;
+                // Z80 NMI latches previous IFF1 into IFF2, then clears IFF1.
+                self.iff2 = self.iff1;
                 self.iff1 = false;
-                self.iff2 = false;
                 self.halted = false;
                 self.push_u16(self.pc, &mut bus);
-                if self.interrupt_mode == 2 {
-                    let vector_addr = ((self.i_reg as u16) << 8) | 0x00FF;
-                    let lo = self.read_byte(vector_addr, &bus);
-                    let hi = self.read_byte(vector_addr.wrapping_add(1), &bus);
-                    self.pc = u16::from_le_bytes([lo, hi]);
-                    used += 19;
-                } else {
-                    // IM0 is device-dependent; Mega Drive software uses IM1 semantics.
-                    self.pc = 0x0038;
-                    used += 13;
+                self.pc = 0x0066;
+                self.execution_credit_cycles -= 11;
+                let elapsed_now = 11i64.min(time_to_advance.max(0));
+                if elapsed_now > 0 {
+                    bus.audio.step_z80_cycles(elapsed_now as u32);
+                    time_to_advance -= elapsed_now;
                 }
                 continue;
+            }
+            if self.interrupt_pending && self.iff1 {
+                if self.interrupt_inhibit_count > 0 {
+                    // EI enables IFF immediately, but maskable IRQ recognition is
+                    // deferred until after the following instruction.
+                } else {
+                    self.interrupt_pending = false;
+                    self.iff1 = false;
+                    self.iff2 = false;
+                    self.halted = false;
+                    self.push_u16(self.pc, &mut bus);
+                    let (vector, cycles) = if self.interrupt_mode == 2 {
+                        let vector_addr = ((self.i_reg as u16) << 8) | 0x00FF;
+                        let lo = self.read_byte(vector_addr, &mut bus);
+                        let hi = self.read_byte(vector_addr.wrapping_add(1), &mut bus);
+                        (u16::from_le_bytes([lo, hi]), 19u8)
+                    } else {
+                        (0x0038, 13u8)
+                    };
+                    self.pc = vector;
+                    self.execution_credit_cycles -= cycles as i64;
+                    let elapsed_now = (cycles as i64).min(time_to_advance.max(0));
+                    if elapsed_now > 0 {
+                        bus.audio.step_z80_cycles(elapsed_now as u32);
+                        time_to_advance -= elapsed_now;
+                    }
+                    continue;
+                }
             }
             if self.halted {
                 break;
             }
+            self.io_wait_cycles = 0;
             let opcode_pc = self.pc;
-            let opcode = self.fetch_u8(&bus);
-            used += self.exec_opcode(opcode_pc, opcode, &mut bus) as usize;
-            if self.ei_block > 0 {
-                self.ei_block -= 1;
+            let opcode = self.fetch_opcode_u8(&mut bus);
+            let elapsed = self.exec_opcode(opcode_pc, opcode, &mut bus) as usize
+                + self.io_wait_cycles as usize;
+            self.execution_credit_cycles -= elapsed as i64;
+            let elapsed_now = (elapsed as i64).min(time_to_advance.max(0));
+            if elapsed_now > 0 {
+                bus.audio.step_z80_cycles(elapsed_now as u32);
+                time_to_advance -= elapsed_now;
             }
+            if self.interrupt_inhibit_count > 0 {
+                self.interrupt_inhibit_count -= 1;
+            }
+        }
+        if time_to_advance > 0 {
+            bus.audio.step_z80_cycles(time_to_advance as u32);
+        }
+        if self.halted && self.execution_credit_cycles > 0 {
+            self.execution_credit_cycles = 0;
+        }
+
+        let advanced_cycles = granted_cycles as u32;
+        let remaining_audio_cycles = audio_granted_cycles.saturating_sub(advanced_cycles);
+        if remaining_audio_cycles > 0 {
+            bus.audio.step_z80_cycles(remaining_audio_cycles);
         }
 
         // Account wall-clock Z80 time even if halted or blocked by unsupported opcodes.
-        self.cycles += budget as u64;
+        self.cycles += granted_cycles as u64;
     }
 
     pub fn cycles(&self) -> u64 {
@@ -291,6 +377,30 @@ impl Z80 {
 
     pub fn pc(&self) -> u16 {
         self.pc
+    }
+
+    pub fn sp(&self) -> u16 {
+        self.sp
+    }
+
+    pub fn a(&self) -> u8 {
+        self.a
+    }
+
+    pub fn f(&self) -> u8 {
+        self.f
+    }
+
+    pub fn bc_reg(&self) -> u16 {
+        self.bc()
+    }
+
+    pub fn de_reg(&self) -> u16 {
+        self.de()
+    }
+
+    pub fn hl_reg(&self) -> u16 {
+        self.hl()
     }
 
     pub fn halted(&self) -> bool {
@@ -329,11 +439,11 @@ impl Z80 {
                 4
             }
             0xCB => {
-                let op2 = self.fetch_u8(bus);
+                let op2 = self.fetch_opcode_u8(bus);
                 self.exec_cb(op2, bus)
             }
             0xED => {
-                let op2 = self.fetch_u8(bus);
+                let op2 = self.fetch_opcode_u8(bus);
                 self.exec_ed(opcode_pc, op2, bus)
             }
             0xDD => self.exec_index_prefix(opcode_pc, true, bus),
@@ -486,8 +596,7 @@ impl Z80 {
                 11
             }
             0xAF => {
-                self.a = 0;
-                self.f = FLAG_Z | FLAG_PV;
+                self.xor_a(self.a);
                 4
             }
             0x80..=0x87 => {
@@ -517,38 +626,25 @@ impl Z80 {
             0xA0..=0xA7 => {
                 let src = opcode & 0x07;
                 let value = self.read_reg_code(src, bus);
-                self.a &= value;
-                self.update_sz_clear_c(self.a);
+                self.and_a(value);
                 if src == 0b110 { 7 } else { 4 }
             }
             0xA8..=0xAF => {
                 let src = opcode & 0x07;
                 let value = self.read_reg_code(src, bus);
-                self.a ^= value;
-                self.update_sz_clear_c(self.a);
+                self.xor_a(value);
                 if src == 0b110 { 7 } else { 4 }
             }
             0xB0..=0xB7 => {
                 let src = opcode & 0x07;
                 let value = self.read_reg_code(src, bus);
-                self.a |= value;
-                self.update_sz_clear_c(self.a);
+                self.or_a(value);
                 if src == 0b110 { 7 } else { 4 }
             }
             0xB8..=0xBF => {
                 let src = opcode & 0x07;
                 let value = self.read_reg_code(src, bus);
-                let result = self.a.wrapping_sub(value);
-                self.f = 0;
-                if result == 0 {
-                    self.f |= FLAG_Z;
-                }
-                if (result & 0x80) != 0 {
-                    self.f |= FLAG_S;
-                }
-                if value > self.a {
-                    self.f |= FLAG_C;
-                }
+                self.set_compare_flags(value);
                 if src == 0b110 { 7 } else { 4 }
             }
             0xD9 => {
@@ -579,7 +675,7 @@ impl Z80 {
                 let carry_in = if self.flag_c() { 1u8 } else { 0 };
                 let carry_out = (self.a & 0x01) != 0;
                 self.a = (self.a >> 1) | (carry_in << 7);
-                let mut flags = self.f & (FLAG_S | FLAG_Z);
+                let mut flags = (self.f & (FLAG_S | FLAG_Z | FLAG_PV)) | Self::xy_from_u8(self.a);
                 if carry_out {
                     flags |= FLAG_C;
                 }
@@ -590,7 +686,7 @@ impl Z80 {
                 let carry_in = if self.flag_c() { 1u8 } else { 0 };
                 let carry_out = (self.a & 0x80) != 0;
                 self.a = (self.a << 1) | carry_in;
-                let mut flags = self.f & (FLAG_S | FLAG_Z);
+                let mut flags = (self.f & (FLAG_S | FLAG_Z | FLAG_PV)) | Self::xy_from_u8(self.a);
                 if carry_out {
                     flags |= FLAG_C;
                 }
@@ -600,7 +696,7 @@ impl Z80 {
             0x07 => {
                 let carry_out = (self.a & 0x80) != 0;
                 self.a = self.a.rotate_left(1);
-                let mut flags = self.f & (FLAG_S | FLAG_Z);
+                let mut flags = (self.f & (FLAG_S | FLAG_Z | FLAG_PV)) | Self::xy_from_u8(self.a);
                 if carry_out {
                     flags |= FLAG_C;
                 }
@@ -610,7 +706,7 @@ impl Z80 {
             0x0F => {
                 let carry_out = (self.a & 0x01) != 0;
                 self.a = self.a.rotate_right(1);
-                let mut flags = self.f & (FLAG_S | FLAG_Z);
+                let mut flags = (self.f & (FLAG_S | FLAG_Z | FLAG_PV)) | Self::xy_from_u8(self.a);
                 if carry_out {
                     flags |= FLAG_C;
                 }
@@ -619,18 +715,17 @@ impl Z80 {
             }
             0xFE => {
                 let value = self.fetch_u8(bus);
-                let result = self.a.wrapping_sub(value);
-                self.f = 0;
-                if result == 0 {
-                    self.f |= FLAG_Z;
-                }
-                if (result & 0x80) != 0 {
-                    self.f |= FLAG_S;
-                }
-                if value > self.a {
-                    self.f |= FLAG_C;
-                }
+                self.set_compare_flags(value);
                 7
+            }
+            0x2F => {
+                // CPL sets N/H and preserves S/Z/C.
+                self.a ^= 0xFF;
+                self.f = (self.f & (FLAG_S | FLAG_Z | FLAG_PV | FLAG_C))
+                    | Self::xy_from_u8(self.a)
+                    | FLAG_N
+                    | FLAG_H;
+                4
             }
             0xC6 => {
                 let value = self.fetch_u8(bus);
@@ -701,20 +796,6 @@ impl Z80 {
                 }
                 10
             }
-            0xCA => {
-                let addr = self.fetch_u16(bus);
-                if self.flag_z() {
-                    self.pc = addr;
-                }
-                10
-            }
-            0xDA => {
-                let addr = self.fetch_u16(bus);
-                if self.flag_c() {
-                    self.pc = addr;
-                }
-                10
-            }
             0xE2 => {
                 let addr = self.fetch_u16(bus);
                 if !self.flag_pv() {
@@ -722,9 +803,23 @@ impl Z80 {
                 }
                 10
             }
+            0xCA => {
+                let addr = self.fetch_u16(bus);
+                if self.flag_z() {
+                    self.pc = addr;
+                }
+                10
+            }
             0xEA => {
                 let addr = self.fetch_u16(bus);
                 if self.flag_pv() {
+                    self.pc = addr;
+                }
+                10
+            }
+            0xDA => {
+                let addr = self.fetch_u16(bus);
+                if self.flag_c() {
                     self.pc = addr;
                 }
                 10
@@ -759,39 +854,9 @@ impl Z80 {
                     10
                 }
             }
-            0xCC => {
-                let addr = self.fetch_u16(bus);
-                if self.flag_z() {
-                    self.push_u16(self.pc, bus);
-                    self.pc = addr;
-                    17
-                } else {
-                    10
-                }
-            }
-            0xFC => {
-                let addr = self.fetch_u16(bus);
-                if self.flag_s() {
-                    self.push_u16(self.pc, bus);
-                    self.pc = addr;
-                    17
-                } else {
-                    10
-                }
-            }
             0xD4 => {
                 let addr = self.fetch_u16(bus);
                 if !self.flag_c() {
-                    self.push_u16(self.pc, bus);
-                    self.pc = addr;
-                    17
-                } else {
-                    10
-                }
-            }
-            0xDC => {
-                let addr = self.fetch_u16(bus);
-                if self.flag_c() {
                     self.push_u16(self.pc, bus);
                     self.pc = addr;
                     17
@@ -809,6 +874,16 @@ impl Z80 {
                     10
                 }
             }
+            0xDC => {
+                let addr = self.fetch_u16(bus);
+                if self.flag_c() {
+                    self.push_u16(self.pc, bus);
+                    self.pc = addr;
+                    17
+                } else {
+                    10
+                }
+            }
             0xEC => {
                 let addr = self.fetch_u16(bus);
                 if self.flag_pv() {
@@ -819,9 +894,29 @@ impl Z80 {
                     10
                 }
             }
+            0xCC => {
+                let addr = self.fetch_u16(bus);
+                if self.flag_z() {
+                    self.push_u16(self.pc, bus);
+                    self.pc = addr;
+                    17
+                } else {
+                    10
+                }
+            }
             0xF4 => {
                 let addr = self.fetch_u16(bus);
                 if !self.flag_s() {
+                    self.push_u16(self.pc, bus);
+                    self.pc = addr;
+                    17
+                } else {
+                    10
+                }
+            }
+            0xFC => {
+                let addr = self.fetch_u16(bus);
+                if self.flag_s() {
                     self.push_u16(self.pc, bus);
                     self.pc = addr;
                     17
@@ -853,16 +948,16 @@ impl Z80 {
                     5
                 }
             }
-            0xD8 => {
-                if self.flag_c() {
+            0xE0 => {
+                if !self.flag_pv() {
                     self.pc = self.pop_u16(bus);
                     11
                 } else {
                     5
                 }
             }
-            0xE0 => {
-                if !self.flag_pv() {
+            0xD8 => {
+                if self.flag_c() {
                     self.pc = self.pop_u16(bus);
                     11
                 } else {
@@ -944,17 +1039,85 @@ impl Z80 {
                 let value = self.pop_u16(bus);
                 let [f, a] = value.to_le_bytes();
                 self.a = a;
-                self.f = f & (FLAG_S | FLAG_Z | FLAG_C);
+                self.f =
+                    f & (FLAG_S | FLAG_Z | FLAG_Y | FLAG_H | FLAG_X | FLAG_PV | FLAG_N | FLAG_C);
                 10
             }
             0xE9 => {
                 self.pc = self.hl();
                 4
             }
+            0xF9 => {
+                // LD SP,HL
+                self.sp = self.hl();
+                6
+            }
             0xEB => {
                 let de = self.de();
                 self.set_de(self.hl());
                 self.set_hl(de);
+                4
+            }
+            0x27 => {
+                let a_before = self.a;
+                let old_c = self.flag_c();
+                let old_h = self.flag_h();
+                let subtract = self.flag_n();
+                let mut adjust = 0u8;
+                let mut carry_out = old_c;
+
+                if !subtract {
+                    if old_h || (self.a & 0x0F) > 0x09 {
+                        adjust |= 0x06;
+                    }
+                    if old_c || self.a > 0x99 {
+                        adjust |= 0x60;
+                        carry_out = true;
+                    }
+                    self.a = self.a.wrapping_add(adjust);
+                } else {
+                    if old_h {
+                        adjust |= 0x06;
+                    }
+                    if old_c {
+                        adjust |= 0x60;
+                    }
+                    self.a = self.a.wrapping_sub(adjust);
+                }
+
+                let mut flags = if subtract { FLAG_N } else { 0 };
+                if self.a == 0 {
+                    flags |= FLAG_Z;
+                }
+                if (self.a & 0x80) != 0 {
+                    flags |= FLAG_S;
+                }
+                flags |= Self::xy_from_u8(self.a);
+                if ((a_before ^ self.a ^ adjust) & 0x10) != 0 {
+                    flags |= FLAG_H;
+                }
+                if Self::parity_even(self.a) {
+                    flags |= FLAG_PV;
+                }
+                if carry_out {
+                    flags |= FLAG_C;
+                }
+                self.f = flags;
+                4
+            }
+            0x37 => {
+                // SCF: set carry, clear N/H, preserve S/Z.
+                self.f = (self.f & (FLAG_S | FLAG_Z | FLAG_PV)) | Self::xy_from_u8(self.a) | FLAG_C;
+                4
+            }
+            0x3F => {
+                // CCF: toggle carry, clear N, set H=old C, preserve S/Z.
+                let old_c = self.f & FLAG_C;
+                let next_c = if old_c == 0 { FLAG_C } else { 0 };
+                self.f = (self.f & (FLAG_S | FLAG_Z | FLAG_PV))
+                    | Self::xy_from_u8(self.a)
+                    | next_c
+                    | if old_c != 0 { FLAG_H } else { 0 };
                 4
             }
             0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF => {
@@ -964,20 +1127,17 @@ impl Z80 {
             }
             0xE6 => {
                 let value = self.fetch_u8(bus);
-                self.a &= value;
-                self.update_sz_clear_c(self.a);
+                self.and_a(value);
                 7
             }
             0xF6 => {
                 let value = self.fetch_u8(bus);
-                self.a |= value;
-                self.update_sz_clear_c(self.a);
+                self.or_a(value);
                 7
             }
             0xEE => {
                 let value = self.fetch_u8(bus);
-                self.a ^= value;
-                self.update_sz_clear_c(self.a);
+                self.xor_a(value);
                 7
             }
             0xD6 => {
@@ -990,31 +1150,45 @@ impl Z80 {
                 self.sbc_a(value);
                 7
             }
+            0xD3 => {
+                // OUT (n),A
+                let port_low = self.fetch_u8(bus);
+                let port = ((self.a as u16) << 8) | port_low as u16;
+                self.write_port(port, self.a, bus);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                11
+            }
+            0xDB => {
+                // IN A,(n)
+                let port_low = self.fetch_u8(bus);
+                let port = ((self.a as u16) << 8) | port_low as u16;
+                self.a = self.read_port(port, bus);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                11
+            }
             0xF3 => {
                 self.iff1 = false;
                 self.iff2 = false;
-                self.ei_block = 0;
+                self.interrupt_inhibit_count = 0;
                 4
             }
             0xFB => {
                 self.iff1 = true;
                 self.iff2 = true;
-                // Z80 accepts maskable interrupts only after the following instruction.
-                self.ei_block = 2;
+                // Maskable IRQs are recognized only after the following instruction.
+                self.interrupt_inhibit_count = 2;
                 4
             }
             0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x34 | 0x3C => {
                 let reg = (opcode >> 3) & 0x7;
-                let value = self.read_reg_code(reg, bus).wrapping_add(1);
+                let value = self.inc8(self.read_reg_code(reg, bus));
                 self.write_reg_code(reg, value, bus);
-                self.update_sz_preserve_c(value);
                 if reg == 0b110 { 11 } else { 4 }
             }
             0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 | 0x3D => {
                 let reg = (opcode >> 3) & 0x7;
-                let value = self.read_reg_code(reg, bus).wrapping_sub(1);
+                let value = self.dec8(self.read_reg_code(reg, bus));
                 self.write_reg_code(reg, value, bus);
-                self.update_sz_preserve_c(value);
                 if reg == 0b110 { 11 } else { 4 }
             }
             0x40..=0x7F => {
@@ -1038,6 +1212,10 @@ impl Z80 {
         let z = opcode & 0x7;
         let value = self.read_reg_code(z, bus);
         let (result, write_back, cycles) = self.apply_cb_to_value(x, y, value);
+        if x == 1 && z == 0b110 {
+            // BIT (HL): undocumented X/Y come from effective address high byte.
+            self.f = (self.f & !(FLAG_X | FLAG_Y)) | Self::xy_from_u16_hi(self.hl());
+        }
         if write_back {
             self.write_reg_code(z, result, bus);
         }
@@ -1050,35 +1228,79 @@ impl Z80 {
 
     fn exec_ed(&mut self, opcode_pc: u16, opcode: u8, bus: &mut Z80Bus<'_>) -> u8 {
         match opcode {
+            0x40 => {
+                // IN B,(C)
+                let value = self.read_port(self.bc(), bus);
+                self.b = value;
+                self.update_szp_preserve_c(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
+            }
+            0x41 => {
+                // OUT (C),B
+                self.write_port(self.bc(), self.b, bus);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
+            }
             0x44 | 0x4C | 0x54 | 0x5C | 0x64 | 0x6C | 0x74 | 0x7C => {
-                self.neg_a();
+                // NEG
+                let value = self.a;
+                let result = 0u8.wrapping_sub(value);
+                self.a = result;
+                let mut flags = FLAG_N | Self::xy_from_u8(result);
+                if result == 0 {
+                    flags |= FLAG_Z;
+                }
+                if (result & 0x80) != 0 {
+                    flags |= FLAG_S;
+                }
+                if value == 0x80 {
+                    flags |= FLAG_PV;
+                }
+                if (value & 0x0F) != 0 {
+                    flags |= FLAG_H;
+                }
+                if value != 0 {
+                    flags |= FLAG_C;
+                }
+                self.f = flags;
                 8
             }
-            0xA1 => {
-                self.compare_block_step(bus, true);
-                16
+            0x48 => {
+                // IN C,(C)
+                let value = self.read_port(self.bc(), bus);
+                self.c = value;
+                self.update_szp_preserve_c(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
             }
-            0xB1 => {
-                let matched = self.compare_block_step(bus, true);
-                if self.bc() != 0 && !matched {
-                    self.pc = self.pc.wrapping_sub(2);
-                    21
-                } else {
-                    16
-                }
+            0x49 => {
+                // OUT (C),C
+                self.write_port(self.bc(), self.c, bus);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
             }
-            0xA9 => {
-                self.compare_block_step(bus, false);
-                16
+            0x42 => {
+                self.sbc_hl(self.bc());
+                15
             }
-            0xB9 => {
-                let matched = self.compare_block_step(bus, false);
-                if self.bc() != 0 && !matched {
-                    self.pc = self.pc.wrapping_sub(2);
-                    21
-                } else {
-                    16
-                }
+            0x4A => {
+                self.adc_hl(self.bc());
+                15
+            }
+            0x50 => {
+                // IN D,(C)
+                let value = self.read_port(self.bc(), bus);
+                self.d = value;
+                self.update_szp_preserve_c(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
+            }
+            0x51 => {
+                // OUT (C),D
+                self.write_port(self.bc(), self.d, bus);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
             }
             0x53 => {
                 let addr = self.fetch_u16(bus);
@@ -1087,11 +1309,147 @@ impl Z80 {
                 self.write_byte(addr.wrapping_add(1), hi, bus);
                 20
             }
+            0x52 => {
+                self.sbc_hl(self.de());
+                15
+            }
+            0x5A => {
+                self.adc_hl(self.de());
+                15
+            }
+            0x58 => {
+                // IN E,(C)
+                let value = self.read_port(self.bc(), bus);
+                self.e = value;
+                self.update_szp_preserve_c(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
+            }
+            0x59 => {
+                // OUT (C),E
+                self.write_port(self.bc(), self.e, bus);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
+            }
+            0x62 => {
+                let hl = self.hl();
+                self.sbc_hl(hl);
+                15
+            }
+            0x6A => {
+                let hl = self.hl();
+                self.adc_hl(hl);
+                15
+            }
+            0x63 => {
+                let addr = self.fetch_u16(bus);
+                let [lo, hi] = self.hl().to_le_bytes();
+                self.write_byte(addr, lo, bus);
+                self.write_byte(addr.wrapping_add(1), hi, bus);
+                20
+            }
+            0x60 => {
+                // IN H,(C)
+                let value = self.read_port(self.bc(), bus);
+                self.h = value;
+                self.update_szp_preserve_c(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
+            }
+            0x61 => {
+                // OUT (C),H
+                self.write_port(self.bc(), self.h, bus);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
+            }
+            0x68 => {
+                // IN L,(C)
+                let value = self.read_port(self.bc(), bus);
+                self.l = value;
+                self.update_szp_preserve_c(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
+            }
+            0x69 => {
+                // OUT (C),L
+                self.write_port(self.bc(), self.l, bus);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
+            }
+            0x67 => {
+                // RRD
+                let addr = self.hl();
+                let mem = self.read_byte(addr, bus);
+                let new_mem = ((self.a & 0x0F) << 4) | (mem >> 4);
+                self.a = (self.a & 0xF0) | (mem & 0x0F);
+                self.write_byte(addr, new_mem, bus);
+                self.update_szp_preserve_c(self.a);
+                18
+            }
+            0x6F => {
+                // RLD
+                let addr = self.hl();
+                let mem = self.read_byte(addr, bus);
+                let new_mem = (mem << 4) | (self.a & 0x0F);
+                self.a = (self.a & 0xF0) | (mem >> 4);
+                self.write_byte(addr, new_mem, bus);
+                self.update_szp_preserve_c(self.a);
+                18
+            }
+            0x6B => {
+                let addr = self.fetch_u16(bus);
+                let lo = self.read_byte(addr, bus);
+                let hi = self.read_byte(addr.wrapping_add(1), bus);
+                self.set_hl(u16::from_le_bytes([lo, hi]));
+                20
+            }
+            0x72 => {
+                self.sbc_hl(self.sp);
+                15
+            }
+            0x7A => {
+                self.adc_hl(self.sp);
+                15
+            }
+            0x70 => {
+                // IN (C) - updates flags only
+                let value = self.read_port(self.bc(), bus);
+                self.update_szp_preserve_c(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
+            }
+            0x71 => {
+                // OUT (C),0 (undocumented NMOS behavior)
+                self.write_port(self.bc(), 0x00, bus);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
+            }
+            0x78 => {
+                // IN A,(C)
+                let value = self.read_port(self.bc(), bus);
+                self.a = value;
+                self.update_szp_preserve_c(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
+            }
+            0x79 => {
+                // OUT (C),A
+                self.write_port(self.bc(), self.a, bus);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                12
+            }
             0x43 => {
                 let addr = self.fetch_u16(bus);
                 let [lo, hi] = self.bc().to_le_bytes();
                 self.write_byte(addr, lo, bus);
                 self.write_byte(addr.wrapping_add(1), hi, bus);
+                20
+            }
+            0x4B => {
+                let addr = self.fetch_u16(bus);
+                let lo = self.read_byte(addr, bus);
+                let hi = self.read_byte(addr.wrapping_add(1), bus);
+                self.set_bc(u16::from_le_bytes([lo, hi]));
                 20
             }
             0x5B => {
@@ -1125,28 +1483,15 @@ impl Z80 {
                 self.r_reg = self.a;
                 9
             }
-            0x57 => {
-                // LD A,I
+            0x57 | 0x5F => {
+                // LD A,I / LD A,R
                 let carry = self.f & FLAG_C;
-                self.a = self.i_reg;
-                let mut flags = carry;
-                if self.a == 0 {
-                    flags |= FLAG_Z;
-                }
-                if (self.a & 0x80) != 0 {
-                    flags |= FLAG_S;
-                }
-                if self.iff2 {
-                    flags |= FLAG_PV;
-                }
-                self.f = flags;
-                9
-            }
-            0x5F => {
-                // LD A,R
-                let carry = self.f & FLAG_C;
-                self.a = self.r_reg;
-                let mut flags = carry;
+                self.a = if opcode == 0x57 {
+                    self.i_reg
+                } else {
+                    self.r_reg
+                };
+                let mut flags = carry | Self::xy_from_u8(self.a);
                 if self.a == 0 {
                     flags |= FLAG_Z;
                 }
@@ -1166,6 +1511,27 @@ impl Z80 {
                 self.set_hl(self.hl().wrapping_add(1));
                 self.set_de(self.de().wrapping_add(1));
                 self.set_bc(self.bc().wrapping_sub(1));
+                self.update_block_transfer_flags(value);
+                16
+            }
+            0xA2 => {
+                // INI
+                let value = self.read_port(self.bc(), bus);
+                self.write_byte(self.hl(), value, bus);
+                self.b = self.b.wrapping_sub(1);
+                self.set_hl(self.hl().wrapping_add(1));
+                self.update_block_in_flags(value, 1);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                16
+            }
+            0xA3 => {
+                // OUTI
+                let value = self.read_byte(self.hl(), bus);
+                self.write_port(self.bc(), value, bus);
+                self.b = self.b.wrapping_sub(1);
+                self.set_hl(self.hl().wrapping_add(1));
+                self.update_block_out_flags(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
                 16
             }
             0xA8 => {
@@ -1175,9 +1541,46 @@ impl Z80 {
                 self.set_hl(self.hl().wrapping_sub(1));
                 self.set_de(self.de().wrapping_sub(1));
                 self.set_bc(self.bc().wrapping_sub(1));
+                self.update_block_transfer_flags(value);
                 16
             }
-            0x45 | 0x4D => {
+            0xAA => {
+                // IND
+                let value = self.read_port(self.bc(), bus);
+                self.write_byte(self.hl(), value, bus);
+                self.b = self.b.wrapping_sub(1);
+                self.set_hl(self.hl().wrapping_sub(1));
+                self.update_block_in_flags(value, -1);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                16
+            }
+            0xAB => {
+                // OUTD
+                let value = self.read_byte(self.hl(), bus);
+                self.write_port(self.bc(), value, bus);
+                self.b = self.b.wrapping_sub(1);
+                self.set_hl(self.hl().wrapping_sub(1));
+                self.update_block_out_flags(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                16
+            }
+            0xA1 => {
+                // CPI
+                let value = self.read_byte(self.hl(), bus);
+                self.set_hl(self.hl().wrapping_add(1));
+                self.set_bc(self.bc().wrapping_sub(1));
+                self.update_block_compare_flags(value);
+                16
+            }
+            0xA9 => {
+                // CPD
+                let value = self.read_byte(self.hl(), bus);
+                self.set_hl(self.hl().wrapping_sub(1));
+                self.set_bc(self.bc().wrapping_sub(1));
+                self.update_block_compare_flags(value);
+                16
+            }
+            0x45 | 0x4D | 0x55 | 0x5D | 0x65 | 0x6D | 0x75 | 0x7D => {
                 self.pc = self.pop_u16(bus);
                 self.iff1 = self.iff2;
                 14
@@ -1188,7 +1591,38 @@ impl Z80 {
                 self.set_hl(self.hl().wrapping_add(1));
                 self.set_de(self.de().wrapping_add(1));
                 self.set_bc(self.bc().wrapping_sub(1));
+                self.update_block_transfer_flags(value);
                 if self.bc() != 0 {
+                    self.pc = self.pc.wrapping_sub(2);
+                    21
+                } else {
+                    16
+                }
+            }
+            0xB2 => {
+                // INIR
+                let value = self.read_port(self.bc(), bus);
+                self.write_byte(self.hl(), value, bus);
+                self.b = self.b.wrapping_sub(1);
+                self.set_hl(self.hl().wrapping_add(1));
+                self.update_block_in_flags(value, 1);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                if self.b != 0 {
+                    self.pc = self.pc.wrapping_sub(2);
+                    21
+                } else {
+                    16
+                }
+            }
+            0xB3 => {
+                // OTIR
+                let value = self.read_byte(self.hl(), bus);
+                self.write_port(self.bc(), value, bus);
+                self.b = self.b.wrapping_sub(1);
+                self.set_hl(self.hl().wrapping_add(1));
+                self.update_block_out_flags(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                if self.b != 0 {
                     self.pc = self.pc.wrapping_sub(2);
                     21
                 } else {
@@ -1196,11 +1630,13 @@ impl Z80 {
                 }
             }
             0xB8 => {
+                // LDDR
                 let value = self.read_byte(self.hl(), bus);
                 self.write_byte(self.de(), value, bus);
                 self.set_hl(self.hl().wrapping_sub(1));
                 self.set_de(self.de().wrapping_sub(1));
                 self.set_bc(self.bc().wrapping_sub(1));
+                self.update_block_transfer_flags(value);
                 if self.bc() != 0 {
                     self.pc = self.pc.wrapping_sub(2);
                     21
@@ -1208,15 +1644,74 @@ impl Z80 {
                     16
                 }
             }
+            0xBA => {
+                // INDR
+                let value = self.read_port(self.bc(), bus);
+                self.write_byte(self.hl(), value, bus);
+                self.b = self.b.wrapping_sub(1);
+                self.set_hl(self.hl().wrapping_sub(1));
+                self.update_block_in_flags(value, -1);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                if self.b != 0 {
+                    self.pc = self.pc.wrapping_sub(2);
+                    21
+                } else {
+                    16
+                }
+            }
+            0xBB => {
+                // OTDR
+                let value = self.read_byte(self.hl(), bus);
+                self.write_port(self.bc(), value, bus);
+                self.b = self.b.wrapping_sub(1);
+                self.set_hl(self.hl().wrapping_sub(1));
+                self.update_block_out_flags(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                if self.b != 0 {
+                    self.pc = self.pc.wrapping_sub(2);
+                    21
+                } else {
+                    16
+                }
+            }
+            0xB1 => {
+                // CPIR
+                let value = self.read_byte(self.hl(), bus);
+                self.set_hl(self.hl().wrapping_add(1));
+                self.set_bc(self.bc().wrapping_sub(1));
+                self.update_block_compare_flags(value);
+                if self.bc() != 0 && !self.flag_z() {
+                    self.pc = self.pc.wrapping_sub(2);
+                    21
+                } else {
+                    16
+                }
+            }
+            0xB9 => {
+                // CPDR
+                let value = self.read_byte(self.hl(), bus);
+                self.set_hl(self.hl().wrapping_sub(1));
+                self.set_bc(self.bc().wrapping_sub(1));
+                self.update_block_compare_flags(value);
+                if self.bc() != 0 && !self.flag_z() {
+                    self.pc = self.pc.wrapping_sub(2);
+                    21
+                } else {
+                    16
+                }
+            }
             0x46 | 0x4E | 0x66 | 0x6E => {
+                // IM 0
                 self.interrupt_mode = 0;
                 8
             }
             0x56 | 0x76 => {
+                // IM 1
                 self.interrupt_mode = 1;
                 8
             }
             0x5E | 0x7E => {
+                // IM 2
                 self.interrupt_mode = 2;
                 8
             }
@@ -1227,24 +1722,24 @@ impl Z80 {
         }
     }
 
-    fn exec_index_prefix(&mut self, opcode_pc: u16, use_ix: bool, bus: &mut Z80Bus<'_>) -> u8 {
-        let op2 = self.fetch_u8(bus);
+    fn exec_index_prefix(&mut self, _opcode_pc: u16, use_ix: bool, bus: &mut Z80Bus<'_>) -> u8 {
+        let op2 = self.fetch_opcode_u8(bus);
         match op2 {
             0x09 => {
-                self.set_index_reg(use_ix, self.index_reg(use_ix).wrapping_add(self.bc()));
+                self.add_index(self.bc(), use_ix);
                 15
             }
             0x19 => {
-                self.set_index_reg(use_ix, self.index_reg(use_ix).wrapping_add(self.de()));
+                self.add_index(self.de(), use_ix);
                 15
             }
             0x29 => {
                 let idx = self.index_reg(use_ix);
-                self.set_index_reg(use_ix, idx.wrapping_add(idx));
+                self.add_index(idx, use_ix);
                 15
             }
             0x39 => {
-                self.set_index_reg(use_ix, self.index_reg(use_ix).wrapping_add(self.sp));
+                self.add_index(self.sp, use_ix);
                 15
             }
             0x21 => {
@@ -1275,44 +1770,48 @@ impl Z80 {
                 self.set_index_reg(use_ix, self.index_reg(use_ix).wrapping_sub(1));
                 10
             }
-            0x24 | 0x2C => {
-                let reg = (op2 >> 3) & 0x7;
-                let value = self
-                    .read_index_prefixed_reg_no_mem(reg, use_ix)
-                    .wrapping_add(1);
-                self.write_index_prefixed_reg_no_mem(reg, use_ix, value);
-                self.update_sz_preserve_c(value);
+            0x24 => {
+                let value = self.inc8(self.index_reg_hi(use_ix));
+                self.set_index_reg_hi(use_ix, value);
                 8
             }
-            0x25 | 0x2D => {
-                let reg = (op2 >> 3) & 0x7;
-                let value = self
-                    .read_index_prefixed_reg_no_mem(reg, use_ix)
-                    .wrapping_sub(1);
-                self.write_index_prefixed_reg_no_mem(reg, use_ix, value);
-                self.update_sz_preserve_c(value);
+            0x25 => {
+                let value = self.dec8(self.index_reg_hi(use_ix));
+                self.set_index_reg_hi(use_ix, value);
                 8
             }
-            0x26 | 0x2E => {
-                let reg = (op2 >> 3) & 0x7;
+            0x26 => {
                 let value = self.fetch_u8(bus);
-                self.write_index_prefixed_reg_no_mem(reg, use_ix, value);
+                self.set_index_reg_hi(use_ix, value);
+                11
+            }
+            0x2C => {
+                let value = self.inc8(self.index_reg_lo(use_ix));
+                self.set_index_reg_lo(use_ix, value);
+                8
+            }
+            0x2D => {
+                let value = self.dec8(self.index_reg_lo(use_ix));
+                self.set_index_reg_lo(use_ix, value);
+                8
+            }
+            0x2E => {
+                let value = self.fetch_u8(bus);
+                self.set_index_reg_lo(use_ix, value);
                 11
             }
             0x34 => {
                 let disp = self.fetch_u8(bus) as i8;
                 let addr = self.indexed_addr(use_ix, disp);
-                let value = self.read_byte(addr, bus).wrapping_add(1);
+                let value = self.inc8(self.read_byte(addr, bus));
                 self.write_byte(addr, value, bus);
-                self.update_sz_preserve_c(value);
                 23
             }
             0x35 => {
                 let disp = self.fetch_u8(bus) as i8;
                 let addr = self.indexed_addr(use_ix, disp);
-                let value = self.read_byte(addr, bus).wrapping_sub(1);
+                let value = self.dec8(self.read_byte(addr, bus));
                 self.write_byte(addr, value, bus);
-                self.update_sz_preserve_c(value);
                 23
             }
             0x36 => {
@@ -1322,146 +1821,57 @@ impl Z80 {
                 self.write_byte(addr, value, bus);
                 19
             }
-            0x7E => {
-                let disp = self.fetch_u8(bus) as i8;
-                let addr = self.indexed_addr(use_ix, disp);
-                self.a = self.read_byte(addr, bus);
-                19
-            }
-            0x46 | 0x4E | 0x56 | 0x5E | 0x66 | 0x6E => {
-                let disp = self.fetch_u8(bus) as i8;
-                let addr = self.indexed_addr(use_ix, disp);
-                let value = self.read_byte(addr, bus);
-                self.write_index_prefixed_reg_no_mem((op2 >> 3) & 0x7, use_ix, value);
-                19
-            }
-            0x70..=0x77 => {
+            0x40..=0x7F => {
                 if op2 == 0x76 {
                     self.halted = true;
                     return 8;
                 }
-                let disp = self.fetch_u8(bus) as i8;
-                let addr = self.indexed_addr(use_ix, disp);
-                let value = self.read_index_prefixed_reg_no_mem(op2 & 0x7, use_ix);
-                self.write_byte(addr, value, bus);
-                19
-            }
-            0x40..=0x7F => {
-                // 0x76 (HALT) is handled above.
                 let dst = (op2 >> 3) & 0x7;
                 let src = op2 & 0x7;
-                let value = self.read_index_prefixed_reg_no_mem(src, use_ix);
-                self.write_index_prefixed_reg_no_mem(dst, use_ix, value);
-                8
-            }
-            0x80..=0x87 => {
-                let src = op2 & 0x7;
-                let value = if src == 0b110 {
+                if dst == 0b110 || src == 0b110 {
                     let disp = self.fetch_u8(bus) as i8;
                     let addr = self.indexed_addr(use_ix, disp);
-                    self.read_byte(addr, bus)
+                    if src == 0b110 {
+                        let value = self.read_byte(addr, bus);
+                        self.write_reg_code_no_mem(dst, value);
+                    } else {
+                        let value = self.read_reg_code_no_mem(src);
+                        self.write_byte(addr, value, bus);
+                    }
+                    19
                 } else {
-                    self.read_index_prefixed_reg_no_mem(src, use_ix)
-                };
-                self.add_a(value);
-                if src == 0b110 { 19 } else { 8 }
-            }
-            0x88..=0x8F => {
-                let src = op2 & 0x7;
-                let value = if src == 0b110 {
-                    let disp = self.fetch_u8(bus) as i8;
-                    let addr = self.indexed_addr(use_ix, disp);
-                    self.read_byte(addr, bus)
-                } else {
-                    self.read_index_prefixed_reg_no_mem(src, use_ix)
-                };
-                self.adc_a(value);
-                if src == 0b110 { 19 } else { 8 }
-            }
-            0x90..=0x97 => {
-                let src = op2 & 0x7;
-                let value = if src == 0b110 {
-                    let disp = self.fetch_u8(bus) as i8;
-                    let addr = self.indexed_addr(use_ix, disp);
-                    self.read_byte(addr, bus)
-                } else {
-                    self.read_index_prefixed_reg_no_mem(src, use_ix)
-                };
-                self.sub_a(value);
-                if src == 0b110 { 19 } else { 8 }
-            }
-            0x98..=0x9F => {
-                let src = op2 & 0x7;
-                let value = if src == 0b110 {
-                    let disp = self.fetch_u8(bus) as i8;
-                    let addr = self.indexed_addr(use_ix, disp);
-                    self.read_byte(addr, bus)
-                } else {
-                    self.read_index_prefixed_reg_no_mem(src, use_ix)
-                };
-                self.sbc_a(value);
-                if src == 0b110 { 19 } else { 8 }
-            }
-            0xA0..=0xA7 => {
-                let src = op2 & 0x7;
-                let value = if src == 0b110 {
-                    let disp = self.fetch_u8(bus) as i8;
-                    let addr = self.indexed_addr(use_ix, disp);
-                    self.read_byte(addr, bus)
-                } else {
-                    self.read_index_prefixed_reg_no_mem(src, use_ix)
-                };
-                self.a &= value;
-                self.update_sz_clear_c(self.a);
-                if src == 0b110 { 19 } else { 8 }
-            }
-            0xA8..=0xAF => {
-                let src = op2 & 0x7;
-                let value = if src == 0b110 {
-                    let disp = self.fetch_u8(bus) as i8;
-                    let addr = self.indexed_addr(use_ix, disp);
-                    self.read_byte(addr, bus)
-                } else {
-                    self.read_index_prefixed_reg_no_mem(src, use_ix)
-                };
-                self.a ^= value;
-                self.update_sz_clear_c(self.a);
-                if src == 0b110 { 19 } else { 8 }
-            }
-            0xB0..=0xB7 => {
-                let src = op2 & 0x7;
-                let value = if src == 0b110 {
-                    let disp = self.fetch_u8(bus) as i8;
-                    let addr = self.indexed_addr(use_ix, disp);
-                    self.read_byte(addr, bus)
-                } else {
-                    self.read_index_prefixed_reg_no_mem(src, use_ix)
-                };
-                self.a |= value;
-                self.update_sz_clear_c(self.a);
-                if src == 0b110 { 19 } else { 8 }
-            }
-            0xB8..=0xBF => {
-                let src = op2 & 0x7;
-                let value = if src == 0b110 {
-                    let disp = self.fetch_u8(bus) as i8;
-                    let addr = self.indexed_addr(use_ix, disp);
-                    self.read_byte(addr, bus)
-                } else {
-                    self.read_index_prefixed_reg_no_mem(src, use_ix)
-                };
-                let result = self.a.wrapping_sub(value);
-                self.f = 0;
-                if result == 0 {
-                    self.f |= FLAG_Z;
+                    let value = self.read_index_reg_code_no_mem(use_ix, src);
+                    self.write_index_reg_code_no_mem(use_ix, dst, value);
+                    8
                 }
-                if (result & 0x80) != 0 {
-                    self.f |= FLAG_S;
+            }
+            0x80..=0xBF => {
+                let src = op2 & 0x7;
+                let (value, cycles) = if src == 0b110 {
+                    let disp = self.fetch_u8(bus) as i8;
+                    let addr = self.indexed_addr(use_ix, disp);
+                    (self.read_byte(addr, bus), 19)
+                } else {
+                    (self.read_index_reg_code_no_mem(use_ix, src), 8)
+                };
+                match op2 & 0xF8 {
+                    0x80 => self.add_a(value),
+                    0x88 => self.adc_a(value),
+                    0x90 => self.sub_a(value),
+                    0x98 => self.sbc_a(value),
+                    0xA0 => {
+                        self.and_a(value);
+                    }
+                    0xA8 => {
+                        self.xor_a(value);
+                    }
+                    0xB0 => {
+                        self.or_a(value);
+                    }
+                    0xB8 => self.set_compare_flags(value),
+                    _ => unreachable!(),
                 }
-                if value > self.a {
-                    self.f |= FLAG_C;
-                }
-                if src == 0b110 { 19 } else { 8 }
+                cycles
             }
             0xE5 => {
                 self.push_u16(self.index_reg(use_ix), bus);
@@ -1472,37 +1882,36 @@ impl Z80 {
                 self.set_index_reg(use_ix, value);
                 14
             }
+            0xF9 => {
+                self.sp = self.index_reg(use_ix);
+                10
+            }
             0xE3 => {
-                let idx = self.index_reg(use_ix);
                 let lo = self.read_byte(self.sp, bus);
                 let hi = self.read_byte(self.sp.wrapping_add(1), bus);
-                let mem_value = u16::from_le_bytes([lo, hi]);
+                let stack_value = u16::from_le_bytes([lo, hi]);
+                let idx = self.index_reg(use_ix);
                 let [idx_lo, idx_hi] = idx.to_le_bytes();
                 self.write_byte(self.sp, idx_lo, bus);
                 self.write_byte(self.sp.wrapping_add(1), idx_hi, bus);
-                self.set_index_reg(use_ix, mem_value);
+                self.set_index_reg(use_ix, stack_value);
                 23
             }
             0xE9 => {
                 self.pc = self.index_reg(use_ix);
                 8
             }
-            0xF9 => {
-                self.sp = self.index_reg(use_ix);
-                10
-            }
             0xCB => {
                 let disp = self.fetch_u8(bus) as i8;
-                let op3 = self.fetch_u8(bus);
+                let op3 = self.fetch_opcode_u8(bus);
                 self.exec_index_cb(use_ix, disp, op3, bus)
             }
             _ => {
-                if op2 >= 0xC0 && !matches!(op2, 0xCB | 0xDD | 0xED | 0xFD) {
-                    self.exec_opcode(opcode_pc, op2, bus)
-                } else {
-                    self.record_unknown(if use_ix { 0xDD } else { 0xFD }, opcode_pc);
-                    4
-                }
+                // DD/FD prefixes only modify instructions that reference HL/H/L
+                // or have dedicated IX/IY encodings. For other opcodes the prefix
+                // is ignored and the following opcode executes normally.
+                let op_pc = self.pc.wrapping_sub(1);
+                4 + self.exec_opcode(op_pc, op2, bus)
             }
         }
     }
@@ -1514,6 +1923,10 @@ impl Z80 {
         let addr = self.indexed_addr(use_ix, disp);
         let value = self.read_byte(addr, bus);
         let (result, write_back, _cycles) = self.apply_cb_to_value(x, y, value);
+        if x == 1 {
+            // BIT (IX/IY+d): undocumented X/Y come from effective address high byte.
+            self.f = (self.f & !(FLAG_X | FLAG_Y)) | Self::xy_from_u16_hi(addr);
+        }
         if write_back {
             self.write_byte(addr, result, bus);
             if z != 0b110 {
@@ -1552,6 +1965,10 @@ impl Z80 {
                 if (result & 0x80) != 0 {
                     flags |= FLAG_S;
                 }
+                flags |= Self::xy_from_u8(result);
+                if Self::parity_even(result) {
+                    flags |= FLAG_PV;
+                }
                 if carry {
                     flags |= FLAG_C;
                 }
@@ -1562,9 +1979,9 @@ impl Z80 {
                 // BIT y,value
                 let bit_set = (value & (1 << y)) != 0;
                 let carry = self.f & FLAG_C;
-                let mut flags = carry;
+                let mut flags = carry | FLAG_H | Self::xy_from_u8(value);
                 if !bit_set {
-                    flags |= FLAG_Z;
+                    flags |= FLAG_Z | FLAG_PV;
                 }
                 if y == 7 && bit_set {
                     flags |= FLAG_S;
@@ -1578,7 +1995,7 @@ impl Z80 {
         }
     }
 
-    fn read_reg_code(&self, code: u8, bus: &Z80Bus<'_>) -> u8 {
+    fn read_reg_code(&self, code: u8, bus: &mut Z80Bus<'_>) -> u8 {
         match code & 0x7 {
             0b000 => self.b,
             0b001 => self.c,
@@ -1587,6 +2004,19 @@ impl Z80 {
             0b100 => self.h,
             0b101 => self.l,
             0b110 => self.read_byte(self.hl(), bus),
+            0b111 => self.a,
+            _ => 0,
+        }
+    }
+
+    fn read_reg_code_no_mem(&self, code: u8) -> u8 {
+        match code & 0x7 {
+            0b000 => self.b,
+            0b001 => self.c,
+            0b010 => self.d,
+            0b011 => self.e,
+            0b100 => self.h,
+            0b101 => self.l,
             0b111 => self.a,
             _ => 0,
         }
@@ -1622,45 +2052,24 @@ impl Z80 {
         }
     }
 
-    fn read_index_prefixed_reg_no_mem(&self, code: u8, use_ix: bool) -> u8 {
-        match code & 0x7 {
-            0b000 => self.b,
-            0b001 => self.c,
-            0b010 => self.d,
-            0b011 => self.e,
-            0b100 => (self.index_reg(use_ix) >> 8) as u8,
-            0b101 => self.index_reg(use_ix) as u8,
-            0b111 => self.a,
-            _ => 0,
-        }
+    fn fetch_opcode_u8(&mut self, bus: &mut Z80Bus<'_>) -> u8 {
+        let opcode = self.fetch_u8(bus);
+        self.increment_refresh_counter();
+        opcode
     }
 
-    fn write_index_prefixed_reg_no_mem(&mut self, code: u8, use_ix: bool, value: u8) {
-        match code & 0x7 {
-            0b000 => self.b = value,
-            0b001 => self.c = value,
-            0b010 => self.d = value,
-            0b011 => self.e = value,
-            0b100 => {
-                let low = self.index_reg(use_ix) & 0x00FF;
-                self.set_index_reg(use_ix, ((value as u16) << 8) | low);
-            }
-            0b101 => {
-                let high = self.index_reg(use_ix) & 0xFF00;
-                self.set_index_reg(use_ix, high | value as u16);
-            }
-            0b111 => self.a = value,
-            _ => {}
-        }
+    fn increment_refresh_counter(&mut self) {
+        let next_low7 = self.r_reg.wrapping_add(1) & 0x7F;
+        self.r_reg = (self.r_reg & 0x80) | next_low7;
     }
 
-    fn fetch_u8(&mut self, bus: &Z80Bus<'_>) -> u8 {
+    fn fetch_u8(&mut self, bus: &mut Z80Bus<'_>) -> u8 {
         let value = self.read_byte(self.pc, bus);
         self.pc = self.pc.wrapping_add(1);
         value
     }
 
-    fn fetch_u16(&mut self, bus: &Z80Bus<'_>) -> u16 {
+    fn fetch_u16(&mut self, bus: &mut Z80Bus<'_>) -> u16 {
         let lo = self.fetch_u8(bus);
         let hi = self.fetch_u8(bus);
         u16::from_le_bytes([lo, hi])
@@ -1674,7 +2083,7 @@ impl Z80 {
         self.write_byte(self.sp, lo, bus);
     }
 
-    fn pop_u16(&mut self, bus: &Z80Bus<'_>) -> u16 {
+    fn pop_u16(&mut self, bus: &mut Z80Bus<'_>) -> u16 {
         let lo = self.read_byte(self.sp, bus);
         self.sp = self.sp.wrapping_add(1);
         let hi = self.read_byte(self.sp, bus);
@@ -1682,7 +2091,7 @@ impl Z80 {
         u16::from_le_bytes([lo, hi])
     }
 
-    fn read_byte(&self, addr: u16, bus: &Z80Bus<'_>) -> u8 {
+    fn read_byte(&self, addr: u16, bus: &mut Z80Bus<'_>) -> u8 {
         match addr {
             0x0000..=0x3FFF => self.ram[(addr as usize) & 0x1FFF],
             0x4000..=0x5FFF => bus.audio.read_ym2612((addr & 0x03) as u8),
@@ -1696,10 +2105,36 @@ impl Z80 {
             0x0000..=0x3FFF => {
                 self.ram[(addr as usize) & 0x1FFF] = value;
             }
-            0x4000..=0x5FFF => bus.audio.write_ym2612((addr & 0x03) as u8, value),
+            0x4000..=0x5FFF => {
+                bus.audio.write_ym2612_from_z80((addr & 0x03) as u8, value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+            }
             0x6000..=0x60FF => self.write_bank_register(value),
-            0x7F11 => bus.audio.write_psg(value),
+            0x7F11 => {
+                bus.audio.write_psg_from_z80(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+            }
             0x8000..=0xFFFF => self.write_68k_window(addr, value, bus),
+            _ => {}
+        }
+    }
+
+    fn read_port(&self, port: u16, _bus: &mut Z80Bus<'_>) -> u8 {
+        match port as u8 {
+            // YM2612 status/data ports (low-byte decode).
+            0x40..=0x43 => _bus.audio.read_ym2612((port as u8) & 0x03),
+            // External I/O ports are sparsely used on Mega Drive Z80 side.
+            // Return open-bus style value for currently unmodeled inputs.
+            _ => 0xFF,
+        }
+    }
+
+    fn write_port(&mut self, port: u16, value: u8, bus: &mut Z80Bus<'_>) {
+        match port as u8 {
+            // YM2612 address/data ports (low-byte decode).
+            0x40..=0x43 => bus.audio.write_ym2612_from_z80((port as u8) & 0x03, value),
+            // PSG data port
+            0x7F => bus.audio.write_psg_from_z80(value),
             _ => {}
         }
     }
@@ -1715,11 +2150,12 @@ impl Z80 {
         (self.bank_address & 0x00FF_8000) | offset
     }
 
-    fn read_68k_window(&self, z80_addr: u16, bus: &Z80Bus<'_>) -> u8 {
+    fn read_68k_window(&self, z80_addr: u16, bus: &mut Z80Bus<'_>) -> u8 {
         let addr = self.resolve_68k_window_addr(z80_addr);
         match addr {
             0x000000..=0x3FFFFF => bus.cartridge.read_u8(addr),
             0xA04000..=0xA04003 => bus.audio.read_ym2612((addr - 0xA04000) as u8),
+            0xC00000..=0xC0001F => Self::read_vdp_port_byte(addr, bus),
             x if x == IO_VERSION_ADDR || x == IO_VERSION_ADDR + 1 => bus.io.read_version(),
             x if x == IO_PORT1_DATA_ADDR || x == IO_PORT1_DATA_ADDR + 1 => bus.io.read_port1_data(),
             x if x == IO_PORT2_DATA_ADDR || x == IO_PORT2_DATA_ADDR + 1 => bus.io.read_port2_data(),
@@ -1730,10 +2166,29 @@ impl Z80 {
         }
     }
 
+    fn read_vdp_port_byte(addr: u32, bus: &mut Z80Bus<'_>) -> u8 {
+        let aligned = addr & !1;
+        let word = match aligned {
+            0xC00000 | 0xC00002 => bus.vdp.read_data_port(),
+            0xC00004 | 0xC00006 => bus.vdp.read_control_port(),
+            0xC00008 | 0xC0000A => bus.vdp.read_hv_counter(),
+            _ => return 0xFF,
+        };
+        if (addr & 1) == 0 {
+            (word >> 8) as u8
+        } else {
+            word as u8
+        }
+    }
+
     fn write_68k_window(&mut self, z80_addr: u16, value: u8, bus: &mut Z80Bus<'_>) {
         let addr = self.resolve_68k_window_addr(z80_addr);
         match addr {
-            0xA04000..=0xA04003 => bus.audio.write_ym2612((addr - 0xA04000) as u8, value),
+            0xA04000..=0xA04003 => {
+                bus.audio
+                    .write_ym2612_from_z80((addr - 0xA04000) as u8, value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+            }
             x if x == IO_PORT1_DATA_ADDR || x == IO_PORT1_DATA_ADDR + 1 => {
                 bus.io.write_port1_data(value)
             }
@@ -1746,7 +2201,10 @@ impl Z80 {
             x if x == IO_PORT2_CTRL_ADDR || x == IO_PORT2_CTRL_ADDR + 1 => {
                 bus.io.write_port2_ctrl(value)
             }
-            0xC00011 => bus.audio.write_psg(value),
+            0xC00011 => {
+                bus.audio.write_psg_from_z80(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+            }
             0xC00000..=0xC0001F => self.write_vdp_port_byte(addr, value, bus),
             0xFF0000..=0xFFFFFF => {
                 bus.work_ram[(addr - 0xFF0000) as usize] = value;
@@ -1757,6 +2215,9 @@ impl Z80 {
 
     fn write_vdp_port_byte(&mut self, addr: u32, value: u8, bus: &mut Z80Bus<'_>) {
         let aligned = addr & !1;
+        let immediate_byte_commit =
+            std::env::var_os("MEGADRIVE_DEBUG_VDP_BYTE_IMMEDIATE").is_some();
+        let low_byte_write = (addr & 1) != 0;
         let next = match aligned {
             0xC00000 | 0xC00002 => {
                 let current = self.vdp_data_write_latch;
@@ -1781,9 +2242,53 @@ impl Z80 {
             _ => return,
         };
         match aligned {
-            0xC00000 | 0xC00002 => bus.vdp.write_data_port(next),
-            0xC00004 | 0xC00006 => bus.vdp.write_control_port(next),
+            0xC00000 | 0xC00002 => {
+                if immediate_byte_commit || low_byte_write {
+                    bus.vdp.write_data_port(next);
+                }
+            }
+            0xC00004 | 0xC00006 => {
+                if immediate_byte_commit || low_byte_write {
+                    bus.vdp.write_control_port(next);
+                    self.process_pending_vdp_bus_dma(bus);
+                }
+            }
             _ => {}
+        }
+    }
+
+    fn process_pending_vdp_bus_dma(&mut self, bus: &mut Z80Bus<'_>) {
+        while let Some(request) = bus.vdp.take_bus_dma_request() {
+            let mut next_source_addr = request.source_addr & 0x00FF_FFFE;
+            for _ in 0..request.words {
+                let hi = self.read_dma_source_u8(next_source_addr, bus);
+                let lo = self.read_dma_source_u8(next_source_addr.wrapping_add(1), bus);
+                bus.vdp.write_data_port(u16::from_be_bytes([hi, lo]));
+                next_source_addr = next_source_addr.wrapping_add(2);
+            }
+            bus.vdp.complete_bus_dma(next_source_addr & 0x00FF_FFFE);
+
+            let dma_wait_cycles = (request.words as u32).saturating_mul(2);
+            self.io_wait_cycles = self
+                .io_wait_cycles
+                .saturating_add(dma_wait_cycles.min(u16::MAX as u32) as u16);
+        }
+    }
+
+    fn read_dma_source_u8(&self, addr: u32, bus: &mut Z80Bus<'_>) -> u8 {
+        let addr = addr & 0x00FF_FFFF;
+        match addr {
+            0x000000..=0x3FFFFF => bus.cartridge.read_u8(addr),
+            0xA00000..=0xA01FFF => self.ram[(addr as usize - 0xA00000) & 0x1FFF],
+            0xA04000..=0xA04003 => bus.audio.read_ym2612((addr - 0xA04000) as u8),
+            0xC00000..=0xC0001F => Self::read_vdp_port_byte(addr, bus),
+            x if x == IO_VERSION_ADDR || x == IO_VERSION_ADDR + 1 => bus.io.read_version(),
+            x if x == IO_PORT1_DATA_ADDR || x == IO_PORT1_DATA_ADDR + 1 => bus.io.read_port1_data(),
+            x if x == IO_PORT2_DATA_ADDR || x == IO_PORT2_DATA_ADDR + 1 => bus.io.read_port2_data(),
+            x if x == IO_PORT1_CTRL_ADDR || x == IO_PORT1_CTRL_ADDR + 1 => bus.io.read_port1_ctrl(),
+            x if x == IO_PORT2_CTRL_ADDR || x == IO_PORT2_CTRL_ADDR + 1 => bus.io.read_port2_ctrl(),
+            0xFF0000..=0xFFFFFF => bus.work_ram[(addr - 0xFF0000) as usize],
+            _ => 0xFF,
         }
     }
 
@@ -1808,6 +2313,50 @@ impl Z80 {
             self.ix = value;
         } else {
             self.iy = value;
+        }
+    }
+
+    fn index_reg_hi(&self, use_ix: bool) -> u8 {
+        (self.index_reg(use_ix) >> 8) as u8
+    }
+
+    fn index_reg_lo(&self, use_ix: bool) -> u8 {
+        self.index_reg(use_ix) as u8
+    }
+
+    fn set_index_reg_hi(&mut self, use_ix: bool, value: u8) {
+        let next = ((value as u16) << 8) | (self.index_reg(use_ix) & 0x00FF);
+        self.set_index_reg(use_ix, next);
+    }
+
+    fn set_index_reg_lo(&mut self, use_ix: bool, value: u8) {
+        let next = (self.index_reg(use_ix) & 0xFF00) | value as u16;
+        self.set_index_reg(use_ix, next);
+    }
+
+    fn read_index_reg_code_no_mem(&self, use_ix: bool, code: u8) -> u8 {
+        match code & 0x7 {
+            0b000 => self.b,
+            0b001 => self.c,
+            0b010 => self.d,
+            0b011 => self.e,
+            0b100 => self.index_reg_hi(use_ix),
+            0b101 => self.index_reg_lo(use_ix),
+            0b111 => self.a,
+            _ => 0,
+        }
+    }
+
+    fn write_index_reg_code_no_mem(&mut self, use_ix: bool, code: u8, value: u8) {
+        match code & 0x7 {
+            0b000 => self.b = value,
+            0b001 => self.c = value,
+            0b010 => self.d = value,
+            0b011 => self.e = value,
+            0b100 => self.set_index_reg_hi(use_ix, value),
+            0b101 => self.set_index_reg_lo(use_ix, value),
+            0b111 => self.a = value,
+            _ => {}
         }
     }
 
@@ -1838,52 +2387,149 @@ impl Z80 {
         (self.f & FLAG_C) != 0
     }
 
-    fn flag_s(&self) -> bool {
-        (self.f & FLAG_S) != 0
-    }
-
     fn flag_pv(&self) -> bool {
         (self.f & FLAG_PV) != 0
     }
 
-    fn update_sz_preserve_c(&mut self, value: u8) {
-        let carry = self.f & FLAG_C;
-        let mut next = carry;
-        if value == 0 {
-            next |= FLAG_Z;
-        }
-        if (value & 0x80) != 0 {
-            next |= FLAG_S;
-        }
-        self.f = next;
+    fn flag_h(&self) -> bool {
+        (self.f & FLAG_H) != 0
     }
 
-    fn update_sz_clear_c(&mut self, value: u8) {
-        let mut next = 0;
+    fn flag_n(&self) -> bool {
+        (self.f & FLAG_N) != 0
+    }
+
+    fn flag_s(&self) -> bool {
+        (self.f & FLAG_S) != 0
+    }
+
+    fn parity_even(value: u8) -> bool {
+        (value.count_ones() & 1) == 0
+    }
+
+    fn xy_from_u8(value: u8) -> u8 {
+        value & (FLAG_X | FLAG_Y)
+    }
+
+    fn xy_from_u16_hi(value: u16) -> u8 {
+        ((value >> 8) as u8) & (FLAG_X | FLAG_Y)
+    }
+
+    fn update_szp_preserve_c(&mut self, value: u8) {
+        let carry = self.f & FLAG_C;
+        let mut next = carry | Self::xy_from_u8(value);
         if value == 0 {
             next |= FLAG_Z;
         }
         if (value & 0x80) != 0 {
             next |= FLAG_S;
         }
-        if value.count_ones() % 2 == 0 {
+        if Self::parity_even(value) {
             next |= FLAG_PV;
         }
         self.f = next;
     }
 
-    fn add_a(&mut self, value: u8) {
-        let a = self.a;
-        let (result, carry) = self.a.overflowing_add(value);
-        self.a = result;
-        let mut flags = 0;
+    fn inc8(&mut self, value: u8) -> u8 {
+        let result = value.wrapping_add(1);
+        let carry = self.f & FLAG_C;
+        let mut flags = carry | Self::xy_from_u8(result);
         if result == 0 {
             flags |= FLAG_Z;
         }
         if (result & 0x80) != 0 {
             flags |= FLAG_S;
         }
-        if ((!(a ^ value)) & (a ^ result) & 0x80) != 0 {
+        if (value & 0x0F) == 0x0F {
+            flags |= FLAG_H;
+        }
+        if value == 0x7F {
+            flags |= FLAG_PV;
+        }
+        self.f = flags;
+        result
+    }
+
+    fn dec8(&mut self, value: u8) -> u8 {
+        let result = value.wrapping_sub(1);
+        let carry = self.f & FLAG_C;
+        let mut flags = carry | FLAG_N | Self::xy_from_u8(result);
+        if result == 0 {
+            flags |= FLAG_Z;
+        }
+        if (result & 0x80) != 0 {
+            flags |= FLAG_S;
+        }
+        if (value & 0x0F) == 0x00 {
+            flags |= FLAG_H;
+        }
+        if value == 0x80 {
+            flags |= FLAG_PV;
+        }
+        self.f = flags;
+        result
+    }
+
+    fn and_a(&mut self, value: u8) {
+        self.a &= value;
+        let mut flags = FLAG_H | Self::xy_from_u8(self.a);
+        if self.a == 0 {
+            flags |= FLAG_Z;
+        }
+        if (self.a & 0x80) != 0 {
+            flags |= FLAG_S;
+        }
+        if Self::parity_even(self.a) {
+            flags |= FLAG_PV;
+        }
+        self.f = flags;
+    }
+
+    fn xor_a(&mut self, value: u8) {
+        self.a ^= value;
+        let mut flags = Self::xy_from_u8(self.a);
+        if self.a == 0 {
+            flags |= FLAG_Z;
+        }
+        if (self.a & 0x80) != 0 {
+            flags |= FLAG_S;
+        }
+        if Self::parity_even(self.a) {
+            flags |= FLAG_PV;
+        }
+        self.f = flags;
+    }
+
+    fn or_a(&mut self, value: u8) {
+        self.a |= value;
+        let mut flags = Self::xy_from_u8(self.a);
+        if self.a == 0 {
+            flags |= FLAG_Z;
+        }
+        if (self.a & 0x80) != 0 {
+            flags |= FLAG_S;
+        }
+        if Self::parity_even(self.a) {
+            flags |= FLAG_PV;
+        }
+        self.f = flags;
+    }
+
+    fn add_a(&mut self, value: u8) {
+        let lhs = self.a;
+        let (result, carry) = self.a.overflowing_add(value);
+        self.a = result;
+        let mut flags = Self::xy_from_u8(result);
+        if result == 0 {
+            flags |= FLAG_Z;
+        }
+        if (result & 0x80) != 0 {
+            flags |= FLAG_S;
+        }
+        if ((lhs & 0x0F) + (value & 0x0F)) > 0x0F {
+            flags |= FLAG_H;
+        }
+        if ((lhs ^ result) & (value ^ result) & 0x80) != 0 {
             flags |= FLAG_PV;
         }
         if carry {
@@ -1893,19 +2539,22 @@ impl Z80 {
     }
 
     fn adc_a(&mut self, value: u8) {
-        let a = self.a;
-        let carry_in = if self.flag_c() { 1u16 } else { 0 };
-        let sum = self.a as u16 + value as u16 + carry_in;
+        let carry_in = if self.flag_c() { 1u8 } else { 0 };
+        let lhs = self.a;
+        let sum = self.a as u16 + value as u16 + carry_in as u16;
         let result = sum as u8;
         self.a = result;
-        let mut flags = 0;
+        let mut flags = Self::xy_from_u8(result);
         if result == 0 {
             flags |= FLAG_Z;
         }
         if (result & 0x80) != 0 {
             flags |= FLAG_S;
         }
-        if ((!(a ^ value)) & (a ^ result) & 0x80) != 0 {
+        if ((lhs & 0x0F) as u16 + (value & 0x0F) as u16 + carry_in as u16) > 0x0F {
+            flags |= FLAG_H;
+        }
+        if ((lhs ^ result) & (value ^ result) & 0x80) != 0 {
             flags |= FLAG_PV;
         }
         if sum > 0xFF {
@@ -1914,18 +2563,108 @@ impl Z80 {
         self.f = flags;
     }
 
-    fn sub_a(&mut self, value: u8) {
-        let a = self.a;
-        let (result, borrow) = self.a.overflowing_sub(value);
-        self.a = result;
-        let mut flags = 0;
+    fn set_compare_flags(&mut self, value: u8) {
+        let lhs = self.a;
+        let result = self.a.wrapping_sub(value);
+        let mut flags = FLAG_N | Self::xy_from_u8(result);
         if result == 0 {
             flags |= FLAG_Z;
         }
         if (result & 0x80) != 0 {
             flags |= FLAG_S;
         }
-        if ((a ^ value) & (a ^ result) & 0x80) != 0 {
+        if (lhs & 0x0F) < (value & 0x0F) {
+            flags |= FLAG_H;
+        }
+        if ((lhs ^ value) & (lhs ^ result) & 0x80) != 0 {
+            flags |= FLAG_PV;
+        }
+        if value > self.a {
+            flags |= FLAG_C;
+        }
+        self.f = flags;
+    }
+
+    fn update_block_transfer_flags(&mut self, value: u8) {
+        // LDI/LDD/LDIR/LDDR preserve S/Z/C, clear H/N, and set PV if BC != 0.
+        let mut flags = self.f & (FLAG_S | FLAG_Z | FLAG_C);
+        if self.bc() != 0 {
+            flags |= FLAG_PV;
+        }
+        flags |= Self::xy_from_u8(self.a.wrapping_add(value));
+        self.f = flags;
+    }
+
+    fn update_block_compare_flags(&mut self, value: u8) {
+        // CPI/CPD/CPIR/CPDR preserve C, set N, and use BC!=0 for PV.
+        let carry = self.f & FLAG_C;
+        let result = self.a.wrapping_sub(value);
+        let half_borrow = (self.a & 0x0F) < (value & 0x0F);
+        let xy_src = result.wrapping_sub(if half_borrow { 1 } else { 0 });
+        let mut flags = carry | FLAG_N | Self::xy_from_u8(xy_src);
+        if result == 0 {
+            flags |= FLAG_Z;
+        }
+        if (result & 0x80) != 0 {
+            flags |= FLAG_S;
+        }
+        if half_borrow {
+            flags |= FLAG_H;
+        }
+        if self.bc() != 0 {
+            flags |= FLAG_PV;
+        }
+        self.f = flags;
+    }
+
+    fn update_block_in_flags(&mut self, value: u8, addr_delta: i8) {
+        // INI/IND/INIR/INDR: derive H/C/PV from C + data +/- 1 and update S/Z from B.
+        let io_sum = self.c as i16 + value as i16 + addr_delta as i16;
+        self.update_block_io_common_flags(value, io_sum);
+    }
+
+    fn update_block_out_flags(&mut self, value: u8) {
+        // OUTI/OUTD/OTIR/OTDR: derive H/C/PV from L + data and update S/Z from B.
+        let io_sum = self.l as i16 + value as i16;
+        self.update_block_io_common_flags(value, io_sum);
+    }
+
+    fn update_block_io_common_flags(&mut self, value: u8, io_sum: i16) {
+        let mut flags = Self::xy_from_u8(self.b);
+        if self.b == 0 {
+            flags |= FLAG_Z;
+        }
+        if (self.b & 0x80) != 0 {
+            flags |= FLAG_S;
+        }
+        if (value & 0x80) != 0 {
+            flags |= FLAG_N;
+        }
+        if !(0..=0xFF).contains(&io_sum) {
+            flags |= FLAG_H | FLAG_C;
+        }
+        let mix = ((io_sum as u8) & 0x07) ^ self.b;
+        if Self::parity_even(mix) {
+            flags |= FLAG_PV;
+        }
+        self.f = flags;
+    }
+
+    fn sub_a(&mut self, value: u8) {
+        let lhs = self.a;
+        let (result, borrow) = self.a.overflowing_sub(value);
+        self.a = result;
+        let mut flags = FLAG_N | Self::xy_from_u8(result);
+        if result == 0 {
+            flags |= FLAG_Z;
+        }
+        if (result & 0x80) != 0 {
+            flags |= FLAG_S;
+        }
+        if (lhs & 0x0F) < (value & 0x0F) {
+            flags |= FLAG_H;
+        }
+        if ((lhs ^ value) & (lhs ^ result) & 0x80) != 0 {
             flags |= FLAG_PV;
         }
         if borrow {
@@ -1935,21 +2674,26 @@ impl Z80 {
     }
 
     fn sbc_a(&mut self, value: u8) {
-        let a = self.a;
-        let carry_in = if self.flag_c() { 1u16 } else { 0 };
+        let carry_in = if self.flag_c() { 1u8 } else { 0 };
+        let lhs8 = self.a;
         let lhs = self.a as u16;
-        let rhs = value as u16 + carry_in;
+        let rhs = value as u16 + carry_in as u16;
         let result16 = lhs.wrapping_sub(rhs);
         let result = result16 as u8;
         self.a = result;
-        let mut flags = 0;
+        let mut flags = FLAG_N | Self::xy_from_u8(result);
         if result == 0 {
             flags |= FLAG_Z;
         }
         if (result & 0x80) != 0 {
             flags |= FLAG_S;
         }
-        if ((a ^ value) & (a ^ result) & 0x80) != 0 {
+        let lhs_low = (lhs8 & 0x0F) as u16;
+        let rhs_low = (value & 0x0F) as u16 + carry_in as u16;
+        if rhs_low > lhs_low {
+            flags |= FLAG_H;
+        }
+        if ((lhs8 ^ value) & (lhs8 ^ result) & 0x80) != 0 {
             flags |= FLAG_PV;
         }
         if rhs > lhs {
@@ -1958,43 +2702,56 @@ impl Z80 {
         self.f = flags;
     }
 
-    fn neg_a(&mut self) {
-        let value = self.a;
-        let result = 0u8.wrapping_sub(value);
-        self.a = result;
-        let mut flags = 0;
+    fn adc_hl(&mut self, value: u16) {
+        let hl = self.hl();
+        let carry_in = if self.flag_c() { 1u32 } else { 0 };
+        let sum = hl as u32 + value as u32 + carry_in;
+        let result = sum as u16;
+        self.set_hl(result);
+        let mut flags = Self::xy_from_u16_hi(result);
         if result == 0 {
             flags |= FLAG_Z;
         }
-        if (result & 0x80) != 0 {
+        if (result & 0x8000) != 0 {
             flags |= FLAG_S;
         }
-        if value != 0 {
+        if ((hl ^ result) & (value ^ result) & 0x8000) != 0 {
+            flags |= FLAG_PV;
+        }
+        if ((hl & 0x0FFF) + (value & 0x0FFF) + carry_in as u16) > 0x0FFF {
+            flags |= FLAG_H;
+        }
+        if sum > 0xFFFF {
             flags |= FLAG_C;
         }
         self.f = flags;
     }
 
-    fn compare_block_step(&mut self, bus: &mut Z80Bus<'_>, increment: bool) -> bool {
-        let value = self.read_byte(self.hl(), bus);
-        let result = self.a.wrapping_sub(value);
-        if increment {
-            self.set_hl(self.hl().wrapping_add(1));
-        } else {
-            self.set_hl(self.hl().wrapping_sub(1));
-        }
-        self.set_bc(self.bc().wrapping_sub(1));
-
-        let carry = self.f & FLAG_C;
-        let mut flags = carry;
+    fn sbc_hl(&mut self, value: u16) {
+        let hl = self.hl();
+        let carry_in = if self.flag_c() { 1u32 } else { 0 };
+        let rhs = value as u32 + carry_in;
+        let lhs = hl as u32;
+        let result = hl.wrapping_sub(value).wrapping_sub(carry_in as u16);
+        self.set_hl(result);
+        let mut flags = FLAG_N | Self::xy_from_u16_hi(result);
         if result == 0 {
             flags |= FLAG_Z;
         }
-        if (result & 0x80) != 0 {
+        if (result & 0x8000) != 0 {
             flags |= FLAG_S;
         }
+        let rhs16 = value.wrapping_add(carry_in as u16);
+        if ((hl ^ rhs16) & (hl ^ result) & 0x8000) != 0 {
+            flags |= FLAG_PV;
+        }
+        if ((value & 0x0FFF) + carry_in as u16) > (hl & 0x0FFF) {
+            flags |= FLAG_H;
+        }
+        if rhs > lhs {
+            flags |= FLAG_C;
+        }
         self.f = flags;
-        result == 0
     }
 
     fn record_unknown(&mut self, opcode: u8, pc: u16) {
@@ -2007,7 +2764,24 @@ impl Z80 {
         let hl = self.hl();
         let (result, carry) = hl.overflowing_add(value);
         self.set_hl(result);
-        let mut flags = self.f & (FLAG_S | FLAG_Z);
+        let mut flags = (self.f & (FLAG_S | FLAG_Z | FLAG_PV)) | Self::xy_from_u16_hi(result);
+        if ((hl & 0x0FFF) + (value & 0x0FFF)) > 0x0FFF {
+            flags |= FLAG_H;
+        }
+        if carry {
+            flags |= FLAG_C;
+        }
+        self.f = flags;
+    }
+
+    fn add_index(&mut self, value: u16, use_ix: bool) {
+        let idx = self.index_reg(use_ix);
+        let (result, carry) = idx.overflowing_add(value);
+        self.set_index_reg(use_ix, result);
+        let mut flags = (self.f & (FLAG_S | FLAG_Z | FLAG_PV)) | Self::xy_from_u16_hi(result);
+        if ((idx & 0x0FFF) + (value & 0x0FFF)) > 0x0FFF {
+            flags |= FLAG_H;
+        }
         if carry {
             flags |= FLAG_C;
         }
@@ -2058,17 +2832,36 @@ mod tests {
 
         z80.write_reset_byte(0x01); // release reset
         z80.step(100, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.cycles(), 50);
+        assert_eq!(z80.cycles(), 46);
 
         z80.write_busreq_byte(0x01); // bus requested -> grant pending, still running
         z80.step(8, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.cycles(), 50);
+
+        z80.step(8, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io); // grant reached at the end of this slice.
         assert_eq!(z80.cycles(), 54);
 
-        z80.step(8, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io); // grant reached at the end of this slice
-        assert_eq!(z80.cycles(), 58);
-
         z80.step(100, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io); // bus granted -> halt
-        assert_eq!(z80.cycles(), 58);
+        assert_eq!(z80.cycles(), 54);
+    }
+
+    #[test]
+    fn bus_grant_mid_slice_only_runs_until_grant_edge() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.write_busreq_byte(0x01);
+
+        // BUSACK delay is 16 M68k cycles; a larger slice must not run beyond it.
+        z80.step(64, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+
+        let expected = ((16u64 * super::Z80_CLOCK_HZ) / super::M68K_CLOCK_HZ) as u64;
+        assert_eq!(z80.cycles(), expected);
+        assert!(z80.bus_granted());
     }
 
     #[test]
@@ -2087,6 +2880,35 @@ mod tests {
 
         z80.step(100, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
         assert!(z80.m68k_can_access_ram());
+    }
+
+    #[test]
+    fn bus_granted_or_reset_still_advances_audio_busy_timer() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+
+        audio.write_ym2612(0, 0x22);
+        audio.write_ym2612(1, 0x0F);
+        assert_ne!(audio.read_ym2612(0) & 0x80, 0);
+
+        // While reset is asserted, Z80 CPU is halted, but YM time should still pass.
+        z80.step(64, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(audio.read_ym2612(0) & 0x80, 0);
+
+        // Re-arm busy and verify BUSREQ-granted state also advances YM time.
+        audio.write_ym2612(0, 0x22);
+        audio.write_ym2612(1, 0x10);
+        assert_ne!(audio.read_ym2612(0) & 0x80, 0);
+        z80.write_reset_byte(0x01);
+        z80.write_busreq_byte(0x01);
+        z80.step(64, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        z80.step(64, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert!(z80.bus_granted());
+        assert_eq!(audio.read_ym2612(0) & 0x80, 0);
     }
 
     #[test]
@@ -2142,6 +2964,997 @@ mod tests {
     }
 
     #[test]
+    fn cpl_and_rla_are_implemented() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD A,0x80 ; RLA ; CPL ; HALT
+        let program = [0x3E, 0x80, 0x17, 0x2F, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0xFF);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_N, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+    }
+
+    #[test]
+    fn scf_and_ccf_update_halfcarry_and_subtract_flags() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // XOR A ; SCF ; CCF ; HALT
+        let program = [0xAF, 0x37, 0x3F, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.f & super::FLAG_C, 0);
+        // CCF should move old carry into H and clear N.
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_eq!(z80.f & super::FLAG_N, 0);
+    }
+
+    #[test]
+    fn scf_and_ccf_take_xy_from_a() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD A,0x28 ; SCF ; CCF ; HALT
+        let program = [0x3E, 0x28, 0x37, 0x3F, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_eq!(z80.f & super::FLAG_N, 0);
+        assert_eq!(
+            z80.f & (super::FLAG_X | super::FLAG_Y),
+            super::FLAG_X | super::FLAG_Y
+        );
+    }
+
+    #[test]
+    fn index_prefixed_sub_and_sbc_memory_are_implemented() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.ix = 0x0100;
+        z80.a = 5;
+
+        z80.write_ram_u8(0x0101, 1);
+        z80.write_ram_u8(0x0102, 2);
+
+        // SUB A,(IX+1) ; SBC A,(IX+2) ; HALT
+        let program = [0xDD, 0x96, 0x01, 0xDD, 0x9E, 0x02, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 2);
+    }
+
+    #[test]
+    fn ed_neg_sets_n_h_and_c_flags() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD A,0x01 ; ED 44 (NEG) ; HALT
+        let program = [0x3E, 0x01, 0xED, 0x44, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0xFF);
+        assert_ne!(z80.f & super::FLAG_N, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_eq!(
+            z80.f & (super::FLAG_X | super::FLAG_Y),
+            super::FLAG_X | super::FLAG_Y
+        );
+
+        z80.write_reset_byte(0x00);
+        z80.write_reset_byte(0x01);
+        // LD A,0x80 ; NEG ; HALT -> overflow sets PV
+        let program = [0x3E, 0x80, 0xED, 0x44, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0x80);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(z80.f & (super::FLAG_X | super::FLAG_Y), 0);
+    }
+
+    #[test]
+    fn ed_in_b_sets_parity_and_preserves_carry() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // SCF ; LD BC,0x007F ; IN B,(C) ; HALT
+        let program = [0x37, 0x01, 0x7F, 0x00, 0xED, 0x40, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.b, 0xFF);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_S, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(z80.f & super::FLAG_Z, 0);
+        assert_eq!(z80.f & super::FLAG_N, 0);
+        assert_eq!(z80.f & super::FLAG_H, 0);
+    }
+
+    #[test]
+    fn index_prefixed_cp_memory_sets_compare_flags() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.ix = 0x0100;
+        z80.a = 0x10;
+        z80.write_ram_u8(0x0101, 0x01);
+
+        // CP (IX+1) ; HALT
+        let program = [0xDD, 0xBE, 0x01, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        // 0x10 - 0x01 => N set, H set, C clear, Z clear.
+        assert_ne!(z80.f & super::FLAG_N, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_eq!(z80.f & super::FLAG_C, 0);
+        assert_eq!(z80.f & super::FLAG_Z, 0);
+    }
+
+    #[test]
+    fn bit_ix_d_uses_effective_address_high_for_xy_flags() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.ix = 0x2810;
+        z80.write_ram_u8(0x0815, 0x00);
+
+        // SCF ; BIT 0,(IX+5) ; HALT
+        let program = [0x37, 0xDD, 0xCB, 0x05, 0x46, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_ne!(z80.f & super::FLAG_Z, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(
+            z80.f & (super::FLAG_X | super::FLAG_Y),
+            super::FLAG_X | super::FLAG_Y
+        );
+    }
+
+    #[test]
+    fn index_high_low_register_ops_and_alu_are_implemented() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD IX,1234 ; LD IXH,20 ; LD IXL,05 ; LD A,IXH ; ADD A,IXL ; AND IXH ; OR IXL ; HALT
+        let program = [
+            0xDD, 0x21, 0x34, 0x12, 0xDD, 0x26, 0x20, 0xDD, 0x2E, 0x05, 0xDD, 0x7C, 0xDD, 0x85,
+            0xDD, 0xA4, 0xDD, 0xB5, 0x76,
+        ];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.ix, 0x2005);
+        assert_eq!(z80.a, 0x25);
+        assert_eq!(z80.pc, program.len() as u16);
+    }
+
+    #[test]
+    fn add_ix_iy_rr_update_halfcarry_and_carry_flags() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.ix = 0xFFFF;
+        z80.set_bc(0x0001);
+        z80.f = super::FLAG_S | super::FLAG_Z | super::FLAG_PV | super::FLAG_N;
+
+        // ADD IX,BC ; HALT
+        let ix_program = [0xDD, 0x09, 0x76];
+        for (i, byte) in ix_program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.ix, 0x0000);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_eq!(z80.f & super::FLAG_N, 0);
+        assert_ne!(z80.f & super::FLAG_S, 0);
+        assert_ne!(z80.f & super::FLAG_Z, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+
+        z80.write_reset_byte(0x00);
+        z80.write_reset_byte(0x01);
+        z80.iy = 0x0FFF;
+        z80.sp = 0x0001;
+
+        // ADD IY,SP ; HALT
+        let iy_program = [0xFD, 0x39, 0x76];
+        for (i, byte) in iy_program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.iy, 0x1000);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_eq!(z80.f & super::FLAG_C, 0);
+    }
+
+    #[test]
+    fn index_prefixed_halt_is_supported() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        z80.write_ram_u8(0x0000, 0xDD);
+        z80.write_ram_u8(0x0001, 0x76);
+
+        z80.step(64, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert!(z80.halted);
+        assert_eq!(z80.pc, 0x0002);
+    }
+
+    #[test]
+    fn ed_ld_bc_mem_and_ld_mem_bc_are_implemented() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.set_bc(0x1234);
+
+        // LD (0x0100),BC ; LD BC,(0x0100) ; HALT
+        let program = [0xED, 0x43, 0x00, 0x01, 0xED, 0x4B, 0x00, 0x01, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.read_ram_u8(0x0100), 0x34);
+        assert_eq!(z80.read_ram_u8(0x0101), 0x12);
+        assert_eq!(z80.bc(), 0x1234);
+    }
+
+    #[test]
+    fn adc_immediate_and_adc_indexed_are_implemented() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.ix = 0x0100;
+        z80.a = 1;
+        z80.write_ram_u8(0x0105, 2);
+
+        // SBC A,0x00 ; ADC A,(IX+5) ; HALT
+        let program = [0xDE, 0x00, 0xDD, 0x8E, 0x05, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 3);
+    }
+
+    #[test]
+    fn ed_adc_sbc_hl_rr_are_implemented() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.set_hl(0x1000);
+        z80.set_bc(0x0001);
+        z80.set_de(0x0002);
+        z80.sp = 0x0003;
+
+        // ADC HL,BC ; ADC HL,DE ; ADC HL,SP ; SBC HL,BC ; HALT
+        let program = [0xED, 0x4A, 0xED, 0x5A, 0xED, 0x7A, 0xED, 0x42, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.hl(), 0x1005);
+    }
+
+    #[test]
+    fn ed_ldd_and_lddr_are_implemented() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.set_hl(0x0102);
+        z80.set_de(0x0202);
+        z80.set_bc(0x0003);
+        z80.write_ram_u8(0x0100, 0x11);
+        z80.write_ram_u8(0x0101, 0x22);
+        z80.write_ram_u8(0x0102, 0x33);
+
+        // LDD ; LDDR ; HALT
+        let program = [0xED, 0xA8, 0xED, 0xB8, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.read_ram_u8(0x0202), 0x33);
+        assert_eq!(z80.read_ram_u8(0x0201), 0x22);
+        assert_eq!(z80.read_ram_u8(0x0200), 0x11);
+        assert_eq!(z80.bc(), 0x0000);
+        assert_eq!(z80.hl(), 0x00FF);
+        assert_eq!(z80.de(), 0x01FF);
+    }
+
+    #[test]
+    fn ed_ldi_updates_block_transfer_flags() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.a = 0x20;
+        z80.f = super::FLAG_S | super::FLAG_Z | super::FLAG_C | super::FLAG_H | super::FLAG_N;
+        z80.set_hl(0x0100);
+        z80.set_de(0x0200);
+        z80.set_bc(0x0002);
+        z80.write_ram_u8(0x0100, 0x11);
+
+        // LDI ; HALT
+        let program = [0xED, 0xA0, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.read_ram_u8(0x0200), 0x11);
+        assert_eq!(z80.bc(), 0x0001);
+        assert_ne!(z80.f & super::FLAG_S, 0);
+        assert_ne!(z80.f & super::FLAG_Z, 0);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(z80.f & (super::FLAG_H | super::FLAG_N), 0);
+    }
+
+    #[test]
+    fn ed_cpi_uses_bc_for_pv_and_preserves_carry() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.a = 0x10;
+        z80.f = super::FLAG_C;
+        z80.set_hl(0x0100);
+        z80.set_bc(0x0002);
+        z80.write_ram_u8(0x0100, 0x01);
+
+        // CPI ; HALT
+        let program = [0xED, 0xA1, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.hl(), 0x0101);
+        assert_eq!(z80.bc(), 0x0001);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_N, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(z80.f & (super::FLAG_Z | super::FLAG_S), 0);
+    }
+
+    #[test]
+    fn ed_cpi_uses_a_minus_mem_minus_h_for_xy_flags() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.a = 0x30;
+        z80.set_hl(0x0100);
+        z80.set_bc(0x0002);
+        z80.write_ram_u8(0x0100, 0x08);
+
+        // CPI ; HALT
+        let program = [0xED, 0xA1, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.hl(), 0x0101);
+        assert_eq!(z80.bc(), 0x0001);
+        assert_ne!(z80.f & super::FLAG_N, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        // result=0x28, H=1 => undocumented XY come from 0x27.
+        assert_eq!(z80.f & (super::FLAG_X | super::FLAG_Y), super::FLAG_Y);
+    }
+
+    #[test]
+    fn ed_cpir_repeats_until_match() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.a = 0x22;
+        z80.set_hl(0x0100);
+        z80.set_bc(0x0003);
+        z80.write_ram_u8(0x0100, 0x10);
+        z80.write_ram_u8(0x0101, 0x22);
+        z80.write_ram_u8(0x0102, 0x33);
+
+        // CPIR ; HALT
+        let program = [0xED, 0xB1, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.hl(), 0x0102);
+        assert_eq!(z80.bc(), 0x0001);
+        assert_ne!(z80.f & super::FLAG_Z, 0);
+    }
+
+    #[test]
+    fn ed_cpir_clears_pv_when_bc_reaches_zero_without_match() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.a = 0x7E;
+        z80.f = super::FLAG_C;
+        z80.set_hl(0x0100);
+        z80.set_bc(0x0002);
+        z80.write_ram_u8(0x0100, 0x10);
+        z80.write_ram_u8(0x0101, 0x20);
+
+        // CPIR ; HALT
+        let program = [0xED, 0xB1, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(1024, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.hl(), 0x0102);
+        assert_eq!(z80.bc(), 0x0000);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_N, 0);
+        assert_eq!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(z80.f & super::FLAG_Z, 0);
+    }
+
+    #[test]
+    fn ed_cpdr_repeats_until_match() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.a = 0x22;
+        z80.set_hl(0x0102);
+        z80.set_bc(0x0003);
+        z80.write_ram_u8(0x0100, 0x10);
+        z80.write_ram_u8(0x0101, 0x22);
+        z80.write_ram_u8(0x0102, 0x33);
+
+        // CPDR ; HALT
+        let program = [0xED, 0xB9, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.hl(), 0x0100);
+        assert_eq!(z80.bc(), 0x0001);
+        assert_ne!(z80.f & super::FLAG_Z, 0);
+    }
+
+    #[test]
+    fn out_immediate_writes_psg_port() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD A,0x9A ; OUT (0x7F),A ; HALT
+        let program = [0x3E, 0x9A, 0xD3, 0x7F, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(audio.psg().last_data(), 0x9A);
+    }
+
+    #[test]
+    fn out_immediate_writes_ym2612_via_port_io() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD A,0x22 ; OUT (0x40),A ; LD A,0x0F ; OUT (0x41),A ; HALT
+        let program = [0x3E, 0x22, 0xD3, 0x40, 0x3E, 0x0F, 0xD3, 0x41, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(320, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(audio.ym2612().register(0, 0x22), 0x0F);
+    }
+
+    #[test]
+    fn ed_out_c_a_writes_ym2612_via_port_io() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD BC,0x0040 ; LD A,0x22 ; OUT (C),A ; INC C ; LD A,0x0F ; OUT (C),A ; HALT
+        let program = [
+            0x01, 0x40, 0x00, 0x3E, 0x22, 0xED, 0x79, 0x0C, 0x3E, 0x0F, 0xED, 0x79, 0x76,
+        ];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(audio.ym2612().register(0, 0x22), 0x0F);
+    }
+
+    #[test]
+    fn in_immediate_reads_ym2612_status_via_port_io() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // Preload YM timer-A status bit so IN can verify YM status routing robustly.
+        audio.write_ym2612(0, 0x24);
+        audio.write_ym2612(1, 0xFF);
+        audio.write_ym2612(0, 0x25);
+        audio.write_ym2612(1, 0x03);
+        audio.write_ym2612(0, 0x27);
+        audio.write_ym2612(1, 0x05);
+        audio.step_z80_cycles(80);
+        assert_ne!(audio.read_ym2612(0) & 0x01, 0);
+
+        // IN A,(0x40) ; HALT
+        let program = [0xDB, 0x40, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_ne!(z80.a & 0x01, 0);
+    }
+
+    #[test]
+    fn ed_in_c_a_reads_ym2612_status_via_port_io() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // Preload YM timer-A status bit so IN can verify YM status routing robustly.
+        audio.write_ym2612(0, 0x24);
+        audio.write_ym2612(1, 0xFF);
+        audio.write_ym2612(0, 0x25);
+        audio.write_ym2612(1, 0x03);
+        audio.write_ym2612(0, 0x27);
+        audio.write_ym2612(1, 0x05);
+        audio.step_z80_cycles(80);
+        assert_ne!(audio.read_ym2612(0) & 0x01, 0);
+
+        // LD BC,0x0040 ; IN A,(C) ; HALT
+        let program = [0x01, 0x40, 0x00, 0xED, 0x78, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_ne!(z80.a & 0x01, 0);
+    }
+
+    #[test]
+    fn ed_otir_repeats_and_writes_psg_port() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.set_hl(0x0100);
+        z80.set_bc(0x027F); // B=2, C=0x7F
+        z80.write_ram_u8(0x0100, 0x9A);
+        z80.write_ram_u8(0x0101, 0x9B);
+
+        // OTIR ; HALT
+        let program = [0xED, 0xB3, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(audio.psg().last_data(), 0x9B);
+        assert_eq!(z80.b, 0);
+        assert_eq!(z80.hl(), 0x0102);
+    }
+
+    #[test]
+    fn ed_inir_reads_port_into_memory_until_b_zero() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.set_hl(0x0100);
+        z80.set_bc(0x0200); // B=2
+
+        // INIR ; HALT
+        let program = [0xED, 0xB2, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.read_ram_u8(0x0100), 0xFF);
+        assert_eq!(z80.read_ram_u8(0x0101), 0xFF);
+        assert_eq!(z80.b, 0);
+        assert_eq!(z80.hl(), 0x0102);
+    }
+
+    #[test]
+    fn ed_ini_updates_block_io_flags() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.set_hl(0x0100);
+        z80.set_bc(0x0100); // B=1, C=0
+
+        // INI ; HALT
+        let program = [0xED, 0xA2, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.read_ram_u8(0x0100), 0xFF);
+        assert_eq!(z80.b, 0);
+        assert_eq!(z80.hl(), 0x0101);
+        assert_ne!(z80.f & super::FLAG_Z, 0);
+        assert_ne!(z80.f & super::FLAG_N, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(z80.f & super::FLAG_S, 0);
+    }
+
+    #[test]
+    fn ed_outd_updates_block_io_flags() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.set_hl(0x0081);
+        z80.set_bc(0x017F); // B=1, C=0x7F (PSG port)
+        z80.write_ram_u8(0x0081, 0x80);
+
+        // OUTD ; HALT
+        let program = [0xED, 0xAB, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(audio.psg().last_data(), 0x80);
+        assert_eq!(z80.b, 0);
+        assert_eq!(z80.hl(), 0x0080);
+        assert_ne!(z80.f & super::FLAG_Z, 0);
+        assert_ne!(z80.f & super::FLAG_N, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(z80.f & super::FLAG_S, 0);
+    }
+
+    #[test]
+    fn ed_rld_and_rrd_transform_nibbles_between_a_and_hl() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.set_hl(0x0100);
+        z80.a = 0xAB;
+        z80.write_ram_u8(0x0100, 0xCD);
+
+        // RLD ; RRD ; HALT
+        let program = [0xED, 0x6F, 0xED, 0x67, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0xAB);
+        assert_eq!(z80.read_ram_u8(0x0100), 0xCD);
+    }
+
+    #[test]
+    fn ed_ld_i_r_and_ld_a_i_r_are_implemented() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.f = super::FLAG_C;
+
+        // LD A,0xA5 ; LD I,A ; XOR A ; LD A,I ; LD A,0x80 ; LD R,A ; LD A,R ; HALT
+        let program = [
+            0x3E, 0xA5, 0xED, 0x47, 0xAF, 0xED, 0x57, 0x3E, 0x80, 0xED, 0x4F, 0xED, 0x5F, 0x76,
+        ];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.i_reg, 0xA5);
+        assert_eq!(z80.a, 0x82);
+    }
+
+    #[test]
+    fn ed_ld_a_i_and_ld_a_r_update_xy_and_control_bits() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD A,I ; HALT
+        z80.i_reg = 0x28;
+        z80.f = super::FLAG_C | super::FLAG_H | super::FLAG_N;
+        z80.iff2 = false;
+        z80.write_ram_u8(0x0000, 0xED);
+        z80.write_ram_u8(0x0001, 0x57);
+        z80.write_ram_u8(0x0002, 0x76);
+
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0x28);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_eq!(z80.f & (super::FLAG_H | super::FLAG_N), 0);
+        assert_eq!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(
+            z80.f & (super::FLAG_X | super::FLAG_Y),
+            super::FLAG_X | super::FLAG_Y
+        );
+
+        // LD A,R ; HALT
+        z80.write_reset_byte(0x00);
+        z80.write_reset_byte(0x01);
+        z80.r_reg = 0x26;
+        z80.f = super::FLAG_C;
+        z80.iff2 = true;
+        z80.write_ram_u8(0x0000, 0xED);
+        z80.write_ram_u8(0x0001, 0x5F);
+        z80.write_ram_u8(0x0002, 0x76);
+        let expected = z80.r_reg.wrapping_add(2);
+
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, expected);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_eq!(z80.f & (super::FLAG_H | super::FLAG_N), 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(
+            z80.f & (super::FLAG_X | super::FLAG_Y),
+            expected & (super::FLAG_X | super::FLAG_Y)
+        );
+    }
+
+    #[test]
+    fn refresh_counter_advances_on_opcode_fetches() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD A,0x12 ; NOP ; HALT
+        z80.write_ram_u8(0x0000, 0x3E);
+        z80.write_ram_u8(0x0001, 0x12);
+        z80.write_ram_u8(0x0002, 0x00);
+        z80.write_ram_u8(0x0003, 0x76);
+
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.r_reg & 0x7F, 3);
+    }
+
+    #[test]
+    fn refresh_counter_preserves_high_bit_during_opcode_fetch() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.r_reg = 0x80;
+
+        // NOP ; NOP ; HALT
+        z80.write_ram_u8(0x0000, 0x00);
+        z80.write_ram_u8(0x0001, 0x00);
+        z80.write_ram_u8(0x0002, 0x76);
+
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.r_reg, 0x83);
+    }
+
+    #[test]
     fn unknown_opcode_counter_increments_for_unimplemented_prefix() {
         let mut z80 = Z80::new();
         let mut audio = AudioBus::new();
@@ -2158,7 +3971,143 @@ mod tests {
     }
 
     #[test]
-    fn ed_neg_opcode_updates_a_and_flags() {
+    fn dd_prefix_is_ignored_for_non_indexed_opcode() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // DD ; NOP ; HALT
+        z80.write_ram_u8(0x0000, 0xDD);
+        z80.write_ram_u8(0x0001, 0x00);
+        z80.write_ram_u8(0x0002, 0x76);
+
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.r_reg & 0x7F, 3);
+    }
+
+    #[test]
+    fn dd_prefix_before_ed_executes_ed_opcode_normally() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.a = 0x5A;
+
+        // DD ; ED 47 (LD I,A) ; HALT
+        z80.write_ram_u8(0x0000, 0xDD);
+        z80.write_ram_u8(0x0001, 0xED);
+        z80.write_ram_u8(0x0002, 0x47);
+        z80.write_ram_u8(0x0003, 0x76);
+
+        z80.step(192, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.i_reg, 0x5A);
+    }
+
+    #[test]
+    fn repeated_dd_prefix_uses_last_prefix_and_does_not_mark_unknown() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // DD ; DD ; LD IX,0x1234 ; HALT
+        let program = [0xDD, 0xDD, 0x21, 0x34, 0x12, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.ix, 0x1234);
+    }
+
+    #[test]
+    fn ed_ld_mem_sp_and_ld_sp_mem_are_implemented() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.sp = 0xBEEF;
+
+        // LD (0x1234),SP ; LD SP,(0x1234) ; HALT
+        let program = [0xED, 0x73, 0x34, 0x12, 0xED, 0x7B, 0x34, 0x12, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.read_ram_u8(0x1234), 0xEF);
+        assert_eq!(z80.read_ram_u8(0x1235), 0xBE);
+        assert_eq!(z80.sp, 0xBEEF);
+    }
+
+    #[test]
+    fn ed_ld_mem_hl_and_ld_hl_mem_are_implemented() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.set_hl(0xCAFE);
+
+        // LD (0x1234),HL ; LD HL,(0x1234) ; HALT
+        let program = [0xED, 0x63, 0x34, 0x12, 0xED, 0x6B, 0x34, 0x12, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.read_ram_u8(0x1234), 0xFE);
+        assert_eq!(z80.read_ram_u8(0x1235), 0xCA);
+        assert_eq!(z80.hl(), 0xCAFE);
+    }
+
+    #[test]
+    fn ed_retn_alias_restores_iff_and_returns() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.iff2 = true;
+        z80.sp = 0x0100;
+        z80.write_ram_u8(0x0100, 0x34);
+        z80.write_ram_u8(0x0101, 0x12);
+
+        // RETN alias: ED 55 ; HALT (at return target)
+        z80.write_ram_u8(0x0000, 0xED);
+        z80.write_ram_u8(0x0001, 0x55);
+        z80.write_ram_u8(0x1234, 0x76);
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.pc, 0x1235);
+        assert!(z80.iff1);
+    }
+
+    #[test]
+    fn ed_neg_opcode_is_implemented() {
         let mut z80 = Z80::new();
         let mut audio = AudioBus::new();
         let cart = dummy_cart();
@@ -2181,28 +4130,6 @@ mod tests {
     }
 
     #[test]
-    fn ed_neg_zero_sets_z_and_clears_carry() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-        z80.a = 0x00;
-        // NEG ; HALT
-        z80.write_ram_u8(0x0000, 0xED);
-        z80.write_ram_u8(0x0001, 0x44);
-        z80.write_ram_u8(0x0002, 0x76);
-
-        z80.step(64, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.a, 0x00);
-        assert_ne!(z80.f & super::FLAG_Z, 0);
-        assert_eq!(z80.f & super::FLAG_C, 0);
-    }
-
-    #[test]
     fn or_a_updates_flags_and_is_not_unknown() {
         let mut z80 = Z80::new();
         let mut audio = AudioBus::new();
@@ -2221,69 +4148,6 @@ mod tests {
         assert_eq!(z80.a, 0);
         assert_ne!(z80.f & super::FLAG_Z, 0);
         assert_eq!(z80.f & super::FLAG_C, 0);
-        assert_ne!(z80.f & super::FLAG_PV, 0);
-    }
-
-    #[test]
-    fn logical_parity_flag_drives_jp_pe_po() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // xor a ; jp po,0x0008 ; ld a,0x11 ; halt ; [0008] ld a,0x22 ; halt
-        let prog = [0xAF, 0xE2, 0x08, 0x00, 0x3E, 0x11, 0x76, 0x00, 0x3E, 0x22, 0x76];
-        for (i, b) in prog.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *b);
-        }
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        // XOR A -> A=0 has even parity => PV=1, so JP PO must be not-taken.
-        assert_eq!(z80.a, 0x11);
-
-        let mut z80 = Z80::new();
-        z80.write_reset_byte(0x01);
-        // xor a ; or 1 ; jp po,0x000A ; ld a,0x11 ; halt ; [000A] ld a,0x22 ; halt
-        let prog = [
-            0xAF, 0xF6, 0x01, 0xE2, 0x0A, 0x00, 0x3E, 0x11, 0x76, 0x00, 0x3E, 0x22, 0x76,
-        ];
-        for (i, b) in prog.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *b);
-        }
-        let mut audio = AudioBus::new();
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        let mut work_ram = [0u8; 0x10000];
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        // OR 1 -> A=1 has odd parity => PV=0, so JP PO must be taken.
-        assert_eq!(z80.a, 0x22);
-    }
-
-    #[test]
-    fn add_overflow_sets_pv_for_conditional_jump() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // ld a,0x7f ; add a,0x01 ; jp pe,0x000b ; ld a,0x11 ; halt ; [000b] ld a,0x22 ; halt
-        let prog = [
-            0x3E, 0x7F, 0xC6, 0x01, 0xEA, 0x0B, 0x00, 0x3E, 0x11, 0x76, 0x00, 0x3E, 0x22, 0x76,
-        ];
-        for (i, b) in prog.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *b);
-        }
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.a, 0x22);
-        assert_ne!(z80.f & super::FLAG_PV, 0);
     }
 
     #[test]
@@ -2327,6 +4191,585 @@ mod tests {
     }
 
     #[test]
+    fn conditional_call_c_and_ret_c_execute_control_flow() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // ld a,0 ; sub 1 ; call c,0x0010 ; halt
+        z80.write_ram_u8(0x0000, 0x3E);
+        z80.write_ram_u8(0x0001, 0x00);
+        z80.write_ram_u8(0x0002, 0xD6);
+        z80.write_ram_u8(0x0003, 0x01);
+        z80.write_ram_u8(0x0004, 0xDC);
+        z80.write_ram_u8(0x0005, 0x10);
+        z80.write_ram_u8(0x0006, 0x00);
+        z80.write_ram_u8(0x0007, 0x76);
+
+        // subroutine @0x0010: ld b,0x42 ; ret c
+        z80.write_ram_u8(0x0010, 0x06);
+        z80.write_ram_u8(0x0011, 0x42);
+        z80.write_ram_u8(0x0012, 0xD8);
+        z80.write_ram_u8(0x0013, 0x76);
+
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.b, 0x42);
+        assert_eq!(z80.pc, 0x0008);
+    }
+
+    #[test]
+    fn conditional_call_nc_and_call_p_are_implemented() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // xor a ; call nc,0x0010 ; call p,0x0020 ; halt
+        z80.write_ram_u8(0x0000, 0xAF);
+        z80.write_ram_u8(0x0001, 0xD4);
+        z80.write_ram_u8(0x0002, 0x10);
+        z80.write_ram_u8(0x0003, 0x00);
+        z80.write_ram_u8(0x0004, 0xF4);
+        z80.write_ram_u8(0x0005, 0x20);
+        z80.write_ram_u8(0x0006, 0x00);
+        z80.write_ram_u8(0x0007, 0x76);
+
+        // @0x0010: ld b,0x11 ; ret
+        z80.write_ram_u8(0x0010, 0x06);
+        z80.write_ram_u8(0x0011, 0x11);
+        z80.write_ram_u8(0x0012, 0xC9);
+        // @0x0020: ld c,0x22 ; ret
+        z80.write_ram_u8(0x0020, 0x0E);
+        z80.write_ram_u8(0x0021, 0x22);
+        z80.write_ram_u8(0x0022, 0xC9);
+
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.b, 0x11);
+        assert_eq!(z80.c, 0x22);
+        assert_eq!(z80.pc, 0x0008);
+    }
+
+    #[test]
+    fn parity_condition_jp_call_and_ret_are_implemented() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // Stack seed for POP AF (A=0x00, F=0x04 => PV=1).
+        z80.sp = 0x0100;
+        z80.write_ram_u8(0x0100, super::FLAG_PV);
+        z80.write_ram_u8(0x0101, 0x00);
+
+        // pop af ; call po,0x0030 ; call pe,0x0040 ; jp po,0x0010 ; jp pe,0x0020 ; halt
+        let program = [
+            0xF1, 0xE4, 0x30, 0x00, 0xEC, 0x40, 0x00, 0xE2, 0x10, 0x00, 0xEA, 0x20, 0x00, 0x76,
+        ];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        // Should be skipped (JP PO / CALL PO not taken with PV=1).
+        z80.write_ram_u8(0x0010, 0x76);
+        z80.write_ram_u8(0x0030, 0x76);
+
+        // JP PE target: execute payload and halt.
+        z80.write_ram_u8(0x0020, 0x0E); // LD C,0x22
+        z80.write_ram_u8(0x0021, 0x22);
+        z80.write_ram_u8(0x0022, 0x76);
+
+        // Subroutine @0x0040: RET PO (not taken) ; LD B,0x44 ; RET PE (taken)
+        z80.write_ram_u8(0x0040, 0xE0);
+        z80.write_ram_u8(0x0041, 0x06);
+        z80.write_ram_u8(0x0042, 0x44);
+        z80.write_ram_u8(0x0043, 0xE8);
+        z80.write_ram_u8(0x0044, 0x76);
+
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.b, 0x44);
+        assert_eq!(z80.c, 0x22);
+        assert_eq!(z80.pc, 0x0023);
+    }
+
+    #[test]
+    fn add_and_sub_set_overflow_parity_flag() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD A,0x7F ; ADD A,0x01 ; HALT
+        let add_prog = [0x3E, 0x7F, 0xC6, 0x01, 0x76];
+        for (i, byte) in add_prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.a, 0x80);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_ne!(z80.f & super::FLAG_S, 0);
+        assert_eq!(z80.f & super::FLAG_N, 0);
+
+        z80.write_reset_byte(0x00);
+        z80.write_reset_byte(0x01);
+        // LD A,0x80 ; SUB 0x01 ; HALT
+        let sub_prog = [0x3E, 0x80, 0xD6, 0x01, 0x76];
+        for (i, byte) in sub_prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.a, 0x7F);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_ne!(z80.f & super::FLAG_N, 0);
+        assert_eq!(z80.f & super::FLAG_S, 0);
+    }
+
+    #[test]
+    fn adc_and_sbc_with_carry_in_have_correct_overflow_flag() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // SCF ; LD A,0x00 ; ADC A,0x7F ; HALT
+        // 0 + 127 + 1 = -128 (signed overflow set)
+        let adc_prog = [0x37, 0x3E, 0x00, 0xCE, 0x7F, 0x76];
+        for (i, byte) in adc_prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0x80);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_ne!(z80.f & super::FLAG_S, 0);
+
+        z80.write_reset_byte(0x00);
+        z80.write_reset_byte(0x01);
+
+        // SCF ; LD A,0x00 ; SBC A,0x7F ; HALT
+        // 0 - 127 - 1 = -128 (signed overflow clear)
+        let sbc_prog = [0x37, 0x3E, 0x00, 0xDE, 0x7F, 0x76];
+        for (i, byte) in sbc_prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0x80);
+        assert_eq!(z80.f & super::FLAG_PV, 0);
+        assert_ne!(z80.f & super::FLAG_S, 0);
+    }
+
+    #[test]
+    fn and_sets_halfcarry_and_parity_flags() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD A,0xF0 ; AND 0x0F ; HALT
+        let prog = [0x3E, 0xF0, 0xE6, 0x0F, 0x76];
+        for (i, byte) in prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.a, 0x00);
+        assert_ne!(z80.f & super::FLAG_Z, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(z80.f & (super::FLAG_N | super::FLAG_C), 0);
+    }
+
+    #[test]
+    fn inc_dec_and_bit_update_pv_related_flags() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // SCF ; LD B,0x7F ; INC B ; HALT
+        let inc_prog = [0x37, 0x06, 0x7F, 0x04, 0x76];
+        for (i, byte) in inc_prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.b, 0x80);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(z80.f & super::FLAG_N, 0);
+
+        z80.write_reset_byte(0x00);
+        z80.write_reset_byte(0x01);
+        // SCF ; LD C,0x80 ; DEC C ; HALT
+        let dec_prog = [0x37, 0x0E, 0x80, 0x0D, 0x76];
+        for (i, byte) in dec_prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.c, 0x7F);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_ne!(z80.f & super::FLAG_N, 0);
+
+        z80.write_reset_byte(0x00);
+        z80.write_reset_byte(0x01);
+        // SCF ; LD B,0x00 ; BIT 0,B ; HALT
+        let bit_prog = [0x37, 0x06, 0x00, 0xCB, 0x40, 0x76];
+        for (i, byte) in bit_prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_ne!(z80.f & super::FLAG_Z, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(z80.f & super::FLAG_N, 0);
+    }
+
+    #[test]
+    fn bit_hl_uses_h_for_xy_flags() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.set_hl(0x2810);
+        z80.write_ram_u8(0x0810, 0x00);
+
+        // SCF ; BIT 0,(HL) ; HALT
+        let prog = [0x37, 0xCB, 0x46, 0x76];
+        for (i, byte) in prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_ne!(z80.f & super::FLAG_Z, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(
+            z80.f & (super::FLAG_X | super::FLAG_Y),
+            super::FLAG_X | super::FLAG_Y
+        );
+    }
+
+    #[test]
+    fn undocumented_xy_flags_follow_alu_and_bit_results() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD A,0 ; OR 0x28 ; HALT
+        let or_prog = [0x3E, 0x00, 0xF6, 0x28, 0x76];
+        for (i, byte) in or_prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.a, 0x28);
+        assert_eq!(
+            z80.f & (super::FLAG_X | super::FLAG_Y),
+            super::FLAG_X | super::FLAG_Y
+        );
+
+        z80.write_reset_byte(0x00);
+        z80.write_reset_byte(0x01);
+
+        // SCF ; LD B,0x28 ; BIT 0,B ; HALT
+        let bit_prog = [0x37, 0x06, 0x28, 0xCB, 0x40, 0x76];
+        for (i, byte) in bit_prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_ne!(z80.f & super::FLAG_Z, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(
+            z80.f & (super::FLAG_X | super::FLAG_Y),
+            super::FLAG_X | super::FLAG_Y
+        );
+    }
+
+    #[test]
+    fn add_hl_sets_xy_from_result_high_byte() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD HL,0x1000 ; LD BC,0x1800 ; ADD HL,BC ; HALT  => HL=0x2800 (high=0x28)
+        let prog = [0x21, 0x00, 0x10, 0x01, 0x00, 0x18, 0x09, 0x76];
+        for (i, byte) in prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.hl(), 0x2800);
+        assert_eq!(
+            z80.f & (super::FLAG_X | super::FLAG_Y),
+            super::FLAG_X | super::FLAG_Y
+        );
+    }
+
+    #[test]
+    fn add_hl_preserves_szpv_and_sets_halfcarry() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // XOR A ; LD HL,0x0FFF ; LD BC,0x0001 ; ADD HL,BC ; HALT
+        let prog = [0xAF, 0x21, 0xFF, 0x0F, 0x01, 0x01, 0x00, 0x09, 0x76];
+        for (i, byte) in prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+
+        assert_eq!(z80.hl(), 0x1000);
+        assert_ne!(z80.f & super::FLAG_Z, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_eq!(z80.f & super::FLAG_N, 0);
+        assert_eq!(z80.f & super::FLAG_C, 0);
+    }
+
+    #[test]
+    fn adc_hl_and_sbc_hl_set_extended_flags() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // SCF ; LD HL,0x7FFF ; LD BC,0 ; ADC HL,BC ; HALT
+        let adc_prog = [0x37, 0x21, 0xFF, 0x7F, 0x01, 0x00, 0x00, 0xED, 0x4A, 0x76];
+        for (i, byte) in adc_prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.hl(), 0x8000);
+        assert_ne!(z80.f & super::FLAG_S, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_eq!(z80.f & super::FLAG_N, 0);
+        assert_eq!(z80.f & super::FLAG_C, 0);
+
+        z80.write_reset_byte(0x00);
+        z80.write_reset_byte(0x01);
+        // SCF ; LD HL,0x8000 ; LD BC,0 ; SBC HL,BC ; HALT
+        let sbc_prog = [0x37, 0x21, 0x00, 0x80, 0x01, 0x00, 0x00, 0xED, 0x42, 0x76];
+        for (i, byte) in sbc_prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.hl(), 0x7FFF);
+        assert_eq!(z80.f & super::FLAG_S, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_ne!(z80.f & super::FLAG_H, 0);
+        assert_ne!(z80.f & super::FLAG_N, 0);
+        assert_eq!(z80.f & super::FLAG_C, 0);
+    }
+
+    #[test]
+    fn rotate_a_instructions_preserve_pv() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // XOR A (PV=1, Z=1) ; LD A,0x80 ; RLCA ; HALT
+        let prog = [0xAF, 0x3E, 0x80, 0x07, 0x76];
+        for (i, byte) in prog.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.a, 0x01);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_ne!(z80.f & super::FLAG_Z, 0);
+    }
+
+    #[test]
+    fn misc_flag_and_sp_ops_are_implemented() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD HL,0x1234 ; LD SP,HL ; LD A,0x09 ; ADD A,0x01 ; DAA ; SCF ; CCF ; HALT
+        let program = [
+            0x21, 0x34, 0x12, 0xF9, 0x3E, 0x09, 0xC6, 0x01, 0x27, 0x37, 0x3F, 0x76,
+        ];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.sp, 0x1234);
+        assert_eq!(z80.a, 0x10);
+        assert_eq!(z80.f & super::FLAG_C, 0);
+    }
+
+    #[test]
+    fn daa_handles_subtraction_path() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // LD A,0x10 ; SUB 0x01 ; DAA ; HALT  => 0x09
+        let program = [0x3E, 0x10, 0xD6, 0x01, 0x27, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0x09);
+        assert_eq!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+
+        // LD A,0x00 ; SUB 0x01 ; DAA ; HALT => 0x99 with carry.
+        z80.write_reset_byte(0x00);
+        z80.write_reset_byte(0x01);
+        let program = [0x3E, 0x00, 0xD6, 0x01, 0x27, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0x99);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+    }
+
+    #[test]
+    fn daa_handles_addition_carry_and_xy_cases() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // 0x15 + 0x27 = 0x42 (BCD, no carry)
+        let program = [0x3E, 0x15, 0xC6, 0x27, 0x27, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0x42);
+        assert_eq!(z80.f & super::FLAG_C, 0);
+        assert_eq!(z80.f & super::FLAG_N, 0);
+        assert_eq!(z80.f & (super::FLAG_X | super::FLAG_Y), 0x00);
+
+        // 0x99 + 0x01 = 0x00 with decimal carry.
+        z80.write_reset_byte(0x00);
+        z80.write_reset_byte(0x01);
+        let program = [0x3E, 0x99, 0xC6, 0x01, 0x27, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0x00);
+        assert_ne!(z80.f & super::FLAG_C, 0);
+        assert_ne!(z80.f & super::FLAG_Z, 0);
+        assert_ne!(z80.f & super::FLAG_PV, 0);
+        assert_eq!(z80.f & (super::FLAG_X | super::FLAG_Y), 0x00);
+
+        // 0x08 + 0x08 = 0x16: verifies H-driven adjust path.
+        z80.write_reset_byte(0x00);
+        z80.write_reset_byte(0x01);
+        let program = [0x3E, 0x08, 0xC6, 0x08, 0x27, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0x16);
+        assert_eq!(z80.f & super::FLAG_C, 0);
+        assert_eq!(z80.f & super::FLAG_N, 0);
+    }
+
+    #[test]
+    fn index_ex_sp_and_jp_index_are_implemented() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.ix = 0x0200;
+        z80.sp = 0x0100;
+        z80.write_ram_u8(0x0100, 0x34);
+        z80.write_ram_u8(0x0101, 0x12);
+
+        // EX (SP),IX ; JP (IX)
+        z80.write_ram_u8(0x0000, 0xDD);
+        z80.write_ram_u8(0x0001, 0xE3);
+        z80.write_ram_u8(0x0002, 0xDD);
+        z80.write_ram_u8(0x0003, 0xE9);
+        z80.write_ram_u8(0x1234, 0x76); // HALT at jump target
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.ix, 0x1234);
+        assert_eq!(z80.read_ram_u8(0x0100), 0x00);
+        assert_eq!(z80.read_ram_u8(0x0101), 0x02);
+        assert_eq!(z80.pc, 0x1235);
+    }
+
+    #[test]
     fn pop_af_restores_accumulator_and_flags() {
         let mut z80 = Z80::new();
         let mut audio = AudioBus::new();
@@ -2336,9 +4779,9 @@ mod tests {
         let mut io = IoBus::new();
         z80.write_reset_byte(0x01);
 
-        // Seed stack with AF value 0xAA41 and execute POP AF.
+        // Seed stack with AF value 0xAA45 and execute POP AF.
         z80.sp = 0x0100;
-        z80.write_ram_u8(0x0100, 0x41);
+        z80.write_ram_u8(0x0100, 0x45);
         z80.write_ram_u8(0x0101, 0xAA);
         z80.write_ram_u8(0x0000, 0xF1);
         z80.write_ram_u8(0x0001, 0x76);
@@ -2347,8 +4790,8 @@ mod tests {
         assert_eq!(z80.unknown_opcode_total(), 0);
         assert_eq!(z80.a, 0xAA);
         assert_eq!(
-            z80.f & (super::FLAG_S | super::FLAG_Z | super::FLAG_C),
-            0x41
+            z80.f & (super::FLAG_S | super::FLAG_Z | super::FLAG_PV | super::FLAG_C),
+            0x45
         );
         assert_eq!(z80.sp, 0x0102);
     }
@@ -2448,6 +4891,131 @@ mod tests {
     }
 
     #[test]
+    fn bank_window_reads_vdp_hv_counter_bytes() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.bank_address = 0x00C0_0000;
+        let expected = vdp.read_hv_counter();
+
+        // ld a,(0x8008) ; ld b,a ; ld a,(0x8009) ; halt
+        let program = [0x3A, 0x08, 0x80, 0x47, 0x3A, 0x09, 0x80, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(224, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.b, (expected >> 8) as u8);
+        assert_eq!(z80.a, expected as u8);
+    }
+
+    #[test]
+    fn bank_window_reads_vdp_control_status_bytes() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.bank_address = 0x00C0_0000;
+        let expected = vdp.read_control_port();
+
+        // ld a,(0x8004) ; ld b,a ; ld a,(0x8005) ; halt
+        let program = [0x3A, 0x04, 0x80, 0x47, 0x3A, 0x05, 0x80, 0x76];
+        for (i, byte) in program.iter().enumerate() {
+            z80.write_ram_u8(i as u16, *byte);
+        }
+
+        z80.step(224, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.b, (expected >> 8) as u8);
+        assert_eq!(z80.a, expected as u8);
+    }
+
+    #[test]
+    fn bank_window_control_write_executes_pending_vdp_bus_dma() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.bank_address = 0x00C0_0000;
+        work_ram[0] = 0x12;
+        work_ram[1] = 0x34;
+
+        let mut bus = super::Z80Bus {
+            audio: &mut audio,
+            cartridge: &cart,
+            work_ram: &mut work_ram,
+            vdp: &mut vdp,
+            io: &mut io,
+        };
+        let mut write_control_word = |word: u16| {
+            z80.write_68k_window(0x8004, (word >> 8) as u8, &mut bus);
+            z80.write_68k_window(0x8005, word as u8, &mut bus);
+        };
+
+        // Enable DMA and setup one-word 68k-bus DMA from 0xFF0000 to VRAM 0x0000.
+        write_control_word(0x8150);
+        write_control_word(0x8F02);
+        write_control_word(0x9301);
+        write_control_word(0x9400);
+        write_control_word(0x9500);
+        write_control_word(0x9680);
+        write_control_word(0x977F);
+
+        // Set VRAM write command with DMA request bit.
+        write_control_word(0x4000);
+        write_control_word(0x0080);
+
+        assert_eq!(bus.vdp.read_vram_u8(0x0000), 0x12);
+        assert_eq!(bus.vdp.read_vram_u8(0x0001), 0x34);
+    }
+
+    #[test]
+    fn bank_window_vdp_data_byte_pair_commits_single_word() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.bank_address = 0x00C0_0000;
+
+        let mut bus = super::Z80Bus {
+            audio: &mut audio,
+            cartridge: &cart,
+            work_ram: &mut work_ram,
+            vdp: &mut vdp,
+            io: &mut io,
+        };
+        let mut write_control_word = |word: u16| {
+            z80.write_68k_window(0x8004, (word >> 8) as u8, &mut bus);
+            z80.write_68k_window(0x8005, word as u8, &mut bus);
+        };
+
+        // VRAM write at address 0.
+        write_control_word(0x4000);
+        write_control_word(0x0000);
+
+        // Write one 16-bit data word through byte path.
+        z80.write_68k_window(0x8000, 0x12, &mut bus);
+        z80.write_68k_window(0x8001, 0x34, &mut bus);
+
+        assert_eq!(bus.vdp.read_vram_u8(0x0000), 0x12);
+        assert_eq!(bus.vdp.read_vram_u8(0x0001), 0x34);
+        assert_eq!(bus.vdp.read_vram_u8(0x0002), 0x00);
+        assert_eq!(bus.vdp.read_vram_u8(0x0003), 0x00);
+    }
+
+    #[test]
     fn bank_window_can_write_psg_through_68k_bus_address() {
         let mut z80 = Z80::new();
         let mut audio = AudioBus::new();
@@ -2511,7 +5079,7 @@ mod tests {
     }
 
     #[test]
-    fn ei_defers_interrupt_acceptance_by_one_instruction() {
+    fn ei_defers_maskable_irq_until_after_next_instruction() {
         let mut z80 = Z80::new();
         let mut audio = AudioBus::new();
         let cart = dummy_cart();
@@ -2520,34 +5088,124 @@ mod tests {
         let mut io = IoBus::new();
         z80.write_reset_byte(0x01);
 
-        // ei ; nop ; halt
+        // ei ; ld a,0x11 ; halt ; halt
         z80.write_ram_u8(0x0000, 0xFB);
-        z80.write_ram_u8(0x0001, 0x00);
-        z80.write_ram_u8(0x0002, 0x76);
-        // IRQ vector @0x0038: ld a,0x99 ; reti
+        z80.write_ram_u8(0x0001, 0x3E);
+        z80.write_ram_u8(0x0002, 0x11);
+        z80.write_ram_u8(0x0003, 0x76);
+        z80.write_ram_u8(0x0004, 0x76);
+
+        // IRQ vector @0x0038: ld a,0x22 ; reti
         z80.write_ram_u8(0x0038, 0x3E);
-        z80.write_ram_u8(0x0039, 0x99);
+        z80.write_ram_u8(0x0039, 0x22);
         z80.write_ram_u8(0x003A, 0xED);
         z80.write_ram_u8(0x003B, 0x4D);
 
-        // Execute EI only.
-        z80.step(8, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        z80.request_interrupt();
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+
+        // If IRQ were taken immediately after EI, LD A,0x11 would run after RETI.
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0x22);
+        assert_eq!(z80.pc, 0x0004);
+    }
+
+    #[test]
+    fn nmi_vectors_to_0066_even_when_maskable_irqs_are_disabled() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // di ; halt ; halt
+        z80.write_ram_u8(0x0000, 0xF3);
+        z80.write_ram_u8(0x0001, 0x76);
+        z80.write_ram_u8(0x0002, 0x76);
+
+        // NMI vector @0x0066: ld a,0x5A ; retn
+        z80.write_ram_u8(0x0066, 0x3E);
+        z80.write_ram_u8(0x0067, 0x5A);
+        z80.write_ram_u8(0x0068, 0xED);
+        z80.write_ram_u8(0x0069, 0x45);
+
+        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert!(z80.halted);
+        assert_eq!(z80.pc, 0x0002);
+
+        z80.request_nmi();
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0x5A);
+        assert_eq!(z80.pc, 0x0003);
+        assert!(z80.halted);
+    }
+
+    #[test]
+    fn nmi_latches_previous_iff1_into_iff2_and_retn_restores_it() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // halt ; halt
+        z80.write_ram_u8(0x0000, 0x76);
+        z80.write_ram_u8(0x0001, 0x76);
+
+        // NMI handler @0x0066: retn
+        z80.write_ram_u8(0x0066, 0xED);
+        z80.write_ram_u8(0x0067, 0x45);
+
+        // Set up a state where only IFF1 is enabled so NMI must copy it to IFF2.
+        z80.iff1 = true;
+        z80.iff2 = false;
+
+        z80.step(64, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert!(z80.halted);
         assert_eq!(z80.pc, 0x0001);
 
-        z80.request_interrupt();
-        // Next slice executes one instruction (NOP), interrupt is still blocked.
-        z80.step(8, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.pc, 0x0002);
-        assert_eq!(z80.a, 0x00);
-
-        // Following slice can accept IRQ.
+        z80.request_nmi();
         z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.a, 0x99);
+
+        assert_eq!(z80.unknown_opcode_total(), 0);
+        assert!(z80.iff1);
+        assert!(z80.iff2);
+        assert_eq!(z80.pc, 0x0002);
+        assert!(z80.halted);
+    }
+
+    #[test]
+    fn im_opcodes_update_interrupt_mode_state() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+
+        // im 1 ; im 2 ; im 0 ; halt
+        z80.write_ram_u8(0x0000, 0xED);
+        z80.write_ram_u8(0x0001, 0x56);
+        z80.write_ram_u8(0x0002, 0xED);
+        z80.write_ram_u8(0x0003, 0x5E);
+        z80.write_ram_u8(0x0004, 0xED);
+        z80.write_ram_u8(0x0005, 0x46);
+        z80.write_ram_u8(0x0006, 0x76);
+
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.interrupt_mode, 0);
         assert_eq!(z80.unknown_opcode_total(), 0);
     }
 
     #[test]
-    fn im2_interrupt_uses_i_register_vector_table() {
+    fn interrupt_mode_2_uses_i_register_vector_table() {
         let mut z80 = Z80::new();
         let mut audio = AudioBus::new();
         let cart = dummy_cart();
@@ -2556,34 +5214,35 @@ mod tests {
         let mut io = IoBus::new();
         z80.write_reset_byte(0x01);
 
-        // im 2 ; ei ; nop ; halt
-        z80.write_ram_u8(0x0000, 0xED);
-        z80.write_ram_u8(0x0001, 0x5E);
-        z80.write_ram_u8(0x0002, 0xFB);
-        z80.write_ram_u8(0x0003, 0x00);
-        z80.write_ram_u8(0x0004, 0x76);
-        z80.write_ram_u8(0x0005, 0x76);
+        // ld a,0x12 ; ld i,a ; im 2 ; ei ; halt ; halt
+        z80.write_ram_u8(0x0000, 0x3E);
+        z80.write_ram_u8(0x0001, 0x12);
+        z80.write_ram_u8(0x0002, 0xED);
+        z80.write_ram_u8(0x0003, 0x47);
+        z80.write_ram_u8(0x0004, 0xED);
+        z80.write_ram_u8(0x0005, 0x5E);
+        z80.write_ram_u8(0x0006, 0xFB);
+        z80.write_ram_u8(0x0007, 0x76);
+        z80.write_ram_u8(0x0008, 0x76);
 
-        // Interrupt vector table entry: (I << 8) | 0xFF -> 0x0400.
-        z80.i_reg = 0x12;
-        z80.write_ram_u8(0x12FF, 0x00);
-        z80.write_ram_u8(0x1300, 0x04);
+        // IM2 vector table at I:0x12FF -> 0x3456.
+        z80.write_ram_u8(0x12FF, 0x56);
+        z80.write_ram_u8(0x1300, 0x34);
+        // Handler @0x3456: ld a,0x77 ; reti
+        z80.write_ram_u8(0x3456, 0x3E);
+        z80.write_ram_u8(0x3457, 0x77);
+        z80.write_ram_u8(0x3458, 0xED);
+        z80.write_ram_u8(0x3459, 0x4D);
 
-        // ISR @0x0400: ld a,0x55 ; reti
-        z80.write_ram_u8(0x0400, 0x3E);
-        z80.write_ram_u8(0x0401, 0x55);
-        z80.write_ram_u8(0x0402, 0xED);
-        z80.write_ram_u8(0x0403, 0x4D);
-
-        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.pc, 0x0005);
+        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(z80.interrupt_mode, 2);
+        assert_eq!(z80.pc, 0x0008);
 
         z80.request_interrupt();
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-
-        assert_eq!(z80.a, 0x55);
-        assert_eq!(z80.pc, 0x0006);
+        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
         assert_eq!(z80.unknown_opcode_total(), 0);
+        assert_eq!(z80.a, 0x77);
+        assert_eq!(z80.pc, 0x0009);
     }
 
     #[test]
@@ -2630,529 +5289,5 @@ mod tests {
         assert_eq!(z80.hl(), 0x0101);
         assert_eq!(z80.de(), 0x0201);
         assert_eq!(z80.bc(), 0x0000);
-    }
-
-    #[test]
-    fn ldd_copies_byte_and_decrements_pairs() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        z80.set_hl(0x0101);
-        z80.set_de(0x0201);
-        z80.set_bc(0x0001);
-        z80.write_ram_u8(0x0101, 0xA5);
-        z80.write_ram_u8(0x0000, 0xED);
-        z80.write_ram_u8(0x0001, 0xA8);
-        z80.write_ram_u8(0x0002, 0x76);
-
-        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.read_ram_u8(0x0201), 0xA5);
-        assert_eq!(z80.hl(), 0x0100);
-        assert_eq!(z80.de(), 0x0200);
-        assert_eq!(z80.bc(), 0x0000);
-    }
-
-    #[test]
-    fn lddr_repeats_until_bc_zero() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        z80.set_hl(0x0101);
-        z80.set_de(0x0201);
-        z80.set_bc(0x0002);
-        z80.write_ram_u8(0x0101, 0x11);
-        z80.write_ram_u8(0x0100, 0x22);
-        z80.write_ram_u8(0x0000, 0xED);
-        z80.write_ram_u8(0x0001, 0xB8);
-        z80.write_ram_u8(0x0002, 0x76);
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.read_ram_u8(0x0201), 0x11);
-        assert_eq!(z80.read_ram_u8(0x0200), 0x22);
-        assert_eq!(z80.hl(), 0x00FF);
-        assert_eq!(z80.de(), 0x01FF);
-        assert_eq!(z80.bc(), 0x0000);
-    }
-
-    #[test]
-    fn cpir_stops_on_match_and_sets_z() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        z80.a = 0x42;
-        z80.set_hl(0x0100);
-        z80.set_bc(0x0003);
-        z80.write_ram_u8(0x0100, 0x10);
-        z80.write_ram_u8(0x0101, 0x42);
-        z80.write_ram_u8(0x0102, 0x99);
-        z80.write_ram_u8(0x0000, 0xED);
-        z80.write_ram_u8(0x0001, 0xB1);
-        z80.write_ram_u8(0x0002, 0x76);
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.bc(), 0x0001);
-        assert_eq!(z80.hl(), 0x0102);
-        assert_ne!(z80.f & super::FLAG_Z, 0);
-    }
-
-    #[test]
-    fn cpdr_repeats_until_bc_zero_when_no_match() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        z80.a = 0x80;
-        z80.set_hl(0x0102);
-        z80.set_bc(0x0003);
-        z80.write_ram_u8(0x0102, 0x01);
-        z80.write_ram_u8(0x0101, 0x02);
-        z80.write_ram_u8(0x0100, 0x03);
-        z80.write_ram_u8(0x0000, 0xED);
-        z80.write_ram_u8(0x0001, 0xB9);
-        z80.write_ram_u8(0x0002, 0x76);
-
-        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.bc(), 0x0000);
-        assert_eq!(z80.hl(), 0x00FF);
-        assert_eq!(z80.f & super::FLAG_Z, 0);
-    }
-
-    #[test]
-    fn ld_i_a_and_ld_a_i_roundtrip() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // ld a,0x9A ; ed 47 (ld i,a) ; xor a ; ed 57 (ld a,i) ; halt
-        let program = [0x3E, 0x9A, 0xED, 0x47, 0xAF, 0xED, 0x57, 0x76];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.i_reg, 0x9A);
-        assert_eq!(z80.a, 0x9A);
-        assert_eq!(z80.f & super::FLAG_Z, 0);
-        assert_ne!(z80.f & super::FLAG_S, 0);
-    }
-
-    #[test]
-    fn ld_r_a_and_ld_a_r_roundtrip() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // ld a,0x35 ; ed 4f (ld r,a) ; xor a ; ed 5f (ld a,r) ; halt
-        let program = [0x3E, 0x35, 0xED, 0x4F, 0xAF, 0xED, 0x5F, 0x76];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.r_reg, 0x35);
-        assert_eq!(z80.a, 0x35);
-        assert_eq!(z80.f & super::FLAG_Z, 0);
-        assert_eq!(z80.f & super::FLAG_S, 0);
-    }
-
-    #[test]
-    fn dd_prefix_halt_is_not_unknown() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // DD 76 => HALT
-        z80.write_ram_u8(0x0000, 0xDD);
-        z80.write_ram_u8(0x0001, 0x76);
-
-        z80.step(64, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert!(z80.halted);
-    }
-
-    #[test]
-    fn dd_e9_jumps_via_ix() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // ld ix,0x0100 ; jp (ix)
-        z80.write_ram_u8(0x0000, 0xDD);
-        z80.write_ram_u8(0x0001, 0x21);
-        z80.write_ram_u8(0x0002, 0x00);
-        z80.write_ram_u8(0x0003, 0x01);
-        z80.write_ram_u8(0x0004, 0xDD);
-        z80.write_ram_u8(0x0005, 0xE9);
-        // target: ld a,0x5A ; halt
-        z80.write_ram_u8(0x0100, 0x3E);
-        z80.write_ram_u8(0x0101, 0x5A);
-        z80.write_ram_u8(0x0102, 0x76);
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.a, 0x5A);
-    }
-
-    #[test]
-    fn dd_e3_exchanges_ix_with_stack_word() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // ld ix,0x1234 ; ex (sp),ix ; halt
-        z80.write_ram_u8(0x0000, 0xDD);
-        z80.write_ram_u8(0x0001, 0x21);
-        z80.write_ram_u8(0x0002, 0x34);
-        z80.write_ram_u8(0x0003, 0x12);
-        z80.write_ram_u8(0x0004, 0xDD);
-        z80.write_ram_u8(0x0005, 0xE3);
-        z80.write_ram_u8(0x0006, 0x76);
-
-        z80.sp = 0x0200;
-        z80.write_ram_u8(0x0200, 0xCD);
-        z80.write_ram_u8(0x0201, 0xAB);
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.ix, 0xABCD);
-        assert_eq!(z80.read_ram_u8(0x0200), 0x34);
-        assert_eq!(z80.read_ram_u8(0x0201), 0x12);
-    }
-
-    #[test]
-    fn dd_indexed_adc_sub_sbc_and_are_supported() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // ld ix,0x0200 ; ld a,0x10 ; adc a,(ix+0) ; sub (ix+1) ; sbc a,(ix+2) ; and (ix+3) ; halt
-        let program = [
-            0xDD, 0x21, 0x00, 0x02, 0x3E, 0x10, 0xDD, 0x8E, 0x00, 0xDD, 0x96, 0x01, 0xDD, 0x9E,
-            0x02, 0xDD, 0xA6, 0x03, 0x76,
-        ];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-        z80.write_ram_u8(0x0200, 0x01);
-        z80.write_ram_u8(0x0201, 0x02);
-        z80.write_ram_u8(0x0202, 0x03);
-        z80.write_ram_u8(0x0203, 0x0F);
-
-        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.a, 0x0C);
-    }
-
-    #[test]
-    fn dd_prefix_supports_ixh_ixl_load_and_inc_dec() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // dd 26 10 ; dd 2e 20 ; dd 24 ; dd 2d ; halt
-        let program = [0xDD, 0x26, 0x10, 0xDD, 0x2E, 0x20, 0xDD, 0x24, 0xDD, 0x2D, 0x76];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.ix, 0x111F);
-    }
-
-    #[test]
-    fn dd_prefix_supports_ixh_ixl_register_transfers() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // dd 21 cd ab ; dd 44 ; dd 4d ; dd 60 ; dd 69 ; halt
-        let program = [
-            0xDD, 0x21, 0xCD, 0xAB, 0xDD, 0x44, 0xDD, 0x4D, 0xDD, 0x60, 0xDD, 0x69, 0x76,
-        ];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.b, 0xAB);
-        assert_eq!(z80.c, 0xCD);
-        assert_eq!(z80.ix, 0xABCD);
-    }
-
-    #[test]
-    fn dd_prefix_supports_ixh_ixl_alu_ops() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // dd 21 34 12 ; dd 7c ; dd 85 ; dd a4 ; dd b5 ; halt
-        let program = [
-            0xDD, 0x21, 0x34, 0x12, 0xDD, 0x7C, 0xDD, 0x85, 0xDD, 0xA4, 0xDD, 0xB5, 0x76,
-        ];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.a, 0x36);
-    }
-
-    #[test]
-    fn dd_prefix_on_unrelated_ld_register_is_not_unknown() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // ld c,0x5a ; dd 41 (ld b,c) ; halt
-        let program = [0x0E, 0x5A, 0xDD, 0x41, 0x76];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-
-        z80.step(128, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.b, 0x5A);
-    }
-
-    #[test]
-    fn fd_prefix_supports_iyh_iyl_ld() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // fd 26 66 ; fd 2e 77 ; fd 7c ; halt
-        let program = [0xFD, 0x26, 0x66, 0xFD, 0x2E, 0x77, 0xFD, 0x7C, 0x76];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.iy, 0x6677);
-        assert_eq!(z80.a, 0x66);
-    }
-
-    #[test]
-    fn dd_ld_ixh_from_indexed_memory_writes_ixh_not_h() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // dd 21 00 02 ; dd 66 01 ; halt
-        let program = [0xDD, 0x21, 0x00, 0x02, 0xDD, 0x66, 0x01, 0x76];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-        z80.write_ram_u8(0x0201, 0xAB);
-        z80.h = 0x11;
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.ix, 0xAB00);
-        assert_eq!(z80.h, 0x11);
-    }
-
-    #[test]
-    fn dd_ld_indexed_from_ixh_uses_ixh_not_h() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // dd 21 34 12 ; dd 74 02 ; halt
-        let program = [0xDD, 0x21, 0x34, 0x12, 0xDD, 0x74, 0x02, 0x76];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-        z80.h = 0x55;
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.read_ram_u8(0x1236), 0x12);
-    }
-
-    #[test]
-    fn conditional_ret_and_call_pe_do_not_increment_unknown() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // ec 10 00 ; e8 ; halt ; [0010] halt
-        let program = [0xEC, 0x10, 0x00, 0xE8, 0x76];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-        z80.write_ram_u8(0x0010, 0x76);
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-    }
-
-    #[test]
-    fn ed_ld_indirect_sp_roundtrip() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // ld sp,0x3456 ; ed 73 00 02 ; ld sp,0 ; ed 7b 00 02 ; halt
-        let program = [
-            0x31, 0x56, 0x34, 0xED, 0x73, 0x00, 0x02, 0x31, 0x00, 0x00, 0xED, 0x7B, 0x00, 0x02,
-            0x76,
-        ];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-
-        z80.step(512, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.read_ram_u8(0x0200), 0x56);
-        assert_eq!(z80.read_ram_u8(0x0201), 0x34);
-        assert_eq!(z80.sp, 0x3456);
-    }
-
-    #[test]
-    fn rla_and_sbc_immediate_are_supported() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // ld a,0x80 ; rla ; scf via cp 0x00 ; sbc a,0x00 ; halt
-        let program = [0x3E, 0x80, 0x17, 0xFE, 0x00, 0xDE, 0x00, 0x76];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.a, 0x00);
-    }
-
-    #[test]
-    fn ed_ld_indirect_bc_roundtrip() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // ld bc,0x89ab ; ed 43 10 02 ; halt
-        let program = [0x01, 0xAB, 0x89, 0xED, 0x43, 0x10, 0x02, 0x76];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
-        assert_eq!(z80.read_ram_u8(0x0210), 0xAB);
-        assert_eq!(z80.read_ram_u8(0x0211), 0x89);
-    }
-
-    #[test]
-    fn dd_prefix_ignores_for_control_opcodes_like_ret_pe() {
-        let mut z80 = Z80::new();
-        let mut audio = AudioBus::new();
-        let cart = dummy_cart();
-        let mut work_ram = [0u8; 0x10000];
-        let mut vdp = Vdp::new();
-        let mut io = IoBus::new();
-        z80.write_reset_byte(0x01);
-
-        // call 0008 ; halt ; [0008] dd e8 ; ret
-        let program = [0xCD, 0x08, 0x00, 0x76, 0x00, 0x00, 0x00, 0x00, 0xDD, 0xE8, 0xC9];
-        for (i, byte) in program.iter().enumerate() {
-            z80.write_ram_u8(i as u16, *byte);
-        }
-
-        z80.step(256, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(z80.unknown_opcode_total(), 0);
     }
 }

@@ -8,6 +8,6 @@ pub mod vdp;
 pub mod z80;
 
 pub use cartridge::{Cartridge, CartridgeError, RomHeader};
-pub use input::Button;
+pub use input::{Button, ControllerType};
 pub use system::{Emulator, StepResult};
-pub use vdp::{FRAME_HEIGHT, FRAME_WIDTH};
+pub use vdp::{FRAME_HEIGHT, FRAME_WIDTH, VideoStandard};

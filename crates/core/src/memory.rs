@@ -1,7 +1,7 @@
 use crate::audio::AudioBus;
 use crate::cartridge::Cartridge;
-use crate::input::{Button, IoBus};
-use crate::vdp::{DmaTarget, Vdp};
+use crate::input::{Button, ControllerType, IoBus};
+use crate::vdp::{BusDmaRequest, DmaTarget, Vdp, VideoStandard};
 use crate::z80::Z80;
 use std::collections::VecDeque;
 
@@ -18,7 +18,10 @@ const IO_PORT1_CTRL_ADDR: u32 = 0xA10008;
 const IO_PORT2_CTRL_ADDR: u32 = 0xA1000A;
 const Z80_BUSREQ_ADDR: u32 = 0xA11100;
 const Z80_RESET_ADDR: u32 = 0xA11200;
+const TMSS_ADDR_START: u32 = 0xA14000;
+const TMSS_ADDR_END: u32 = 0xA14003;
 const PSG_ADDR: u32 = 0xC00011;
+const DMA_BUS_WAIT_CYCLES_PER_WORD: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VdpPort {
@@ -48,9 +51,41 @@ impl From<DmaTarget> for DmaTraceTarget {
 pub struct DmaTraceEntry {
     pub target: DmaTraceTarget,
     pub source_addr: u32,
+    pub dest_addr: u16,
+    pub auto_increment: u16,
     pub words: usize,
     pub first_word: u16,
     pub last_word: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveBusDma {
+    target: DmaTarget,
+    source_addr: u32,
+    next_source_addr: u32,
+    dest_addr: u16,
+    auto_increment: u16,
+    words_total: usize,
+    words_remaining: usize,
+    first_word: Option<u16>,
+    last_word: u16,
+}
+
+impl ActiveBusDma {
+    fn from_request(request: BusDmaRequest) -> Self {
+        let source_addr = request.source_addr & 0x00FF_FFFE;
+        Self {
+            target: request.target,
+            source_addr,
+            next_source_addr: source_addr,
+            dest_addr: request.dest_addr,
+            auto_increment: request.auto_increment.max(1),
+            words_total: request.words,
+            words_remaining: request.words,
+            first_word: None,
+            last_word: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -65,9 +100,13 @@ pub struct MemoryMap {
     vdp_control_byte_writes: u64,
     vdp_control_word_writes: u64,
     io: IoBus,
+    tmss: [u8; 4],
     z80: Z80,
     audio: AudioBus,
     dma_trace: VecDeque<DmaTraceEntry>,
+    pending_bus_dma: VecDeque<BusDmaRequest>,
+    active_bus_dma: Option<ActiveBusDma>,
+    dma_wait_cycles: u32,
 }
 
 impl MemoryMap {
@@ -77,20 +116,31 @@ impl MemoryMap {
     }
 
     pub fn new(cartridge: Cartridge) -> Self {
+        let region = cartridge.header().region.as_str();
+        let io_version = io_version_from_region(region);
+        let video_standard = video_standard_from_region(region);
+        let mut vdp = Vdp::with_video_standard(video_standard);
+        if sonic3_compat_quirks_enabled(&cartridge) {
+            vdp.set_quirk_plane_a_64x32_paged(true);
+        }
         Self {
             cartridge,
             work_ram: [0; 0x10000],
-            vdp: Vdp::new(),
+            vdp,
             vdp_data_write_latch: 0,
             vdp_control_write_latch: 0,
             vdp_data_byte_writes: 0,
             vdp_data_word_writes: 0,
             vdp_control_byte_writes: 0,
             vdp_control_word_writes: 0,
-            io: IoBus::new(),
+            io: IoBus::with_version(io_version),
+            tmss: [0; 4],
             z80: Z80::new(),
             audio: AudioBus::new(),
             dma_trace: VecDeque::with_capacity(128),
+            pending_bus_dma: VecDeque::with_capacity(8),
+            active_bus_dma: None,
+            dma_wait_cycles: 0,
         }
     }
 
@@ -124,6 +174,14 @@ impl MemoryMap {
         &self.audio
     }
 
+    pub fn set_audio_output_sample_rate_hz(&mut self, hz: u32) {
+        self.audio.set_output_sample_rate_hz(hz);
+    }
+
+    pub fn audio_output_channels(&self) -> u8 {
+        self.audio.output_channels()
+    }
+
     pub fn pending_audio_samples(&self) -> usize {
         self.audio.pending_samples()
     }
@@ -140,12 +198,22 @@ impl MemoryMap {
         self.io.set_button2_pressed(button, pressed);
     }
 
+    pub fn set_controller_type(&mut self, player: u8, controller_type: ControllerType) {
+        self.io.set_controller_type(player, controller_type);
+    }
+
     pub fn pending_interrupt_level(&self) -> Option<u8> {
         self.vdp.pending_interrupt_level()
     }
 
     pub fn acknowledge_interrupt(&mut self, level: u8) {
         self.vdp.acknowledge_interrupt(level);
+    }
+
+    pub fn take_dma_wait_cycles(&mut self) -> u32 {
+        let cycles = self.dma_wait_cycles;
+        self.dma_wait_cycles = 0;
+        cycles
     }
 
     pub fn step_subsystems(&mut self, cpu_cycles: u32) {
@@ -157,11 +225,70 @@ impl MemoryMap {
             &mut self.vdp,
             &mut self.io,
         );
+        self.io.step(cpu_cycles);
         self.audio.step(cpu_cycles);
     }
 
     pub fn step_vdp(&mut self, cpu_cycles: u32) -> bool {
-        self.vdp.step(cpu_cycles)
+        let mut remaining = cpu_cycles;
+        let mut frame_ready = false;
+
+        while remaining > 0 {
+            if self.active_bus_dma.is_none() {
+                self.active_bus_dma = self
+                    .pending_bus_dma
+                    .pop_front()
+                    .map(ActiveBusDma::from_request);
+            }
+
+            let Some(mut dma) = self.active_bus_dma.take() else {
+                frame_ready |= self.vdp.step(remaining);
+                break;
+            };
+
+            while remaining >= DMA_BUS_WAIT_CYCLES_PER_WORD && dma.words_remaining > 0 {
+                let source = dma.next_source_addr & 0x00FF_FFFE;
+                let hi = self.read_u8_mapped(source & 0x00FF_FFFF);
+                let lo = self.read_u8_mapped(source.wrapping_add(1) & 0x00FF_FFFF);
+                let word = u16::from_be_bytes([hi, lo]);
+                if dma.first_word.is_none() {
+                    dma.first_word = Some(word);
+                }
+                dma.last_word = word;
+                dma.next_source_addr = dma.next_source_addr.wrapping_add(2);
+                dma.words_remaining -= 1;
+
+                self.vdp.write_data_port(word);
+                frame_ready |= self.vdp.step(DMA_BUS_WAIT_CYCLES_PER_WORD);
+                remaining -= DMA_BUS_WAIT_CYCLES_PER_WORD;
+            }
+
+            if dma.words_remaining == 0 {
+                self.vdp
+                    .complete_bus_dma(dma.next_source_addr & 0x00FF_FFFE);
+                self.dma_trace.push_back(DmaTraceEntry {
+                    target: dma.target.into(),
+                    source_addr: dma.source_addr,
+                    dest_addr: dma.dest_addr,
+                    auto_increment: dma.auto_increment,
+                    words: dma.words_total,
+                    first_word: dma.first_word.unwrap_or(0),
+                    last_word: dma.last_word,
+                });
+                if self.dma_trace.len() > 128 {
+                    self.dma_trace.pop_front();
+                }
+                self.active_bus_dma = None;
+            } else {
+                self.active_bus_dma = Some(dma);
+                if remaining > 0 {
+                    frame_ready |= self.vdp.step(remaining);
+                    remaining = 0;
+                }
+            }
+        }
+
+        frame_ready
     }
 
     pub fn frame_buffer(&self) -> &[u8] {
@@ -230,6 +357,9 @@ impl MemoryMap {
     pub fn write_u8(&mut self, addr: u32, value: u8) {
         let addr = Self::mask_address(addr);
         if let Some(port) = decode_vdp_port(addr) {
+            let immediate_byte_commit =
+                std::env::var_os("MEGADRIVE_DEBUG_VDP_BYTE_IMMEDIATE").is_some();
+            let low_byte_write = (addr & 1) != 0;
             let next = match port {
                 VdpPort::Data => {
                     let current = self.vdp_data_write_latch;
@@ -253,13 +383,17 @@ impl MemoryMap {
                 VdpPort::Data => {
                     self.vdp_data_byte_writes = self.vdp_data_byte_writes.saturating_add(1);
                     self.vdp_data_write_latch = next;
-                    self.vdp.write_data_port(next);
+                    if immediate_byte_commit || low_byte_write {
+                        self.vdp.write_data_port(next);
+                    }
                 }
                 VdpPort::Control => {
                     self.vdp_control_byte_writes = self.vdp_control_byte_writes.saturating_add(1);
                     self.vdp_control_write_latch = next;
-                    self.vdp.write_control_port(next);
-                    self.run_pending_vdp_dma();
+                    if immediate_byte_commit || low_byte_write {
+                        self.vdp.write_control_port(next);
+                        self.enqueue_pending_vdp_dma();
+                    }
                 }
                 VdpPort::HvCounter => {}
             }
@@ -281,7 +415,7 @@ impl MemoryMap {
                     self.vdp_control_word_writes = self.vdp_control_word_writes.saturating_add(1);
                     self.vdp_control_write_latch = value;
                     self.vdp.write_control_port(value);
-                    self.run_pending_vdp_dma();
+                    self.enqueue_pending_vdp_dma();
                 }
                 VdpPort::HvCounter => {}
             }
@@ -322,6 +456,7 @@ impl MemoryMap {
             x if x == Z80_BUSREQ_ADDR + 1 => 0x00,
             Z80_RESET_ADDR => self.z80.read_reset_byte(),
             x if x == Z80_RESET_ADDR + 1 => 0x00,
+            TMSS_ADDR_START..=TMSS_ADDR_END => self.tmss[(addr - TMSS_ADDR_START) as usize],
             YM2612_START..=YM2612_END => self.audio.read_ym2612((addr - YM2612_START) as u8),
             Z80_RAM_START..=Z80_RAM_END => {
                 if self.z80.m68k_can_access_ram() {
@@ -353,6 +488,9 @@ impl MemoryMap {
             }
             Z80_BUSREQ_ADDR => self.z80.write_busreq_byte(value),
             Z80_RESET_ADDR => self.z80.write_reset_byte(value),
+            TMSS_ADDR_START..=TMSS_ADDR_END => {
+                self.tmss[(addr - TMSS_ADDR_START) as usize] = value;
+            }
             YM2612_START..=YM2612_END => {
                 self.audio.write_ym2612((addr - YM2612_START) as u8, value)
             }
@@ -366,36 +504,84 @@ impl MemoryMap {
         }
     }
 
-    fn run_pending_vdp_dma(&mut self) {
+    fn enqueue_pending_vdp_dma(&mut self) {
         while let Some(request) = self.vdp.take_bus_dma_request() {
-            let mut source = request.source_addr & 0x00FF_FFFE;
-            let mut first_word = 0u16;
-            let mut last_word = 0u16;
-            let mut has_word = false;
-            for _ in 0..request.words {
-                let hi = self.read_u8_mapped(source & 0x00FF_FFFF);
-                let lo = self.read_u8_mapped(source.wrapping_add(1) & 0x00FF_FFFF);
-                let word = u16::from_be_bytes([hi, lo]);
-                if !has_word {
-                    first_word = word;
-                    has_word = true;
-                }
-                last_word = word;
-                self.vdp.write_data_port(word);
-                source = source.wrapping_add(2);
-            }
-            self.vdp.complete_bus_dma(source & 0x00FF_FFFE);
-            self.dma_trace.push_back(DmaTraceEntry {
-                target: request.target.into(),
+            self.dma_wait_cycles = self.dma_wait_cycles.saturating_add(
+                (request.words as u32).saturating_mul(DMA_BUS_WAIT_CYCLES_PER_WORD),
+            );
+            self.pending_bus_dma.push_back(BusDmaRequest {
                 source_addr: request.source_addr & 0x00FF_FFFE,
+                dest_addr: request.dest_addr,
+                auto_increment: request.auto_increment,
                 words: request.words,
-                first_word,
-                last_word,
+                target: request.target,
             });
-            if self.dma_trace.len() > 128 {
-                self.dma_trace.pop_front();
-            }
         }
+    }
+}
+
+fn sonic3_compat_quirks_enabled(cartridge: &Cartridge) -> bool {
+    let header = cartridge.header();
+    if header.product_code.contains("MK-1079") {
+        return true;
+    }
+    let domestic = header.domestic_title.to_ascii_uppercase();
+    let overseas = header.overseas_title.to_ascii_uppercase();
+    domestic.contains("HEDGEHOG 3") || overseas.contains("HEDGEHOG 3")
+}
+
+fn io_version_from_region(region: &str) -> u8 {
+    let upper = region.trim().to_ascii_uppercase();
+    if upper.contains('J') {
+        return 0x20; // Japan NTSC
+    }
+    if upper.contains('U') {
+        return 0xA0; // Overseas NTSC
+    }
+    if upper.contains('E') {
+        return 0xE0; // Overseas PAL
+    }
+
+    let mut numeric_mask = 0u8;
+    for ch in upper.chars() {
+        if let Some(digit) = ch.to_digit(16) {
+            numeric_mask |= digit as u8;
+        }
+    }
+
+    if (numeric_mask & 0x01) != 0 {
+        0x20
+    } else if (numeric_mask & 0x04) != 0 {
+        0xA0
+    } else if (numeric_mask & 0x08) != 0 {
+        0xE0
+    } else {
+        0x20
+    }
+}
+
+fn video_standard_from_region(region: &str) -> VideoStandard {
+    let upper = region.trim().to_ascii_uppercase();
+    if upper.contains('J') || upper.contains('U') {
+        return VideoStandard::Ntsc;
+    }
+    if upper.contains('E') {
+        return VideoStandard::Pal;
+    }
+
+    let mut numeric_mask = 0u8;
+    for ch in upper.chars() {
+        if let Some(digit) = ch.to_digit(16) {
+            numeric_mask |= digit as u8;
+        }
+    }
+
+    if (numeric_mask & 0x05) != 0 {
+        VideoStandard::Ntsc
+    } else if (numeric_mask & 0x08) != 0 {
+        VideoStandard::Pal
+    } else {
+        VideoStandard::Ntsc
     }
 }
 
@@ -413,7 +599,10 @@ fn decode_vdp_port(addr: u32) -> Option<VdpPort> {
 mod tests {
     use crate::cartridge::Cartridge;
     use crate::input::Button;
-    use crate::memory::MemoryMap;
+    use crate::memory::{
+        DmaTraceTarget, MemoryMap, io_version_from_region, video_standard_from_region,
+    };
+    use crate::vdp::VideoStandard;
 
     #[test]
     fn maps_work_ram_reads_and_writes() {
@@ -438,6 +627,53 @@ mod tests {
 
         assert_eq!(memory.vdp().read_vram_u8(0), 0xAB);
         assert_eq!(memory.vdp().read_vram_u8(1), 0xCD);
+    }
+
+    #[test]
+    fn vdp_data_port_byte_writes_commit_only_on_second_byte() {
+        let cart = Cartridge::from_bytes(vec![0; 0x200]).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        memory.write_u16(0xC00004, 0x4000);
+        memory.write_u16(0xC00004, 0x0000);
+        memory.write_u16(0xC00000, 0xA1B2);
+
+        memory.write_u16(0xC00004, 0x4000);
+        memory.write_u16(0xC00004, 0x0000);
+        memory.write_u8(0xC00000, 0x12);
+        assert_eq!(memory.vdp().read_vram_u8(0), 0xA1);
+        assert_eq!(memory.vdp().read_vram_u8(1), 0xB2);
+
+        memory.write_u8(0xC00001, 0x34);
+        assert_eq!(memory.vdp().read_vram_u8(0), 0x12);
+        assert_eq!(memory.vdp().read_vram_u8(1), 0x34);
+    }
+
+    #[test]
+    fn vdp_control_port_byte_writes_commit_only_on_second_byte() {
+        let cart = Cartridge::from_bytes(vec![0; 0x200]).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        // Baseline write at VRAM address 0x0020.
+        memory.write_u16(0xC00004, 0x4020);
+        memory.write_u16(0xC00004, 0x0000);
+        memory.write_u16(0xC00000, 0xAAAA);
+        assert_eq!(memory.vdp().read_vram_u8(0x20), 0xAA);
+        assert_eq!(memory.vdp().read_vram_u8(0x21), 0xAA);
+
+        // First byte only should not commit a new command.
+        memory.write_u8(0xC00004, 0x40);
+        memory.write_u16(0xC00000, 0xBBBB);
+        assert_eq!(memory.vdp().read_vram_u8(0x20), 0xAA);
+        assert_eq!(memory.vdp().read_vram_u8(0x21), 0xAA);
+
+        // Complete command with byte pairs and write new value at 0x0020.
+        memory.write_u8(0xC00005, 0x20);
+        memory.write_u8(0xC00004, 0x00);
+        memory.write_u8(0xC00005, 0x00);
+        memory.write_u16(0xC00000, 0x1234);
+        assert_eq!(memory.vdp().read_vram_u8(0x20), 0x12);
+        assert_eq!(memory.vdp().read_vram_u8(0x21), 0x34);
     }
 
     #[test]
@@ -476,6 +712,49 @@ mod tests {
         memory.set_button_pressed(Button::Start, true);
         memory.write_u8(0xA10003, 0x00); // TH low
         assert_eq!(memory.read_u8(0xA10003), 0x03);
+    }
+
+    #[test]
+    fn io_version_follows_rom_region_letters() {
+        let mut rom = vec![0; 0x400];
+        rom[0x1F0..0x1F3].copy_from_slice(b"U  ");
+        let cart = Cartridge::from_bytes(rom).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+        assert_eq!(memory.read_u8(0xA10000), 0xA0);
+
+        let mut rom = vec![0; 0x400];
+        rom[0x1F0..0x1F3].copy_from_slice(b"E  ");
+        let cart = Cartridge::from_bytes(rom).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+        assert_eq!(memory.read_u8(0xA10000), 0xE0);
+    }
+
+    #[test]
+    fn io_version_follows_numeric_region_mask() {
+        assert_eq!(io_version_from_region("4"), 0xA0);
+        assert_eq!(io_version_from_region("8"), 0xE0);
+        assert_eq!(io_version_from_region("1"), 0x20);
+        assert_eq!(io_version_from_region("F"), 0x20);
+    }
+
+    #[test]
+    fn video_standard_follows_rom_region() {
+        assert_eq!(video_standard_from_region("E"), VideoStandard::Pal);
+        assert_eq!(video_standard_from_region("8"), VideoStandard::Pal);
+        assert_eq!(video_standard_from_region("J"), VideoStandard::Ntsc);
+        assert_eq!(video_standard_from_region("U"), VideoStandard::Ntsc);
+        assert_eq!(video_standard_from_region("JUE"), VideoStandard::Ntsc);
+        assert_eq!(video_standard_from_region("C"), VideoStandard::Ntsc);
+    }
+
+    #[test]
+    fn memory_map_constructs_pal_vdp_for_pal_region_rom() {
+        let mut rom = vec![0; 0x400];
+        rom[0x1F0..0x1F1].copy_from_slice(b"E");
+        let cart = Cartridge::from_bytes(rom).expect("valid cart");
+        let memory = MemoryMap::new(cart);
+        assert_eq!(memory.vdp().video_standard(), VideoStandard::Pal);
+        assert_eq!(memory.vdp().total_lines(), 313);
     }
 
     #[test]
@@ -535,6 +814,20 @@ mod tests {
 
         memory.write_u8(0xC00011, 0x9F);
         assert_eq!(memory.audio().psg().last_data(), 0x9F);
+    }
+
+    #[test]
+    fn routes_tmss_register_reads_and_writes() {
+        let cart = Cartridge::from_bytes(vec![0; 0x200]).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        memory.write_u32(0xA14000, 0x5345_4741); // "SEGA"
+        assert_eq!(memory.read_u8(0xA14000), b'S');
+        assert_eq!(memory.read_u8(0xA14001), b'E');
+        assert_eq!(memory.read_u16(0xA14002), u16::from_be_bytes([b'G', b'A']));
+
+        memory.write_u16(0xA14000, 0x4D44); // "MD"
+        assert_eq!(memory.read_u16(0xA14000), 0x4D44);
     }
 
     #[test]
@@ -604,10 +897,93 @@ mod tests {
         memory.write_u16(0xC00004, 0x4000);
         memory.write_u16(0xC00004, 0x0080);
 
+        let dma_cycles = memory.take_dma_wait_cycles();
+        assert_eq!(dma_cycles, 4);
+        memory.step_vdp(dma_cycles);
+
         assert_eq!(memory.vdp().read_vram_u8(0x0000), 0xAA);
         assert_eq!(memory.vdp().read_vram_u8(0x0001), 0xBB);
         assert_eq!(memory.vdp().read_vram_u8(0x0002), 0xCC);
         assert_eq!(memory.vdp().read_vram_u8(0x0003), 0xDD);
+        assert_eq!(memory.take_dma_wait_cycles(), 0);
+        let trace = memory.dma_trace();
+        let last = trace.last().expect("dma trace entry");
+        assert_eq!(last.target, DmaTraceTarget::Vram);
+        assert_eq!(last.source_addr, 0x00000200);
+        assert_eq!(last.dest_addr, 0x0000);
+        assert_eq!(last.auto_increment, 2);
+        assert_eq!(last.words, 2);
+        assert_eq!(last.first_word, 0xAABB);
+        assert_eq!(last.last_word, 0xCCDD);
+    }
+
+    #[test]
+    fn bus_dma_progresses_as_vdp_cycles_advance() {
+        let mut rom = vec![0; 0x400];
+        rom[0x200] = 0xAA;
+        rom[0x201] = 0xBB;
+        rom[0x202] = 0xCC;
+        rom[0x203] = 0xDD;
+
+        let cart = Cartridge::from_bytes(rom).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        memory.write_u16(0xC00004, 0x8150);
+        memory.write_u16(0xC00004, 0x8F02);
+        memory.write_u16(0xC00004, 0x9302);
+        memory.write_u16(0xC00004, 0x9400);
+        memory.write_u16(0xC00004, 0x9500);
+        memory.write_u16(0xC00004, 0x9601);
+        memory.write_u16(0xC00004, 0x9700);
+        memory.write_u16(0xC00004, 0x4000);
+        memory.write_u16(0xC00004, 0x0080);
+
+        // 2 cycles transfer exactly one word.
+        memory.step_vdp(2);
+        assert_eq!(memory.vdp().read_vram_u8(0x0000), 0xAA);
+        assert_eq!(memory.vdp().read_vram_u8(0x0001), 0xBB);
+        assert_eq!(memory.vdp().read_vram_u8(0x0002), 0x00);
+        assert_eq!(memory.vdp().read_vram_u8(0x0003), 0x00);
+
+        memory.step_vdp(2);
+        assert_eq!(memory.vdp().read_vram_u8(0x0002), 0xCC);
+        assert_eq!(memory.vdp().read_vram_u8(0x0003), 0xDD);
+    }
+
+    #[test]
+    fn bus_dma_updates_source_registers_only_after_transfer_completes() {
+        let mut rom = vec![0; 0x400];
+        rom[0x200] = 0xAA;
+        rom[0x201] = 0xBB;
+        rom[0x202] = 0xCC;
+        rom[0x203] = 0xDD;
+
+        let cart = Cartridge::from_bytes(rom).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        memory.write_u16(0xC00004, 0x8150);
+        memory.write_u16(0xC00004, 0x8F02);
+        memory.write_u16(0xC00004, 0x9302);
+        memory.write_u16(0xC00004, 0x9400);
+        memory.write_u16(0xC00004, 0x9500);
+        memory.write_u16(0xC00004, 0x9601);
+        memory.write_u16(0xC00004, 0x9700);
+        memory.write_u16(0xC00004, 0x4000);
+        memory.write_u16(0xC00004, 0x0080);
+
+        // Mid-transfer: source and length registers are not finalized yet.
+        memory.step_vdp(2);
+        assert_eq!(memory.vdp().register(21), 0x00);
+        assert_eq!(memory.vdp().register(22), 0x01);
+        assert_eq!(memory.vdp().register(19), 0x02);
+        assert_eq!(memory.vdp().register(20), 0x00);
+
+        // Completion finalizes source advance and clears DMA length.
+        memory.step_vdp(2);
+        assert_eq!(memory.vdp().register(21), 0x02);
+        assert_eq!(memory.vdp().register(22), 0x01);
+        assert_eq!(memory.vdp().register(19), 0x00);
+        assert_eq!(memory.vdp().register(20), 0x00);
     }
 
     #[test]
@@ -633,15 +1009,35 @@ mod tests {
 
         memory.write_u16(0xC00004, 0x4000);
         memory.write_u16(0xC00004, 0x0080);
+        let dma_cycles = memory.take_dma_wait_cycles();
+        assert_eq!(dma_cycles, 4);
+        memory.step_vdp(dma_cycles);
+        assert_eq!(memory.take_dma_wait_cycles(), 0);
 
         // Second transfer: 1 word, source should continue from 0x204.
         memory.write_u16(0xC00004, 0x9301);
         memory.write_u16(0xC00004, 0x9400);
         memory.write_u16(0xC00004, 0x4200); // destination 0x0200
         memory.write_u16(0xC00004, 0x0080);
+        let dma_cycles = memory.take_dma_wait_cycles();
+        assert_eq!(dma_cycles, 2);
+        memory.step_vdp(dma_cycles);
+        assert_eq!(memory.take_dma_wait_cycles(), 0);
 
         assert_eq!(memory.vdp().read_vram_u8(0x0200), 0x55);
         assert_eq!(memory.vdp().read_vram_u8(0x0201), 0x66);
+        let trace = memory.dma_trace();
+        let second = trace.last().expect("second dma trace");
+        let first = trace.iter().rev().nth(1).expect("first dma trace");
+        assert_eq!(first.source_addr, 0x00000200);
+        assert_eq!(first.dest_addr, 0x0000);
+        assert_eq!(first.words, 2);
+        assert_eq!(second.source_addr, 0x00000204);
+        assert_eq!(second.dest_addr, 0x0200);
+        assert_eq!(second.auto_increment, 2);
+        assert_eq!(second.words, 1);
+        assert_eq!(second.first_word, 0x5566);
+        assert_eq!(second.last_word, 0x5566);
     }
 
     #[test]
@@ -662,6 +1058,10 @@ mod tests {
 
         memory.write_u16(0xC00004, 0x4000);
         memory.write_u16(0xC00004, 0x0080);
+        let dma_cycles = memory.take_dma_wait_cycles();
+        assert_eq!(dma_cycles, 2);
+        memory.step_vdp(dma_cycles);
+        assert_eq!(memory.take_dma_wait_cycles(), 0);
 
         assert_eq!(memory.vdp().read_vram_u8(0x0000), 0x12);
         assert_eq!(memory.vdp().read_vram_u8(0x0001), 0x34);
@@ -690,9 +1090,22 @@ mod tests {
         // CRAM write DMA command @ index 0.
         memory.write_u16(0xC00004, 0xC000);
         memory.write_u16(0xC00004, 0x0080);
+        let dma_cycles = memory.take_dma_wait_cycles();
+        assert_eq!(dma_cycles, 4);
+        memory.step_vdp(dma_cycles);
+        assert_eq!(memory.take_dma_wait_cycles(), 0);
 
         assert_eq!(memory.vdp().read_cram_u16(0), 0x0E0E);
         assert_eq!(memory.vdp().read_cram_u16(1), 0x0222);
+        let trace = memory.dma_trace();
+        let last = trace.last().expect("dma trace entry");
+        assert_eq!(last.target, DmaTraceTarget::Cram);
+        assert_eq!(last.source_addr, 0x00000200);
+        assert_eq!(last.dest_addr, 0x0000);
+        assert_eq!(last.auto_increment, 2);
+        assert_eq!(last.words, 2);
+        assert_eq!(last.first_word, 0x0E0E);
+        assert_eq!(last.last_word, 0x0222);
     }
 
     #[test]
@@ -702,8 +1115,9 @@ mod tests {
 
         // reg1: display + v-blank interrupt enable
         memory.write_u16(0xC00004, 0x8160);
-        let frame_ready = memory.step_vdp(130_000);
-        assert!(frame_ready);
+        // Advance into vblank interval (before frame wrap).
+        let frame_ready = memory.step_vdp(110_000);
+        assert!(!frame_ready);
 
         // First control-port byte write should not perform a hidden status read.
         memory.write_u8(0xC00004, 0x12);
