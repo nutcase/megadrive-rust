@@ -299,6 +299,14 @@ impl MemoryMap {
         self.vdp.frame_count()
     }
 
+    pub fn work_ram(&self) -> &[u8] {
+        &self.work_ram
+    }
+
+    pub fn work_ram_mut(&mut self) -> &mut [u8] {
+        &mut self.work_ram
+    }
+
     pub fn dma_trace(&self) -> Vec<DmaTraceEntry> {
         self.dma_trace.iter().copied().collect()
     }

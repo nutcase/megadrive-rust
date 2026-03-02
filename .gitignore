@@ -3,3 +3,5 @@ roms
 *.jpg
 *.ppm
 *.png
+/states
+/cheats

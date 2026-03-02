@@ -4,7 +4,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <path-to-rom.bin> [--boot-frames N]"
+  echo "Usage: $0 [--no-egui] <path-to-rom.bin> [--boot-frames N]"
+  exit 1
+fi
+
+BIN_NAME="megadrive-egui"
+if [[ "${1:-}" == "--no-egui" ]]; then
+  BIN_NAME="megadrive-cli"
+  shift
+fi
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 [--no-egui] <path-to-rom.bin> [--boot-frames N]"
   exit 1
 fi
 
@@ -22,4 +33,4 @@ fi
 : "${MEGADRIVE_BOOT_FRAMES:=0}"
 export MEGADRIVE_BOOT_FRAMES
 
-exec cargo run --release --manifest-path "$SCRIPT_DIR/Cargo.toml" -p megadrive-cli --bin megadrive-cli -- "$ROM_PATH" "$@"
+exec cargo run --release --manifest-path "$SCRIPT_DIR/Cargo.toml" -p megadrive-cli --bin "$BIN_NAME" -- "$ROM_PATH" "$@"

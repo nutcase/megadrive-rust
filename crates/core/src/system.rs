@@ -57,6 +57,14 @@ impl Emulator {
         FRAME_HEIGHT
     }
 
+    pub fn work_ram(&self) -> &[u8] {
+        self.memory.work_ram()
+    }
+
+    pub fn work_ram_mut(&mut self) -> &mut [u8] {
+        self.memory.work_ram_mut()
+    }
+
     pub fn set_button_pressed(&mut self, button: Button, pressed: bool) {
         self.memory.set_button_pressed(button, pressed);
     }
@@ -128,5 +136,15 @@ mod tests {
         assert!(emulator.pending_audio_samples() > 0);
         let drained = emulator.drain_audio_samples(64);
         assert!(!drained.is_empty());
+    }
+
+    #[test]
+    fn exposes_work_ram_access() {
+        let cart = Cartridge::from_bytes(vec![0; 0x200]).expect("valid rom");
+        let mut emulator = Emulator::new(cart);
+
+        assert_eq!(emulator.work_ram().len(), 0x10000);
+        emulator.work_ram_mut()[0x1234] = 0xAB;
+        assert_eq!(emulator.work_ram()[0x1234], 0xAB);
     }
 }

@@ -39,10 +39,12 @@ cargo run -p megadrive-cli -- path/to/rom.bin
 ```bash
 ./run.sh path/to/rom.bin
 ./run.sh path/to/rom.bin --boot-frames 600
+./run.sh --no-egui path/to/rom.bin
 ```
 
 起動前の高速スキップは `--boot-frames` を優先し、未指定時は環境変数 `MEGADRIVE_BOOT_FRAMES` を参照します。  
 コントローラ種別は `MEGADRIVE_PAD1` / `MEGADRIVE_PAD2` (`3` または `6`) で切り替えできます（既定は `3`）。
+`run.sh` はデフォルトで `Tab` で表示できるチートパネル付き（Hex Viewer + Cheat Search）の OpenGL/egui フロントエンドを起動します。チートは `cheats/<ROM名>.json` に保存できます。従来の SDL フロントエンドで起動したい場合は `--no-egui` を指定してください。
 
 ## 次に実装する候補
 

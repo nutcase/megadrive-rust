@@ -6,6 +6,10 @@ edition = "2024"
 [dependencies]
 megadrive-core = { path = "../core" }
 sdl2 = { version = "0.38", features = ["bundled"] }
+egui = "0.33"
+egui_sdl2_gl = "0.33.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [[bin]]
 name = "megadrive-cli"
@@ -16,4 +20,9 @@ bench = false
 name = "opcode_profile"
 path = "src/bin/opcode_profile.rs"
 test = false
+bench = false
+
+[[bin]]
+name = "megadrive-egui"
+path = "src/bin/megadrive_egui.rs"
 bench = false
