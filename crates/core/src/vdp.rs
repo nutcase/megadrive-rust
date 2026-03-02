@@ -184,7 +184,6 @@ impl Vdp {
             quirk_live_hscroll: false,
             quirk_plane_a_64x32_paged: false,
         };
-        vdp.seed_demo_scene();
         vdp.reset_line_state();
         vdp.capture_line_state(0);
         vdp.render_frame();
@@ -288,6 +287,14 @@ impl Vdp {
             self.line_hscroll[line]
         } else {
             [0; 2]
+        }
+    }
+
+    pub fn line_vram_u8(&self, line: usize, addr: u16) -> u8 {
+        if line < FRAME_HEIGHT {
+            self.line_vram[line][addr as usize % VRAM_SIZE]
+        } else {
+            0
         }
     }
 
@@ -768,64 +775,14 @@ impl Vdp {
         }
 
         self.set_dma_source_addr(src);
+        if self.frame_cycles == 0 {
+            self.reset_line_state();
+            self.capture_line_state(0);
+        }
         self.clear_dma_length();
     }
 
-    fn seed_demo_scene(&mut self) {
-        self.seed_palette();
-        self.seed_tile_data();
-        self.seed_name_table();
-    }
-
-    fn seed_palette(&mut self) {
-        for palette in 0..4u16 {
-            for color in 0..16u16 {
-                let idx = (palette * 16 + color) as usize;
-                let ramp = color & 0x7;
-                let (r, g, b) = match palette {
-                    0 => (ramp, 0, 0),
-                    1 => (0, ramp, 0),
-                    2 => (0, 0, ramp),
-                    _ => (ramp, ramp / 2, ramp),
-                };
-                self.cram[idx] = encode_md_color(r as u8, g as u8, b as u8);
-            }
-        }
-    }
-
-    fn seed_tile_data(&mut self) {
-        const TILE_COUNT: usize = 64;
-        // Keep tile 0 transparent so zero-filled name table entries render as background color.
-        for tile_index in 1..TILE_COUNT {
-            let tile_base = tile_index * TILE_SIZE_BYTES;
-            for y in 0..8 {
-                for x_pair in 0..4 {
-                    let x0 = x_pair * 2;
-                    let color_a = ((tile_index + y + x0) % 15 + 1) as u8;
-                    let color_b = ((tile_index + y + x0 + 1) % 15 + 1) as u8;
-                    let packed = (color_a << 4) | color_b;
-                    self.vram[tile_base + y * 4 + x_pair] = packed;
-                }
-            }
-        }
-    }
-
-    fn seed_name_table(&mut self) {
-        const TILE_COUNT: usize = 64;
-        let base = self.nametable_base();
-        let (plane_width_tiles, plane_height_tiles) = self.plane_tile_dimensions();
-        for tile_y in 0..plane_height_tiles {
-            for tile_x in 0..plane_width_tiles {
-                let tile_number = ((tile_y * plane_width_tiles + tile_x) % TILE_COUNT) as u16;
-                let palette_line = ((tile_y / 7) % 4) as u16;
-                let entry = tile_number | (palette_line << 13);
-                let name_addr = base + (tile_y * plane_width_tiles + tile_x) * 2;
-                self.vram[name_addr % VRAM_SIZE] = (entry >> 8) as u8;
-                self.vram[(name_addr + 1) % VRAM_SIZE] = entry as u8;
-            }
-        }
-    }
-
+    #[cfg(test)]
     fn nametable_base(&self) -> usize {
         Self::nametable_base_from_regs(&self.registers)
     }
@@ -834,10 +791,6 @@ impl Vdp {
         // In H40 mode the SAT base is 1KB aligned (bit0 ignored).
         let mask = if self.h40_mode() { 0x7E } else { 0x7F };
         ((self.registers[REG_SPRITE_TABLE] as usize & mask) << 9) % VRAM_SIZE
-    }
-
-    fn plane_tile_dimensions(&self) -> (usize, usize) {
-        Self::plane_tile_dimensions_from_regs(&self.registers)
     }
 
     fn nametable_base_from_regs(regs: &[u8; REG_COUNT]) -> usize {
@@ -1815,6 +1768,7 @@ fn read_u16_be_wrapped(vram: &[u8; VRAM_SIZE], addr: usize) -> u16 {
     u16::from_be_bytes([hi, lo])
 }
 
+#[cfg(test)]
 fn encode_md_color(r: u8, g: u8, b: u8) -> u16 {
     let r = (r & 0x7) as u16;
     let g = (g & 0x7) as u16;

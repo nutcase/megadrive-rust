@@ -1,13 +1,34 @@
 use std::f32::consts::TAU;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YmEnvelopePhase {
+    Off,
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct YmChannel {
     fnum: u16,
     block: u8,
     key_on: bool,
     phase: f32,
+    algorithm: u8,
+    feedback: u8,
+    feedback_sample: f32,
     pan_left: bool,
     pan_right: bool,
+    carrier_mul: u8,
+    carrier_tl: u8,
+    attack_rate: u8,
+    decay_rate: u8,
+    sustain_rate: u8,
+    sustain_level: u8,
+    release_rate: u8,
+    envelope_phase: YmEnvelopePhase,
+    envelope_level: f32,
 }
 
 impl Default for YmChannel {
@@ -17,8 +38,22 @@ impl Default for YmChannel {
             block: 4,
             key_on: false,
             phase: 0.0,
+            algorithm: 0,
+            feedback: 0,
+            feedback_sample: 0.0,
             pan_left: true,
             pan_right: true,
+            carrier_mul: 1,
+            carrier_tl: 0,
+            attack_rate: 31,
+            decay_rate: 0,
+            sustain_rate: 0,
+            sustain_level: 0,
+            // Keep default release short to avoid lingering notes when a game
+            // hasn't initialized operator envelopes yet.
+            release_rate: 15,
+            envelope_phase: YmEnvelopePhase::Off,
+            envelope_level: 0.0,
         }
     }
 }
@@ -106,6 +141,22 @@ impl Ym2612 {
         } else if let Some(channel) = self.decode_pan_channel(bank, reg) {
             self.channels[channel].pan_left = (value & 0x80) != 0;
             self.channels[channel].pan_right = (value & 0x40) != 0;
+        } else if let Some(channel) = self.decode_algorithm_channel(bank, reg) {
+            self.channels[channel].algorithm = value & 0x07;
+            self.channels[channel].feedback = (value >> 3) & 0x07;
+        } else if let Some(channel) = self.decode_carrier_mul_channel(bank, reg) {
+            self.channels[channel].carrier_mul = value & 0x0F;
+        } else if let Some(channel) = self.decode_carrier_tl_channel(bank, reg) {
+            self.channels[channel].carrier_tl = value & 0x7F;
+        } else if let Some(channel) = self.decode_carrier_attack_channel(bank, reg) {
+            self.channels[channel].attack_rate = value & 0x1F;
+        } else if let Some(channel) = self.decode_carrier_decay_channel(bank, reg) {
+            self.channels[channel].decay_rate = value & 0x1F;
+        } else if let Some(channel) = self.decode_carrier_sustain_rate_channel(bank, reg) {
+            self.channels[channel].sustain_rate = value & 0x1F;
+        } else if let Some(channel) = self.decode_carrier_sustain_release_channel(bank, reg) {
+            self.channels[channel].sustain_level = (value >> 4) & 0x0F;
+            self.channels[channel].release_rate = value & 0x0F;
         }
 
         if bank == 0 {
@@ -140,6 +191,16 @@ impl Ym2612 {
                         let next_key_on = (value & 0xF0) != 0;
                         if next_key_on && !self.channels[channel].key_on {
                             self.channels[channel].phase = 0.0;
+                            self.channels[channel].feedback_sample = 0.0;
+                            self.channels[channel].envelope_phase = YmEnvelopePhase::Attack;
+                            self.channels[channel].envelope_level = 0.0;
+                        } else if !next_key_on && self.channels[channel].key_on {
+                            self.channels[channel].envelope_phase =
+                                if self.channels[channel].envelope_level > 0.0 {
+                                    YmEnvelopePhase::Release
+                                } else {
+                                    YmEnvelopePhase::Off
+                                };
                         }
                         self.channels[channel].key_on = next_key_on;
                     }
@@ -193,11 +254,162 @@ impl Ym2612 {
         }
     }
 
+    fn decode_algorithm_channel(&self, bank: usize, reg: u8) -> Option<usize> {
+        if (0xB0..=0xB2).contains(&reg) {
+            Some((bank & 1) * 3 + (reg as usize - 0xB0))
+        } else {
+            None
+        }
+    }
+
+    fn decode_carrier_mul_channel(&self, bank: usize, reg: u8) -> Option<usize> {
+        if (0x3C..=0x3E).contains(&reg) {
+            Some((bank & 1) * 3 + (reg as usize - 0x3C))
+        } else {
+            None
+        }
+    }
+
+    fn decode_carrier_tl_channel(&self, bank: usize, reg: u8) -> Option<usize> {
+        if (0x4C..=0x4E).contains(&reg) {
+            Some((bank & 1) * 3 + (reg as usize - 0x4C))
+        } else {
+            None
+        }
+    }
+
+    fn decode_carrier_attack_channel(&self, bank: usize, reg: u8) -> Option<usize> {
+        if (0x5C..=0x5E).contains(&reg) {
+            Some((bank & 1) * 3 + (reg as usize - 0x5C))
+        } else {
+            None
+        }
+    }
+
+    fn decode_carrier_decay_channel(&self, bank: usize, reg: u8) -> Option<usize> {
+        if (0x6C..=0x6E).contains(&reg) {
+            Some((bank & 1) * 3 + (reg as usize - 0x6C))
+        } else {
+            None
+        }
+    }
+
+    fn decode_carrier_sustain_rate_channel(&self, bank: usize, reg: u8) -> Option<usize> {
+        if (0x7C..=0x7E).contains(&reg) {
+            Some((bank & 1) * 3 + (reg as usize - 0x7C))
+        } else {
+            None
+        }
+    }
+
+    fn decode_carrier_sustain_release_channel(&self, bank: usize, reg: u8) -> Option<usize> {
+        if (0x8C..=0x8E).contains(&reg) {
+            Some((bank & 1) * 3 + (reg as usize - 0x8C))
+        } else {
+            None
+        }
+    }
+
     fn channel_frequency_hz(channel: &YmChannel) -> f32 {
         let fnum_scale = (channel.fnum.max(1) as f32) / 1024.0;
         let octave_scale = 2f32.powi(channel.block as i32 - 4);
-        let freq = 220.0 * fnum_scale * octave_scale;
+        let multiple = (channel.carrier_mul.max(1)) as f32;
+        let freq = 220.0 * fnum_scale * octave_scale * multiple;
         freq.clamp(20.0, 12_000.0)
+    }
+
+    fn channel_level_scale(channel: &YmChannel) -> f32 {
+        if channel.carrier_tl >= 0x7F {
+            return 0.0;
+        }
+        let attenuation_db = channel.carrier_tl as f32 * 0.75;
+        10f32.powf(-attenuation_db / 20.0)
+    }
+
+    fn channel_algorithm_gain(channel: &YmChannel) -> f32 {
+        // Approximate YM2612 algorithm output scaling by carrier count.
+        // This keeps relative loudness closer across algorithms in this
+        // simplified one-operator-per-channel model.
+        const GAIN_BY_ALG: [f32; 8] = [0.35, 0.35, 0.35, 0.35, 0.55, 0.75, 0.75, 1.0];
+        GAIN_BY_ALG[(channel.algorithm & 0x07) as usize]
+    }
+
+    fn rate_to_step(rate: u8, sample_rate_hz: f32, min_seconds: f32, max_seconds: f32) -> f32 {
+        if rate == 0 || sample_rate_hz <= 0.0 {
+            return 0.0;
+        }
+        let ratio = rate.min(31) as f32 / 31.0;
+        let seconds = max_seconds * (min_seconds / max_seconds).powf(ratio);
+        (1.0 / (seconds * sample_rate_hz)).clamp(0.0, 1.0)
+    }
+
+    fn sustain_level_to_amplitude(level: u8) -> f32 {
+        if level >= 0x0F {
+            0.0
+        } else {
+            1.0 - (level as f32 / 15.0)
+        }
+    }
+
+    fn release_rate_to_step(rate: u8, sample_rate_hz: f32) -> f32 {
+        if sample_rate_hz <= 0.0 {
+            return 0.0;
+        }
+        let ratio = rate.min(15) as f32 / 15.0;
+        let seconds = 0.8_f32 * (0.004_f32 / 0.8_f32).powf(ratio);
+        (1.0 / (seconds * sample_rate_hz)).clamp(0.0, 1.0)
+    }
+
+    fn advance_envelope(channel: &mut YmChannel, sample_rate_hz: f32) -> f32 {
+        match channel.envelope_phase {
+            YmEnvelopePhase::Off => {
+                channel.envelope_level = 0.0;
+            }
+            YmEnvelopePhase::Attack => {
+                let step = Self::rate_to_step(channel.attack_rate, sample_rate_hz, 0.002, 0.8);
+                if step <= 0.0 {
+                    channel.envelope_level = 1.0;
+                    channel.envelope_phase = YmEnvelopePhase::Decay;
+                } else {
+                    channel.envelope_level = (channel.envelope_level + step).min(1.0);
+                    if channel.envelope_level >= 1.0 {
+                        channel.envelope_phase = YmEnvelopePhase::Decay;
+                    }
+                }
+            }
+            YmEnvelopePhase::Decay => {
+                let sustain_target = Self::sustain_level_to_amplitude(channel.sustain_level);
+                let step = Self::rate_to_step(channel.decay_rate, sample_rate_hz, 0.01, 3.0);
+                if step <= 0.0 || channel.envelope_level <= sustain_target {
+                    channel.envelope_level = sustain_target;
+                    channel.envelope_phase = YmEnvelopePhase::Sustain;
+                } else {
+                    channel.envelope_level = (channel.envelope_level - step).max(sustain_target);
+                    if channel.envelope_level <= sustain_target {
+                        channel.envelope_phase = YmEnvelopePhase::Sustain;
+                    }
+                }
+            }
+            YmEnvelopePhase::Sustain => {
+                let step = Self::rate_to_step(channel.sustain_rate, sample_rate_hz, 0.03, 5.0);
+                if step > 0.0 {
+                    channel.envelope_level = (channel.envelope_level - step).max(0.0);
+                }
+            }
+            YmEnvelopePhase::Release => {
+                let step = Self::release_rate_to_step(channel.release_rate, sample_rate_hz);
+                if step <= 0.0 {
+                    channel.envelope_level = 0.0;
+                    channel.envelope_phase = YmEnvelopePhase::Off;
+                } else {
+                    channel.envelope_level = (channel.envelope_level - step).max(0.0);
+                    if channel.envelope_level <= 0.0 {
+                        channel.envelope_phase = YmEnvelopePhase::Off;
+                    }
+                }
+            }
+        }
+        channel.envelope_level
     }
 
     pub fn writes(&self) -> u64 {
@@ -214,7 +426,8 @@ impl Ym2612 {
             .enumerate()
             .filter(|(index, channel)| {
                 let dac_channel = *index == 5;
-                channel.key_on && !(dac_channel && self.dac_enabled)
+                (channel.key_on || channel.envelope_phase != YmEnvelopePhase::Off)
+                    && !(dac_channel && self.dac_enabled)
             })
             .count()
     }
@@ -225,7 +438,7 @@ impl Ym2612 {
         let mut left_active = 0usize;
         let mut right_active = 0usize;
         for (index, channel) in self.channels.iter_mut().enumerate() {
-            if !channel.key_on {
+            if !channel.key_on && channel.envelope_phase == YmEnvelopePhase::Off {
                 continue;
             }
             if index == 5 && self.dac_enabled {
@@ -236,7 +449,14 @@ impl Ym2612 {
             if channel.phase >= 1.0 {
                 channel.phase -= channel.phase.floor();
             }
-            let sample = (channel.phase * TAU).sin();
+            let feedback_amount = (channel.feedback as f32 / 7.0) * 0.2;
+            let modulated_phase = channel.phase + channel.feedback_sample * feedback_amount;
+            let envelope = Self::advance_envelope(channel, sample_rate_hz);
+            let sample = (modulated_phase * TAU).sin()
+                * Self::channel_level_scale(channel)
+                * envelope
+                * Self::channel_algorithm_gain(channel);
+            channel.feedback_sample = sample;
             if channel.pan_left {
                 left_mix += sample;
                 left_active += 1;
@@ -343,6 +563,34 @@ impl Ym2612 {
         Self::channel_frequency_hz(&self.channels[channel.min(5)])
     }
 
+    pub fn channel_carrier_mul(&self, channel: usize) -> u8 {
+        self.channels[channel.min(5)].carrier_mul
+    }
+
+    pub fn channel_carrier_tl(&self, channel: usize) -> u8 {
+        self.channels[channel.min(5)].carrier_tl
+    }
+
+    pub fn channel_algorithm_feedback(&self, channel: usize) -> (u8, u8) {
+        let channel = self.channels[channel.min(5)];
+        (channel.algorithm, channel.feedback)
+    }
+
+    pub fn channel_envelope_level(&self, channel: usize) -> f32 {
+        self.channels[channel.min(5)].envelope_level
+    }
+
+    pub fn channel_envelope_params(&self, channel: usize) -> (u8, u8, u8, u8, u8) {
+        let channel = self.channels[channel.min(5)];
+        (
+            channel.attack_rate,
+            channel.decay_rate,
+            channel.sustain_rate,
+            channel.sustain_level,
+            channel.release_rate,
+        )
+    }
+
     pub fn channel_block_and_fnum(&self, channel: usize) -> (u8, u16) {
         let channel = self.channels[channel.min(5)];
         (channel.block, channel.fnum)
@@ -399,7 +647,7 @@ impl Psg {
         if !self.latched_is_volume && self.latched_channel < 3 {
             let lo = self.tone_period[self.latched_channel] & 0x000F;
             let hi = ((value & 0x3F) as u16) << 4;
-            self.tone_period[self.latched_channel] = (lo | hi).max(1);
+            self.tone_period[self.latched_channel] = lo | hi;
         }
     }
 
@@ -423,6 +671,10 @@ impl Psg {
         self.noise_control
     }
 
+    pub fn tone_frequency_hz_debug(&self, channel: usize) -> f32 {
+        self.tone_frequency_hz(channel)
+    }
+
     fn apply_latched_data(&mut self, data: u8) {
         if self.latched_is_volume {
             self.attenuation[self.latched_channel] = data & 0x0F;
@@ -431,15 +683,18 @@ impl Psg {
 
         if self.latched_channel < 3 {
             let hi = self.tone_period[self.latched_channel] & 0x03F0;
-            self.tone_period[self.latched_channel] = (hi | data as u16).max(1);
+            self.tone_period[self.latched_channel] = hi | data as u16;
         } else {
             self.noise_control = data & 0x07;
             self.noise_lfsr = 0x8000;
+            self.noise_phase_acc = 0.0;
         }
     }
 
     fn tone_frequency_hz(&self, channel: usize) -> f32 {
-        let period = self.tone_period[channel.min(2)].max(1) as f32;
+        let raw_period = self.tone_period[channel.min(2)] & 0x03FF;
+        // SN76489-compatible behavior: period 0 is treated as divider 1024.
+        let period = if raw_period == 0 { 1024 } else { raw_period } as f32;
         Self::PSG_CLOCK_HZ / (32.0 * period)
     }
 
@@ -474,18 +729,30 @@ impl Psg {
     }
 
     fn next_sample(&mut self, sample_rate_hz: f32) -> i16 {
+        let noise_uses_tone3 = (self.noise_control & 0x03) == 0x03;
+        let mut tone3_falling_edges = 0usize;
         for channel in 0..3 {
             self.tone_phase_acc[channel] += self.tone_frequency_hz(channel) / sample_rate_hz;
             while self.tone_phase_acc[channel] >= 1.0 {
                 self.tone_phase_acc[channel] -= 1.0;
+                let was_high = self.tone_phase_high[channel];
                 self.tone_phase_high[channel] = !self.tone_phase_high[channel];
+                if noise_uses_tone3 && channel == 2 && was_high && !self.tone_phase_high[channel] {
+                    tone3_falling_edges = tone3_falling_edges.saturating_add(1);
+                }
             }
         }
 
-        self.noise_phase_acc += self.noise_frequency_hz() / sample_rate_hz;
-        while self.noise_phase_acc >= 1.0 {
-            self.noise_phase_acc -= 1.0;
-            self.clock_noise_lfsr();
+        if noise_uses_tone3 {
+            for _ in 0..tone3_falling_edges {
+                self.clock_noise_lfsr();
+            }
+        } else {
+            self.noise_phase_acc += self.noise_frequency_hz() / sample_rate_hz;
+            while self.noise_phase_acc >= 1.0 {
+                self.noise_phase_acc -= 1.0;
+                self.clock_noise_lfsr();
+            }
         }
 
         let mut mix = 0.0f32;

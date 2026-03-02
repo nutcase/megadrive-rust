@@ -6,8 +6,11 @@ const CCR_V: u16 = 0x0002;
 const CCR_Z: u16 = 0x0004;
 const CCR_N: u16 = 0x0008;
 const CCR_X: u16 = 0x0010;
+const SR_TRACE: u16 = 0x8000;
 const SR_INT_MASK: u16 = 0x0700;
 const SR_SUPERVISOR: u16 = 0x2000;
+const SR_VALID_MASK_68000: u16 =
+    SR_TRACE | SR_SUPERVISOR | SR_INT_MASK | CCR_X | CCR_N | CCR_Z | CCR_V | CCR_C;
 
 #[derive(Debug, Clone)]
 pub struct M68k {
@@ -19,11 +22,16 @@ pub struct M68k {
     pc: u32,
     cycles: u64,
     stopped: bool,
+    hard_halted: bool,
     unknown_opcode_total: u64,
     unknown_opcode_histogram: BTreeMap<u16, u64>,
     unknown_opcode_pc_histogram: BTreeMap<u32, u64>,
     exception_histogram: BTreeMap<u32, u64>,
     pending_exception_cycles: Option<u32>,
+    pending_group0_frames: u32,
+    pending_trace_exception: bool,
+    exception_raised_this_step: bool,
+    current_opcode: u16,
 }
 
 impl Default for M68k {
@@ -37,11 +45,16 @@ impl Default for M68k {
             pc: 0,
             cycles: 0,
             stopped: false,
+            hard_halted: false,
             unknown_opcode_total: 0,
             unknown_opcode_histogram: BTreeMap::new(),
             unknown_opcode_pc_histogram: BTreeMap::new(),
             exception_histogram: BTreeMap::new(),
             pending_exception_cycles: None,
+            pending_group0_frames: 0,
+            pending_trace_exception: false,
+            exception_raised_this_step: false,
+            current_opcode: 0,
         }
     }
 }
@@ -62,14 +75,34 @@ impl M68k {
         self.pc = memory.read_u32(0x000004);
         self.cycles = 0;
         self.stopped = false;
+        self.hard_halted = false;
         self.unknown_opcode_total = 0;
         self.unknown_opcode_histogram.clear();
         self.unknown_opcode_pc_histogram.clear();
         self.exception_histogram.clear();
         self.pending_exception_cycles = None;
+        self.pending_group0_frames = 0;
+        self.pending_trace_exception = false;
+        self.exception_raised_this_step = false;
+        self.current_opcode = 0;
     }
 
     pub fn step(&mut self, memory: &mut MemoryMap) -> u32 {
+        if self.hard_halted {
+            let cycles = memory.take_dma_wait_cycles();
+            self.cycles += cycles as u64;
+            return cycles;
+        }
+
+        if self.pending_trace_exception {
+            self.pending_trace_exception = false;
+            self.exception_raised_this_step = false;
+            self.raise_exception(9, memory, None);
+            let cycles = 34u32.saturating_add(memory.take_dma_wait_cycles());
+            self.cycles += cycles as u64;
+            return cycles;
+        }
+
         if let Some(level) = memory.pending_interrupt_level() {
             if self.service_interrupt(level, memory) {
                 memory.acknowledge_interrupt(level);
@@ -85,6 +118,7 @@ impl M68k {
             return cycles;
         }
 
+        self.exception_raised_this_step = false;
         // MC68000 traps on odd-PC instruction fetches.
         if (self.pc & 1) != 0 {
             let cycles = self
@@ -95,6 +129,7 @@ impl M68k {
         }
 
         let opcode = self.fetch_u16(memory);
+        self.current_opcode = opcode;
         macro_rules! opt_cycles {
             ($expr:expr) => {{
                 match $expr {
@@ -144,9 +179,6 @@ impl M68k {
             _ if (opcode & 0xF000) == 0x5000 => opt_cycles!(self.exec_addq_subq(opcode, memory)),
             _ if (opcode & 0xF100) == 0x7000 => self.exec_moveq(opcode),
             _ if (opcode & 0xFFC0) == 0x44C0 => opt_cycles!(self.exec_move_to_ccr(opcode, memory)),
-            _ if (opcode & 0xFFC0) == 0x42C0 => {
-                opt_cycles!(self.exec_move_from_ccr(opcode, memory))
-            }
             _ if (opcode & 0xFF00) == 0x4200 => opt_cycles!(self.exec_clr(opcode, memory)),
             _ if (opcode & 0xFF00) == 0x4400 => opt_cycles!(self.exec_neg(opcode, memory)),
             _ if (opcode & 0xFF00) == 0x4600 => opt_cycles!(self.exec_not(opcode, memory)),
@@ -215,6 +247,14 @@ impl M68k {
             _ if (opcode & 0xF000) == 0xF000 => self.exec_line_f(memory),
             _ => self.exec_unknown_as_illegal(opcode, memory),
         };
+
+        if !self.exception_raised_this_step
+            && !self.stopped
+            && !self.hard_halted
+            && (self.sr & SR_TRACE) != 0
+        {
+            self.pending_trace_exception = true;
+        }
 
         let total_cycles = cycles.saturating_add(memory.take_dma_wait_cycles());
         self.cycles += total_cycles as u64;
@@ -526,8 +566,8 @@ impl M68k {
         if opmode > 0b010 {
             return None;
         }
-        // Logical source for <ea>,Dn cannot be An direct or immediate.
-        if mode == 0b001 || (mode == 0b111 && reg == 0b100) {
+        // Logical source for <ea>,Dn cannot be An direct.
+        if mode == 0b001 {
             return None;
         }
 
@@ -691,10 +731,6 @@ impl M68k {
 
         match opmode {
             0b000 => {
-                // Immediate source is not allowed for ADD/SUB to Dn.
-                if mode == 0b111 && reg == 0b100 {
-                    return None;
-                }
                 let src = self.read_ea_byte(mode, reg, memory)?;
                 let dst_val = self.d_regs[dst] as u8;
                 match op {
@@ -720,10 +756,6 @@ impl M68k {
                 Some(cycles)
             }
             0b001 => {
-                // Immediate source is not allowed for ADD/SUB to Dn.
-                if mode == 0b111 && reg == 0b100 {
-                    return None;
-                }
                 let src = self.read_ea_word(mode, reg, memory)?;
                 let dst_val = self.d_regs[dst] as u16;
                 match op {
@@ -749,10 +781,6 @@ impl M68k {
                 Some(cycles)
             }
             0b010 => {
-                // Immediate source is not allowed for ADD/SUB to Dn.
-                if mode == 0b111 && reg == 0b100 {
-                    return None;
-                }
                 let src = self.read_ea_long(mode, reg, memory)?;
                 let dst_val = self.d_regs[dst];
                 match op {
@@ -1162,12 +1190,17 @@ impl M68k {
             return None;
         }
 
-        let src = self.read_ea_word(mode, reg, memory)? as u32;
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
+        let src_word = self.read_ea_word(mode, reg, memory)?;
+        let src = src_word as u32;
         let dst_word = (self.d_regs[dst] & 0xFFFF) as u32;
         let result = dst_word.wrapping_mul(src);
         self.d_regs[dst] = result;
         self.update_test_flags_long(result);
-        Some(if mode == 0b000 { 38 } else { 42 })
+
+        // MC68000: MULU requires 38 + 2n clocks, n = number of ones in source.
+        let n = src_word.count_ones();
+        Some(38 + (2 * n) + ea_cycles)
     }
 
     fn exec_muls_w(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -1180,12 +1213,26 @@ impl M68k {
             return None;
         }
 
-        let src = self.read_ea_word(mode, reg, memory)? as i16 as i32;
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
+        let src_word = self.read_ea_word(mode, reg, memory)?;
+        let src = src_word as i16 as i32;
         let dst_word = (self.d_regs[dst] as u16) as i16 as i32;
         let result = dst_word.wrapping_mul(src) as u32;
         self.d_regs[dst] = result;
         self.update_test_flags_long(result);
-        Some(if mode == 0b000 { 54 } else { 58 })
+
+        // MC68000: MULS requires 38 + 2n clocks where n is the number of
+        // 01/10 patterns in (<ea> concatenated with zero as LSB).
+        let pattern = (src_word as u32) << 1;
+        let mut n = 0u32;
+        for bit in 0..16 {
+            let b0 = (pattern >> bit) & 1;
+            let b1 = (pattern >> (bit + 1)) & 1;
+            if b0 != b1 {
+                n += 1;
+            }
+        }
+        Some(38 + (2 * n) + ea_cycles)
     }
 
     fn exec_divu_w(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -1198,19 +1245,22 @@ impl M68k {
             return None;
         }
 
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
+        let divzero_cycles = 38 + ea_cycles;
         let divisor = self.read_ea_word(mode, reg, memory)? as u32;
         if divisor == 0 {
             self.raise_exception(5, memory, None);
-            return Some(38);
+            return Some(divzero_cycles);
         }
 
         let dividend = self.d_regs[dst];
+        let exec_cycles = Self::divu_word_exec_cycles(dividend, divisor as u16);
         let quotient = dividend / divisor;
         let remainder = dividend % divisor;
         if quotient > 0xFFFF {
             self.set_flag(CCR_V, true);
             self.set_flag(CCR_C, false);
-            return Some(if mode == 0b000 { 140 } else { 144 });
+            return Some(exec_cycles + ea_cycles);
         }
 
         self.d_regs[dst] = ((remainder & 0xFFFF) << 16) | (quotient & 0xFFFF);
@@ -1219,7 +1269,7 @@ impl M68k {
         self.set_flag(CCR_Z, q16 == 0);
         self.set_flag(CCR_V, false);
         self.set_flag(CCR_C, false);
-        Some(if mode == 0b000 { 140 } else { 144 })
+        Some(exec_cycles + ea_cycles)
     }
 
     fn exec_divs_w(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -1232,27 +1282,30 @@ impl M68k {
             return None;
         }
 
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
+        let divzero_cycles = 38 + ea_cycles;
         let divisor = self.read_ea_word(mode, reg, memory)? as i16 as i32;
         if divisor == 0 {
             self.raise_exception(5, memory, None);
-            return Some(38);
+            return Some(divzero_cycles);
         }
 
         let dividend = self.d_regs[dst] as i32;
+        let exec_cycles = Self::divs_word_exec_cycles(dividend, divisor as i16);
         let (quotient, remainder) =
             match (dividend.checked_div(divisor), dividend.checked_rem(divisor)) {
                 (Some(q), Some(r)) => (q, r),
                 _ => {
                     self.set_flag(CCR_V, true);
                     self.set_flag(CCR_C, false);
-                    return Some(if mode == 0b000 { 158 } else { 162 });
+                    return Some(exec_cycles + ea_cycles);
                 }
             };
 
         if !(-0x8000..=0x7FFF).contains(&quotient) {
             self.set_flag(CCR_V, true);
             self.set_flag(CCR_C, false);
-            return Some(if mode == 0b000 { 158 } else { 162 });
+            return Some(exec_cycles + ea_cycles);
         }
 
         let q16 = quotient as i16 as u16 as u32;
@@ -1262,7 +1315,7 @@ impl M68k {
         self.set_flag(CCR_Z, (q16 as u16) == 0);
         self.set_flag(CCR_V, false);
         self.set_flag(CCR_C, false);
-        Some(if mode == 0b000 { 158 } else { 162 })
+        Some(exec_cycles + ea_cycles)
     }
 
     fn exec_adda_l(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -1444,8 +1497,8 @@ impl M68k {
         let mode = ((opcode >> 3) & 0x7) as u8;
         let reg = (opcode & 0x7) as usize;
 
-        // Destination EA for CMPI cannot be immediate.
-        if mode == 0b111 && reg == 0b100 {
+        // Destination EA for CMPI is data alterable (Dn + alterable memory only).
+        if mode == 0b001 || (mode == 0b111 && reg >= 0b010) {
             return None;
         }
 
@@ -1487,8 +1540,8 @@ impl M68k {
 
         match opmode {
             0b000 => {
-                // Source for CMP <ea>,Dn cannot be An direct or immediate.
-                if mode == 0b001 || (mode == 0b111 && reg == 0b100) {
+                // Source for CMP.B <ea>,Dn cannot be An direct.
+                if mode == 0b001 {
                     return None;
                 }
                 let src = self.read_ea_byte(mode, reg, memory)?;
@@ -1505,10 +1558,6 @@ impl M68k {
                 Some(cycles)
             }
             0b001 => {
-                // Source for CMP.W <ea>,Dn cannot be immediate.
-                if mode == 0b111 && reg == 0b100 {
-                    return None;
-                }
                 let src = self.read_ea_word(mode, reg, memory)?;
                 let dst_val = self.d_regs[reg_x] as u16;
                 let result = dst_val.wrapping_sub(src);
@@ -1523,10 +1572,6 @@ impl M68k {
                 Some(cycles)
             }
             0b010 => {
-                // Source for CMP.L <ea>,Dn cannot be immediate.
-                if mode == 0b111 && reg == 0b100 {
-                    return None;
-                }
                 let src = self.read_ea_long(mode, reg, memory)?;
                 let dst_val = self.d_regs[reg_x];
                 let result = dst_val.wrapping_sub(src);
@@ -1705,8 +1750,9 @@ impl M68k {
         let mode = ((opcode >> 3) & 0x7) as u8;
         let reg = (opcode & 0x7) as usize;
 
-        // TST allows data alterable modes, so An direct and immediate are excluded.
-        if mode == 0b001 || (mode == 0b111 && reg == 0b100) {
+        // On 68000, TST supports Dn and memory data-alterable modes only.
+        // PC-relative and immediate forms are not available.
+        if mode == 0b001 || (mode == 0b111 && reg >= 0b010) {
             return None;
         }
 
@@ -2108,17 +2154,6 @@ impl M68k {
         } else {
             16
         })
-    }
-
-    fn exec_move_from_ccr(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
-        let mode = ((opcode >> 3) & 0x7) as u8;
-        let reg = (opcode & 0x7) as usize;
-        // Destination must be data alterable; An direct and immediate are invalid.
-        if mode == 0b001 || (mode == 0b111 && reg == 0b100) {
-            return None;
-        }
-        self.write_ea_word(mode, reg, self.sr & 0x001F, memory)?;
-        Some(if mode == 0b000 { 6 } else { 8 })
     }
 
     fn exec_neg(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -2535,34 +2570,35 @@ impl M68k {
 
             let addr = self.resolve_data_alterable_address(mode, reg, 2, memory)?;
             let value = memory.read_u16(addr);
-            let (result, carry_out) = match op {
+            let (result, carry_out, overflow) = match op {
                 // ASR.W <ea>
                 0b000 => {
                     let carry = (value & 0x0001) != 0;
                     let result = ((value as i16) >> 1) as u16;
                     self.set_flag(CCR_X, carry);
-                    (result, carry)
+                    (result, carry, false)
                 }
                 // ASL.W <ea>
                 0b001 => {
                     let carry = (value & 0x8000) != 0;
                     let result = value.wrapping_shl(1);
+                    let overflow = ((value ^ result) & 0x8000) != 0;
                     self.set_flag(CCR_X, carry);
-                    (result, carry)
+                    (result, carry, overflow)
                 }
                 // LSR.W <ea>
                 0b010 => {
                     let carry = (value & 0x0001) != 0;
                     let result = value >> 1;
                     self.set_flag(CCR_X, carry);
-                    (result, carry)
+                    (result, carry, false)
                 }
                 // LSL.W <ea>
                 0b011 => {
                     let carry = (value & 0x8000) != 0;
                     let result = value.wrapping_shl(1);
                     self.set_flag(CCR_X, carry);
-                    (result, carry)
+                    (result, carry, false)
                 }
                 // ROXR.W <ea>
                 0b100 => {
@@ -2570,7 +2606,7 @@ impl M68k {
                     let carry = (value & 0x0001) != 0;
                     let result = (value >> 1) | ((x_in as u16) << 15);
                     self.set_flag(CCR_X, carry);
-                    (result, carry)
+                    (result, carry, false)
                 }
                 // ROXL.W <ea>
                 0b101 => {
@@ -2578,19 +2614,19 @@ impl M68k {
                     let carry = (value & 0x8000) != 0;
                     let result = value.wrapping_shl(1) | (x_in as u16);
                     self.set_flag(CCR_X, carry);
-                    (result, carry)
+                    (result, carry, false)
                 }
                 // ROR.W <ea>
                 0b110 => {
                     let carry = (value & 0x0001) != 0;
                     let result = (value >> 1) | ((carry as u16) << 15);
-                    (result, carry)
+                    (result, carry, false)
                 }
                 // ROL.W <ea>
                 0b111 => {
                     let carry = (value & 0x8000) != 0;
                     let result = value.wrapping_shl(1) | (carry as u16);
-                    (result, carry)
+                    (result, carry, false)
                 }
                 _ => return None,
             };
@@ -2598,7 +2634,7 @@ impl M68k {
             memory.write_u16(addr, result);
             self.set_flag(CCR_N, (result & 0x8000) != 0);
             self.set_flag(CCR_Z, result == 0);
-            self.set_flag(CCR_V, false);
+            self.set_flag(CCR_V, overflow);
             self.set_flag(CCR_C, carry_out);
             return Some(8);
         }
@@ -2608,12 +2644,13 @@ impl M68k {
         let left = (opcode & 0x0100) != 0;
         let count_from_reg = (opcode & 0x0020) != 0;
         let count_field = ((opcode >> 9) & 0x7) as usize;
-        let mut count = if count_from_reg {
+        let shift_count = if count_from_reg {
             (self.d_regs[count_field] & 0x3F) as u32
         } else {
             let imm = count_field as u32;
             if imm == 0 { 8 } else { imm }
         };
+        let mut count = shift_count;
 
         let (width, mask, sign_bit) = match size {
             0b00 => (8u32, 0x0000_00FFu32, 0x0000_0080u32),
@@ -2623,6 +2660,8 @@ impl M68k {
         };
         let mut value = self.d_regs[dst] & mask;
         let mut carry_out = false;
+        let x_before = self.flag_set(CCR_X);
+        let mut as_left_overflow = false;
 
         if count > 0 {
             while count > 0 {
@@ -2630,8 +2669,10 @@ impl M68k {
                     // ASx
                     0b00 => {
                         if left {
+                            let old = value;
                             carry_out = (value & sign_bit) != 0;
                             value = (value << 1) & mask;
+                            as_left_overflow |= ((old ^ value) & sign_bit) != 0;
                         } else {
                             carry_out = (value & 0x1) != 0;
                             let fill = value & sign_bit;
@@ -2684,18 +2725,27 @@ impl M68k {
         self.set_shift_rotate_result(dst, size, value);
         self.set_flag(CCR_N, (value & sign_bit) != 0);
         self.set_flag(CCR_Z, value == 0);
-        self.set_flag(CCR_V, false);
-        self.set_flag(CCR_C, carry_out);
-        if op != 0b11 {
-            self.set_flag(CCR_X, carry_out);
-        }
+        self.set_flag(
+            CCR_V,
+            if op == 0b00 && left {
+                as_left_overflow
+            } else {
+                false
+            },
+        );
 
-        let shift_count = if count_from_reg {
-            (self.d_regs[count_field] & 0x3F) as u32
+        if shift_count == 0 {
+            // 68000 register shift/rotate semantics for count=0:
+            // ASx/LSx/ROx: C cleared, X unaffected.
+            // ROXx: C reflects previous X, X unaffected.
+            let c = if op == 0b10 { x_before } else { false };
+            self.set_flag(CCR_C, c);
         } else {
-            let imm = count_field as u32;
-            if imm == 0 { 8 } else { imm }
-        };
+            self.set_flag(CCR_C, carry_out);
+            if op != 0b11 {
+                self.set_flag(CCR_X, carry_out);
+            }
+        }
         Some(6 + shift_count * 2)
     }
 
@@ -2902,6 +2952,17 @@ impl M68k {
             return 34;
         }
 
+        if self.pending_group0_frames > 0 {
+            let _access_info = self.pop_u16(memory);
+            let _fault_addr = self.pop_u32(memory);
+            let _instruction_word = self.pop_u16(memory);
+            let restored_sr = self.pop_u16(memory);
+            self.pc = self.pop_u32(memory);
+            self.write_sr(restored_sr);
+            self.pending_group0_frames = self.pending_group0_frames.saturating_sub(1);
+            return 20;
+        }
+
         let restored_sr = self.pop_u16(memory);
         self.pc = self.pop_u32(memory);
         self.write_sr(restored_sr);
@@ -3015,9 +3076,12 @@ impl M68k {
     }
 
     fn exec_address_error(&mut self, memory: &mut MemoryMap) -> u32 {
-        // Accuracy note: real 68000 uses a distinct stack frame format for
-        // address errors; this currently vectors via the generic exception frame.
-        self.raise_address_error(memory);
+        self.raise_address_error(
+            memory,
+            self.pc,
+            AddressErrorAccess::InstructionRead,
+            self.current_opcode,
+        );
         self.pending_exception_cycles.take().unwrap_or(50)
     }
 
@@ -3051,6 +3115,7 @@ impl M68k {
         memory: &mut MemoryMap,
         interrupt_level: Option<u8>,
     ) {
+        self.exception_raised_this_step = true;
         *self.exception_histogram.entry(vector).or_insert(0) += 1;
         self.stopped = false;
         let old_sr = self.sr;
@@ -3065,7 +3130,8 @@ impl M68k {
         self.push_u16(memory, old_sr);
         self.ssp = self.a_regs[7];
 
-        self.sr = old_sr | SR_SUPERVISOR;
+        // Exceptions force supervisor mode and clear trace on 68000.
+        self.sr = (old_sr | SR_SUPERVISOR) & !SR_TRACE;
         if let Some(level) = interrupt_level {
             self.sr = (self.sr & !SR_INT_MASK) | ((level as u16) << 8);
         }
@@ -3374,6 +3440,93 @@ impl M68k {
         }
     }
 
+    fn word_ea_calculation_cycles(&self, mode: u8, reg: usize) -> Option<u32> {
+        // MC68000 Table 8-1: effective address calculation times (byte/word column).
+        let cycles = match mode {
+            0b000 => 0,  // Dn
+            0b001 => 0,  // An
+            0b010 => 4,  // (An)
+            0b011 => 4,  // (An)+
+            0b100 => 6,  // -(An)
+            0b101 => 8,  // (d16,An)
+            0b110 => 10, // (d8,An,Xn)
+            0b111 => match reg {
+                0b000 => 8,  // (xxx).W
+                0b001 => 12, // (xxx).L
+                0b010 => 8,  // (d16,PC)
+                0b011 => 10, // (d8,PC,Xn)
+                0b100 => 4,  // #<data>
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(cycles)
+    }
+
+    fn divu_word_exec_cycles(dividend: u32, divisor: u16) -> u32 {
+        let divisor_u32 = divisor as u32;
+
+        // Overflow is detected before the restoring division loop.
+        if (dividend >> 16) >= divisor_u32 {
+            return 10;
+        }
+
+        // MC68000 unsigned restoring divide timing model.
+        let mut mcycles = 38u32;
+        let hdivisor = divisor_u32 << 16;
+        let mut rem = dividend;
+        for _ in 0..15 {
+            let old_rem = rem;
+            rem <<= 1;
+            if (old_rem & 0x8000_0000) != 0 {
+                rem = rem.wrapping_sub(hdivisor);
+            } else {
+                mcycles += 2;
+                if rem >= hdivisor {
+                    rem = rem.wrapping_sub(hdivisor);
+                    mcycles -= 1;
+                }
+            }
+        }
+        mcycles * 2
+    }
+
+    fn divs_word_exec_cycles(dividend: i32, divisor: i16) -> u32 {
+        // MC68000 signed divide timing model.
+        let mut mcycles = 6u32;
+        if dividend < 0 {
+            mcycles += 1;
+        }
+
+        let dividend_abs = dividend.unsigned_abs();
+        let divisor_abs = (divisor as i32).unsigned_abs();
+
+        // Detect absolute overflow early.
+        if (dividend_abs >> 16) >= divisor_abs {
+            return (mcycles + 2) * 2;
+        }
+
+        let mut abs_quotient = (dividend_abs / divisor_abs) as u16;
+        mcycles += 55;
+
+        if divisor >= 0 {
+            if dividend >= 0 {
+                mcycles -= 1;
+            } else {
+                mcycles += 1;
+            }
+        }
+
+        for _ in 0..15 {
+            if (abs_quotient & 0x8000) == 0 {
+                mcycles += 1;
+            }
+            abs_quotient <<= 1;
+        }
+
+        mcycles * 2
+    }
+
     fn write_ea_word(
         &mut self,
         mode: u8,
@@ -3387,46 +3540,46 @@ impl M68k {
                 Some(())
             }
             0b010 => {
-                let addr = self.ensure_aligned_for_size(self.a_regs[reg], 2, memory)?;
+                let addr = self.ensure_aligned_for_size_write(self.a_regs[reg], 2, memory)?;
                 memory.write_u16(addr, value);
                 Some(())
             }
             0b011 => {
                 let addr = self.a_regs[reg];
-                self.ensure_aligned_for_size(addr, 2, memory)?;
+                self.ensure_aligned_for_size_write(addr, 2, memory)?;
                 memory.write_u16(addr, value);
                 self.a_regs[reg] = self.a_regs[reg].wrapping_add(2);
                 Some(())
             }
             0b100 => {
                 self.a_regs[reg] = self.a_regs[reg].wrapping_sub(2);
-                let addr = self.ensure_aligned_for_size(self.a_regs[reg], 2, memory)?;
+                let addr = self.ensure_aligned_for_size_write(self.a_regs[reg], 2, memory)?;
                 memory.write_u16(addr, value);
                 Some(())
             }
             0b101 => {
                 let disp = self.fetch_u16(memory) as i16 as i32;
                 let addr = self.a_regs[reg].wrapping_add_signed(disp);
-                self.ensure_aligned_for_size(addr, 2, memory)?;
+                self.ensure_aligned_for_size_write(addr, 2, memory)?;
                 memory.write_u16(addr, value);
                 Some(())
             }
             0b110 => {
                 let addr = self.resolve_indexed_address(self.a_regs[reg], memory);
-                self.ensure_aligned_for_size(addr, 2, memory)?;
+                self.ensure_aligned_for_size_write(addr, 2, memory)?;
                 memory.write_u16(addr, value);
                 Some(())
             }
             0b111 => match reg {
                 0b000 => {
                     let addr = self.fetch_u16(memory) as i16 as i32 as u32;
-                    self.ensure_aligned_for_size(addr, 2, memory)?;
+                    self.ensure_aligned_for_size_write(addr, 2, memory)?;
                     memory.write_u16(addr, value);
                     Some(())
                 }
                 0b001 => {
                     let addr = self.fetch_u32(memory);
-                    self.ensure_aligned_for_size(addr, 2, memory)?;
+                    self.ensure_aligned_for_size_write(addr, 2, memory)?;
                     memory.write_u16(addr, value);
                     Some(())
                 }
@@ -3449,46 +3602,46 @@ impl M68k {
                 Some(())
             }
             0b010 => {
-                let addr = self.ensure_aligned_for_size(self.a_regs[reg], 4, memory)?;
+                let addr = self.ensure_aligned_for_size_write(self.a_regs[reg], 4, memory)?;
                 memory.write_u32(addr, value);
                 Some(())
             }
             0b011 => {
                 let addr = self.a_regs[reg];
-                self.ensure_aligned_for_size(addr, 4, memory)?;
+                self.ensure_aligned_for_size_write(addr, 4, memory)?;
                 memory.write_u32(addr, value);
                 self.a_regs[reg] = self.a_regs[reg].wrapping_add(4);
                 Some(())
             }
             0b100 => {
                 self.a_regs[reg] = self.a_regs[reg].wrapping_sub(4);
-                let addr = self.ensure_aligned_for_size(self.a_regs[reg], 4, memory)?;
+                let addr = self.ensure_aligned_for_size_write(self.a_regs[reg], 4, memory)?;
                 memory.write_u32(addr, value);
                 Some(())
             }
             0b101 => {
                 let disp = self.fetch_u16(memory) as i16 as i32;
                 let addr = self.a_regs[reg].wrapping_add_signed(disp);
-                self.ensure_aligned_for_size(addr, 4, memory)?;
+                self.ensure_aligned_for_size_write(addr, 4, memory)?;
                 memory.write_u32(addr, value);
                 Some(())
             }
             0b110 => {
                 let addr = self.resolve_indexed_address(self.a_regs[reg], memory);
-                self.ensure_aligned_for_size(addr, 4, memory)?;
+                self.ensure_aligned_for_size_write(addr, 4, memory)?;
                 memory.write_u32(addr, value);
                 Some(())
             }
             0b111 => match reg {
                 0b000 => {
                     let addr = self.fetch_u16(memory) as i16 as i32 as u32;
-                    self.ensure_aligned_for_size(addr, 4, memory)?;
+                    self.ensure_aligned_for_size_write(addr, 4, memory)?;
                     memory.write_u32(addr, value);
                     Some(())
                 }
                 0b001 => {
                     let addr = self.fetch_u32(memory);
-                    self.ensure_aligned_for_size(addr, 4, memory)?;
+                    self.ensure_aligned_for_size_write(addr, 4, memory)?;
                     memory.write_u32(addr, value);
                     Some(())
                 }
@@ -3500,7 +3653,12 @@ impl M68k {
 
     fn fetch_u16(&mut self, memory: &mut MemoryMap) -> u16 {
         if (self.pc & 1) != 0 {
-            self.raise_address_error(memory);
+            self.raise_address_error(
+                memory,
+                self.pc,
+                AddressErrorAccess::InstructionRead,
+                self.current_opcode,
+            );
             return 0;
         }
         let value = memory.read_u16(self.pc);
@@ -3510,7 +3668,12 @@ impl M68k {
 
     fn fetch_u32(&mut self, memory: &mut MemoryMap) -> u32 {
         if (self.pc & 1) != 0 {
-            self.raise_address_error(memory);
+            self.raise_address_error(
+                memory,
+                self.pc,
+                AddressErrorAccess::InstructionRead,
+                self.current_opcode,
+            );
             return 0;
         }
         let value = memory.read_u32(self.pc);
@@ -3525,7 +3688,30 @@ impl M68k {
         memory: &mut MemoryMap,
     ) -> Option<u32> {
         if size_bytes >= 2 && (addr & 1) != 0 {
-            self.raise_address_error(memory);
+            self.raise_address_error(
+                memory,
+                addr,
+                AddressErrorAccess::DataRead,
+                self.current_opcode,
+            );
+            return None;
+        }
+        Some(addr)
+    }
+
+    fn ensure_aligned_for_size_write(
+        &mut self,
+        addr: u32,
+        size_bytes: u32,
+        memory: &mut MemoryMap,
+    ) -> Option<u32> {
+        if size_bytes >= 2 && (addr & 1) != 0 {
+            self.raise_address_error(
+                memory,
+                addr,
+                AddressErrorAccess::DataWrite,
+                self.current_opcode,
+            );
             return None;
         }
         Some(addr)
@@ -3617,9 +3803,61 @@ impl M68k {
         value
     }
 
-    fn raise_address_error(&mut self, memory: &mut MemoryMap) {
-        self.raise_exception(3, memory, None);
+    fn raise_address_error(
+        &mut self,
+        memory: &mut MemoryMap,
+        fault_addr: u32,
+        access: AddressErrorAccess,
+        instruction_word: u16,
+    ) {
+        self.exception_raised_this_step = true;
+        if self.pending_group0_frames > 0 {
+            // Double bus/address fault while already processing a group-0
+            // exception halts the 68000 until external reset.
+            self.hard_halted = true;
+            self.stopped = false;
+            self.pending_exception_cycles = Some(0);
+            self.pending_trace_exception = false;
+            return;
+        }
+
+        *self.exception_histogram.entry(3).or_insert(0) += 1;
+        self.stopped = false;
+        let old_sr = self.sr;
+
+        // Address/bus errors use the 68000 group 0 frame.
+        if (self.sr & SR_SUPERVISOR) == 0 {
+            self.usp = self.a_regs[7];
+            self.a_regs[7] = self.ssp;
+        }
+
+        let stacked_pc = self.pc;
+        self.push_u32(memory, stacked_pc);
+        self.push_u16(memory, old_sr);
+        self.push_u16(memory, instruction_word);
+        self.push_u32(memory, fault_addr);
+        self.push_u16(memory, self.address_error_access_info(access));
+        self.ssp = self.a_regs[7];
+        self.pending_group0_frames = self.pending_group0_frames.saturating_add(1);
+
+        // Address/bus error entry also clears trace.
+        self.sr = (old_sr | SR_SUPERVISOR) & !SR_TRACE;
+        let vector_addr = 3 * 4;
+        self.pc = memory.read_u32(vector_addr);
         self.pending_exception_cycles = Some(50);
+    }
+
+    fn address_error_access_info(&self, access: AddressErrorAccess) -> u16 {
+        let supervisor = (self.sr & SR_SUPERVISOR) != 0;
+        let instruction = matches!(access, AddressErrorAccess::InstructionRead);
+        let read = !matches!(access, AddressErrorAccess::DataWrite);
+        let fc = match (supervisor, instruction) {
+            (false, false) => 0b001, // user data
+            (false, true) => 0b010,  // user program
+            (true, false) => 0b101,  // supervisor data
+            (true, true) => 0b110,   // supervisor program
+        };
+        (if read { 0x0010 } else { 0 }) | (if instruction { 0 } else { 0x0008 }) | fc
     }
 
     fn take_pending_exception_cycles(&mut self) -> Option<u32> {
@@ -3753,6 +3991,7 @@ impl M68k {
     }
 
     fn write_sr(&mut self, value: u16) {
+        let value = value & SR_VALID_MASK_68000;
         let old_supervisor = (self.sr & SR_SUPERVISOR) != 0;
         let new_supervisor = (value & SR_SUPERVISOR) != 0;
         if old_supervisor != new_supervisor {
@@ -3784,6 +4023,13 @@ enum ArithOp {
 enum LogicOp {
     And,
     Or,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AddressErrorAccess {
+    InstructionRead,
+    DataRead,
+    DataWrite,
 }
 
 #[derive(Debug, Clone, Copy)]

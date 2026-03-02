@@ -20,6 +20,8 @@ struct InputEvent {
 struct CliArgs {
     rom_path: String,
     steps: usize,
+    snapshot_path: Option<String>,
+    verify_snapshot_path: Option<String>,
 }
 
 fn main() {
@@ -33,6 +35,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let cli = parse_cli_args(env::args().skip(1))?;
     let rom_path = cli.rom_path;
     let steps = cli.steps;
+    let snapshot_path = cli.snapshot_path;
+    let verify_snapshot_path = cli.verify_snapshot_path;
     let stop_on_unknown = env::var("STOP_ON_UNKNOWN").is_ok();
     let stop_on_bad_pc = env::var("STOP_ON_BAD_PC").is_ok();
     let stop_on_pc = env::var("STOP_ON_PC")
@@ -487,12 +491,32 @@ fn run() -> Result<(), Box<dyn Error>> {
         println!("dump frame path  : {path}");
     }
 
+    let snapshot_text =
+        build_unknown_snapshot_text(&rom_path, steps, steps_executed, &cpu, &memory);
+    if let Some(path) = snapshot_path.as_deref() {
+        std::fs::write(path, snapshot_text.as_bytes())?;
+        println!("snapshot write   : {path}");
+    }
+    if let Some(path) = verify_snapshot_path.as_deref() {
+        let expected = std::fs::read_to_string(path)?;
+        if normalize_snapshot(&expected) != normalize_snapshot(&snapshot_text) {
+            let mismatch_path = format!("{path}.new");
+            std::fs::write(&mismatch_path, snapshot_text.as_bytes())?;
+            return Err(
+                format!("snapshot mismatch: current snapshot written to {mismatch_path}").into(),
+            );
+        }
+        println!("snapshot verify  : ok ({path})");
+    }
+
     Ok(())
 }
 
 fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Box<dyn Error>> {
     let mut rom_path: Option<String> = None;
     let mut steps: Option<usize> = None;
+    let mut snapshot_path: Option<String> = None;
+    let mut verify_snapshot_path: Option<String> = None;
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
@@ -504,9 +528,21 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Box
                 let parsed = value.parse::<usize>()?;
                 steps = Some(parsed);
             }
+            "--snapshot" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "missing value for --snapshot".to_string())?;
+                snapshot_path = Some(value);
+            }
+            "--verify-snapshot" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "missing value for --verify-snapshot".to_string())?;
+                verify_snapshot_path = Some(value);
+            }
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: cargo run -p megadrive-cli --bin opcode_profile -- <rom-path> [steps]\n       cargo run -p megadrive-cli --bin opcode_profile -- <rom-path> --steps <n>"
+                    "usage: cargo run -p megadrive-cli --bin opcode_profile -- <rom-path> [steps]\n       cargo run -p megadrive-cli --bin opcode_profile -- <rom-path> --steps <n> [--snapshot <path>] [--verify-snapshot <path>]"
                 );
                 std::process::exit(0);
             }
@@ -528,11 +564,96 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Box
     let rom_path = rom_path.ok_or_else(|| {
         "usage: cargo run -p megadrive-cli --bin opcode_profile -- <rom-path> [steps]".to_string()
     })?;
+    if snapshot_path.is_some() && verify_snapshot_path.is_some() {
+        return Err("cannot use --snapshot and --verify-snapshot together".into());
+    }
 
     Ok(CliArgs {
         rom_path,
         steps: steps.unwrap_or(2_000_000),
+        snapshot_path,
+        verify_snapshot_path,
     })
+}
+
+fn normalize_snapshot(value: &str) -> String {
+    value.trim().replace("\r\n", "\n")
+}
+
+fn build_unknown_snapshot_text(
+    rom_path: &str,
+    steps: usize,
+    steps_executed: usize,
+    cpu: &M68k,
+    memory: &MemoryMap,
+) -> String {
+    fn join_u16_pairs(items: &[(u16, u64)]) -> String {
+        items
+            .iter()
+            .map(|(k, v)| format!("{k:04X}:{v}"))
+            .collect::<Vec<String>>()
+            .join(",")
+    }
+    fn join_u32_pairs(items: &[(u32, u64)]) -> String {
+        items
+            .iter()
+            .map(|(k, v)| format!("{k:08X}:{v}"))
+            .collect::<Vec<String>>()
+            .join(",")
+    }
+    fn join_u8_pairs(items: &[(u8, u64)]) -> String {
+        items
+            .iter()
+            .map(|(k, v)| format!("{k:02X}:{v}"))
+            .collect::<Vec<String>>()
+            .join(",")
+    }
+    fn join_u16_pairs_z80(items: &[(u16, u64)]) -> String {
+        items
+            .iter()
+            .map(|(k, v)| format!("{k:04X}:{v}"))
+            .collect::<Vec<String>>()
+            .join(",")
+    }
+    fn join_u32_exception_pairs(items: &[(u32, u64)]) -> String {
+        items
+            .iter()
+            .map(|(k, v)| format!("{k:08X}:{v}"))
+            .collect::<Vec<String>>()
+            .join(",")
+    }
+
+    let mut lines = Vec::with_capacity(16);
+    lines.push("version=1".to_string());
+    lines.push(format!("rom={rom_path}"));
+    lines.push(format!("steps={steps}"));
+    lines.push(format!("steps_executed={steps_executed}"));
+    lines.push(format!("m68k_unknown_total={}", cpu.unknown_opcode_total()));
+    lines.push(format!(
+        "m68k_unknown_hist={}",
+        join_u16_pairs(&cpu.unknown_opcode_histogram())
+    ));
+    lines.push(format!(
+        "m68k_unknown_pc_hist={}",
+        join_u32_pairs(&cpu.unknown_opcode_pc_histogram())
+    ));
+    lines.push(format!(
+        "m68k_exception_hist={}",
+        join_u32_exception_pairs(&cpu.exception_histogram())
+    ));
+    lines.push(format!(
+        "z80_unknown_total={}",
+        memory.z80().unknown_opcode_total()
+    ));
+    lines.push(format!(
+        "z80_unknown_hist={}",
+        join_u8_pairs(&memory.z80().unknown_opcode_histogram())
+    ));
+    lines.push(format!(
+        "z80_unknown_pc_hist={}",
+        join_u16_pairs_z80(&memory.z80().unknown_opcode_pc_histogram())
+    ));
+    lines.join("\n")
 }
 
 fn framebuffer_hash(data: &[u8]) -> u64 {
@@ -1178,6 +1299,50 @@ mod tests {
         let args = vec!["roms/Sonic.md".to_string(), "--bad".to_string()];
         let err = parse_cli_args(args).expect_err("must fail");
         assert!(err.to_string().contains("unknown option"));
+    }
+
+    #[test]
+    fn parse_cli_args_accepts_snapshot_options() {
+        let args = vec![
+            "roms/Sonic.md".to_string(),
+            "--steps".to_string(),
+            "789".to_string(),
+            "--snapshot".to_string(),
+            "snapshots/sonic.txt".to_string(),
+        ];
+        let parsed = parse_cli_args(args).expect("must parse");
+        assert_eq!(parsed.rom_path, "roms/Sonic.md");
+        assert_eq!(parsed.steps, 789);
+        assert_eq!(parsed.snapshot_path.as_deref(), Some("snapshots/sonic.txt"));
+        assert_eq!(parsed.verify_snapshot_path, None);
+
+        let args = vec![
+            "roms/Sonic.md".to_string(),
+            "--verify-snapshot".to_string(),
+            "snapshots/sonic.txt".to_string(),
+        ];
+        let parsed = parse_cli_args(args).expect("must parse");
+        assert_eq!(
+            parsed.verify_snapshot_path.as_deref(),
+            Some("snapshots/sonic.txt")
+        );
+        assert_eq!(parsed.snapshot_path, None);
+    }
+
+    #[test]
+    fn parse_cli_args_rejects_snapshot_and_verify_together() {
+        let args = vec![
+            "roms/Sonic.md".to_string(),
+            "--snapshot".to_string(),
+            "a.txt".to_string(),
+            "--verify-snapshot".to_string(),
+            "b.txt".to_string(),
+        ];
+        let err = parse_cli_args(args).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("cannot use --snapshot and --verify-snapshot together")
+        );
     }
 
     #[test]

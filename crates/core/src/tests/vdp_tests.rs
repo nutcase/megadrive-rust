@@ -1,4 +1,4 @@
-use super::{FRAME_HEIGHT, FRAME_WIDTH, Vdp, encode_md_color};
+use super::{DmaTarget, FRAME_HEIGHT, FRAME_WIDTH, Vdp, encode_md_color};
 
 #[test]
 fn supports_vram_read_write() {
@@ -98,19 +98,10 @@ fn register_write_updates_name_table_base() {
 }
 
 #[test]
-fn renders_non_uniform_frame() {
+fn initial_frame_starts_black() {
     let vdp = Vdp::new();
     assert_eq!(vdp.frame_buffer().len(), FRAME_WIDTH * FRAME_HEIGHT * 3);
-
-    let first = &vdp.frame_buffer()[0..3];
-    let mut saw_different = false;
-    for chunk in vdp.frame_buffer().chunks_exact(3).take(512) {
-        if chunk != first {
-            saw_different = true;
-            break;
-        }
-    }
-    assert!(saw_different, "frame buffer should not be a flat color");
+    assert!(vdp.frame_buffer().iter().all(|&b| b == 0));
 }
 
 #[test]
@@ -1235,4 +1226,59 @@ fn dma_copy_copies_vram_bytes() {
     assert_eq!(vdp.read_vram_u8(0x0201), 0x22);
     assert_eq!(vdp.read_vram_u8(0x0202), 0x33);
     assert_eq!(vdp.read_vram_u8(0x0203), 0x44);
+}
+
+#[test]
+fn bus_dma_request_contains_expected_fields_for_vram_target() {
+    let mut vdp = Vdp::new();
+    // Register 1: display + DMA enable.
+    vdp.write_control_port(0x8150);
+    // Auto-increment = 2 bytes.
+    vdp.write_control_port(0x8F02);
+    // DMA length = 4 words.
+    vdp.write_control_port(0x9304);
+    vdp.write_control_port(0x9400);
+    // DMA source = encoded 0x021123 -> bus 0x042246.
+    vdp.write_control_port(0x9523);
+    vdp.write_control_port(0x9611);
+    vdp.write_control_port(0x9702); // bus mode (bit7=0)
+
+    // VRAM write DMA command @ 0x0400 (DMA request bit set).
+    vdp.write_control_port(0x4400);
+    vdp.write_control_port(0x0080);
+
+    let request = vdp
+        .take_bus_dma_request()
+        .expect("bus DMA request should be queued");
+    assert_eq!(request.target, DmaTarget::Vram);
+    assert_eq!(request.source_addr, 0x0042_246);
+    assert_eq!(request.dest_addr, 0x0400);
+    assert_eq!(request.auto_increment, 2);
+    assert_eq!(request.words, 4);
+}
+
+#[test]
+fn complete_bus_dma_updates_source_and_clears_length_registers() {
+    let mut vdp = Vdp::new();
+    vdp.write_control_port(0x8150); // display + DMA enable
+    vdp.write_control_port(0x9302); // length low
+    vdp.write_control_port(0x9400); // length high
+    vdp.write_control_port(0x9500); // source low
+    vdp.write_control_port(0x9600); // source mid
+    vdp.write_control_port(0x9700); // source high / bus mode
+
+    // Queue bus DMA request.
+    vdp.write_control_port(0x4000);
+    vdp.write_control_port(0x0080);
+    let _ = vdp.take_bus_dma_request().expect("request expected");
+
+    vdp.complete_bus_dma(0x0012_3456);
+    // DMA length should be cleared.
+    assert_eq!(vdp.register(19), 0);
+    assert_eq!(vdp.register(20), 0);
+
+    // Source registers should encode 0x123456 >> 1 = 0x091A2B.
+    assert_eq!(vdp.register(21), 0x2B);
+    assert_eq!(vdp.register(22), 0x1A);
+    assert_eq!(vdp.register(23) & 0x7F, 0x09);
 }

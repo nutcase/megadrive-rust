@@ -1334,9 +1334,10 @@ fn mulu_word_with_register_source_updates_result_and_flags() {
 
     cpu.step(&mut memory);
     cpu.step(&mut memory);
-    cpu.step(&mut memory);
+    let mul_cycles = cpu.step(&mut memory);
 
     assert_eq!(cpu.d_regs[0], 42);
+    assert_eq!(mul_cycles, 44);
     assert_eq!(cpu.sr() & CCR_Z, 0);
     assert_eq!(cpu.sr() & CCR_N, 0);
     assert_eq!(cpu.sr() & CCR_V, 0);
@@ -1367,15 +1368,52 @@ fn mulu_word_with_displacement_memory_source_sets_zero() {
     let mut cpu = M68k::new();
     cpu.reset(&mut memory);
 
-    for _ in 0..5 {
-        cpu.step(&mut memory);
-    }
+    cpu.step(&mut memory);
+    cpu.step(&mut memory);
+    cpu.step(&mut memory);
+    let mul_cycles = cpu.step(&mut memory);
 
     assert_eq!(cpu.d_regs[0], 0);
+    assert_eq!(mul_cycles, 46);
     assert_ne!(cpu.sr() & CCR_Z, 0);
     assert_eq!(cpu.sr() & CCR_N, 0);
     assert_eq!(cpu.sr() & CCR_V, 0);
     assert_eq!(cpu.sr() & CCR_C, 0);
+}
+
+#[test]
+fn mulu_word_cycles_follow_38_plus_2n_rule() {
+    let mut rom = vec![0u8; 0x600];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+    // move.w #$0000, d1 ; moveq #1, d0 ; mulu.w d1,d0
+    rom[0x100..0x102].copy_from_slice(&0x323Cu16.to_be_bytes());
+    rom[0x102..0x104].copy_from_slice(&0x0000u16.to_be_bytes());
+    rom[0x104..0x106].copy_from_slice(&0x7001u16.to_be_bytes());
+    rom[0x106..0x108].copy_from_slice(&0xC0C1u16.to_be_bytes());
+    // move.w #$FFFF, d1 ; moveq #1, d0 ; mulu.w d1,d0
+    rom[0x108..0x10A].copy_from_slice(&0x323Cu16.to_be_bytes());
+    rom[0x10A..0x10C].copy_from_slice(&0xFFFFu16.to_be_bytes());
+    rom[0x10C..0x10E].copy_from_slice(&0x7001u16.to_be_bytes());
+    rom[0x10E..0x110].copy_from_slice(&0xC0C1u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    cpu.step(&mut memory);
+    cpu.step(&mut memory);
+    let c1 = cpu.step(&mut memory);
+    assert_eq!(c1, 38);
+    assert_eq!(cpu.d_regs[0], 0);
+
+    cpu.step(&mut memory);
+    cpu.step(&mut memory);
+    let c2 = cpu.step(&mut memory);
+    assert_eq!(c2, 70);
+    assert_eq!(cpu.d_regs[0], 0x0000_FFFF);
 }
 
 #[test]
@@ -1398,13 +1436,49 @@ fn muls_word_with_register_source_handles_negative_result() {
 
     cpu.step(&mut memory);
     cpu.step(&mut memory);
-    cpu.step(&mut memory);
+    let mul_cycles = cpu.step(&mut memory);
 
     assert_eq!(cpu.d_regs[0], 0xFFFF_FFFA);
+    assert_eq!(mul_cycles, 42);
     assert_eq!(cpu.sr() & CCR_Z, 0);
     assert_ne!(cpu.sr() & CCR_N, 0);
     assert_eq!(cpu.sr() & CCR_V, 0);
     assert_eq!(cpu.sr() & CCR_C, 0);
+}
+
+#[test]
+fn muls_word_cycles_follow_38_plus_2n_rule() {
+    let mut rom = vec![0u8; 0x600];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+    // move.w #$0000, d1 ; moveq #2, d0 ; muls.w d1,d0
+    rom[0x100..0x102].copy_from_slice(&0x323Cu16.to_be_bytes());
+    rom[0x102..0x104].copy_from_slice(&0x0000u16.to_be_bytes());
+    rom[0x104..0x106].copy_from_slice(&0x7002u16.to_be_bytes());
+    rom[0x106..0x108].copy_from_slice(&0xC1C1u16.to_be_bytes());
+    // move.w #$5555, d1 ; moveq #1, d0 ; muls.w d1,d0
+    rom[0x108..0x10A].copy_from_slice(&0x323Cu16.to_be_bytes());
+    rom[0x10A..0x10C].copy_from_slice(&0x5555u16.to_be_bytes());
+    rom[0x10C..0x10E].copy_from_slice(&0x7001u16.to_be_bytes());
+    rom[0x10E..0x110].copy_from_slice(&0xC1C1u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    cpu.step(&mut memory);
+    cpu.step(&mut memory);
+    let c1 = cpu.step(&mut memory);
+    assert_eq!(c1, 38);
+    assert_eq!(cpu.d_regs[0], 0);
+
+    cpu.step(&mut memory);
+    cpu.step(&mut memory);
+    let c2 = cpu.step(&mut memory);
+    assert_eq!(c2, 70);
+    assert_eq!(cpu.d_regs[0], 0x0000_5555);
 }
 
 #[test]
@@ -1463,12 +1537,96 @@ fn divu_word_with_register_source_produces_quotient_and_remainder() {
 
     cpu.step(&mut memory);
     cpu.step(&mut memory);
-    cpu.step(&mut memory);
+    let cycles = cpu.step(&mut memory);
 
     assert_eq!(cpu.d_regs[0], 0x0001_3335);
+    assert_eq!(cycles, 122);
     assert_eq!(cpu.sr() & CCR_Z, 0);
     assert_eq!(cpu.sr() & CCR_N, 0);
     assert_eq!(cpu.sr() & CCR_V, 0);
+    assert_eq!(cpu.sr() & CCR_C, 0);
+}
+
+#[test]
+fn divu_word_cycles_cover_overflow_and_min_max_paths() {
+    let mut rom = vec![0u8; 0x800];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+    // move.l #$00010000, d0 ; moveq #1, d1 ; divu.w d1,d0 (overflow => 10 cycles)
+    rom[0x100..0x102].copy_from_slice(&0x203Cu16.to_be_bytes());
+    rom[0x102..0x106].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    rom[0x106..0x108].copy_from_slice(&0x7201u16.to_be_bytes());
+    rom[0x108..0x10A].copy_from_slice(&0x80C1u16.to_be_bytes());
+
+    // moveq #0, d0 ; moveq #1, d1 ; divu.w d1,d0 (worst-case => 136 cycles)
+    rom[0x10A..0x10C].copy_from_slice(&0x7000u16.to_be_bytes());
+    rom[0x10C..0x10E].copy_from_slice(&0x7201u16.to_be_bytes());
+    rom[0x10E..0x110].copy_from_slice(&0x80C1u16.to_be_bytes());
+
+    // move.l #$FF0000FF, d0 ; move.w #$FF01, d1 ; divu.w d1,d0 (best-case => 76 cycles)
+    rom[0x110..0x112].copy_from_slice(&0x203Cu16.to_be_bytes());
+    rom[0x112..0x116].copy_from_slice(&0xFF00_00FFu32.to_be_bytes());
+    rom[0x116..0x118].copy_from_slice(&0x323Cu16.to_be_bytes());
+    rom[0x118..0x11A].copy_from_slice(&0xFF01u16.to_be_bytes());
+    rom[0x11A..0x11C].copy_from_slice(&0x80C1u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    cpu.step(&mut memory);
+    cpu.step(&mut memory);
+    let c_overflow = cpu.step(&mut memory);
+    assert_eq!(c_overflow, 10);
+    assert_eq!(cpu.d_regs[0], 0x0001_0000);
+    assert_ne!(cpu.sr() & CCR_V, 0);
+    assert_eq!(cpu.sr() & CCR_C, 0);
+
+    cpu.step(&mut memory);
+    cpu.step(&mut memory);
+    let c_worst = cpu.step(&mut memory);
+    assert_eq!(c_worst, 136);
+    assert_eq!(cpu.d_regs[0], 0);
+
+    cpu.step(&mut memory);
+    cpu.step(&mut memory);
+    let c_best = cpu.step(&mut memory);
+    assert_eq!(c_best, 76);
+    assert_eq!(cpu.d_regs[0], 0x0000_FFFF);
+    assert_eq!(cpu.sr() & CCR_V, 0);
+}
+
+#[test]
+fn divu_word_overflow_with_memory_source_adds_ea_cycles() {
+    let mut rom = vec![0u8; 0x800];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+    // movea.l #$00FF0040, a0
+    rom[0x100..0x102].copy_from_slice(&0x207Cu16.to_be_bytes());
+    rom[0x102..0x106].copy_from_slice(&0x00FF_0040u32.to_be_bytes());
+    // move.l #$00010000, d0
+    rom[0x106..0x108].copy_from_slice(&0x203Cu16.to_be_bytes());
+    rom[0x108..0x10C].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    // divu.w (2,a0), d0
+    rom[0x10C..0x10E].copy_from_slice(&0x80E8u16.to_be_bytes());
+    rom[0x10E..0x110].copy_from_slice(&0x0002u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    memory.write_u16(0x00FF_0042, 0x0001);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    cpu.step(&mut memory);
+    cpu.step(&mut memory);
+    let cycles = cpu.step(&mut memory);
+
+    assert_eq!(cycles, 18);
+    assert_eq!(cpu.d_regs[0], 0x0001_0000);
+    assert_ne!(cpu.sr() & CCR_V, 0);
     assert_eq!(cpu.sr() & CCR_C, 0);
 }
 
@@ -1500,6 +1658,40 @@ fn divu_by_zero_vectors_to_exception_5() {
 }
 
 #[test]
+fn divu_by_zero_with_memory_source_uses_memory_cycles() {
+    let mut rom = vec![0u8; 0x800];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+    // Divide by zero vector #5
+    rom[0x14..0x18].copy_from_slice(&0x0000_0200u32.to_be_bytes());
+
+    // movea.l #$00FF0040, a0
+    rom[0x100..0x102].copy_from_slice(&0x207Cu16.to_be_bytes());
+    rom[0x102..0x106].copy_from_slice(&0x00FF_0040u32.to_be_bytes());
+    // move.l #$00001234, d0
+    rom[0x106..0x108].copy_from_slice(&0x203Cu16.to_be_bytes());
+    rom[0x108..0x10C].copy_from_slice(&0x0000_1234u32.to_be_bytes());
+    // divu.w (2,a0), d0
+    rom[0x10C..0x10E].copy_from_slice(&0x80E8u16.to_be_bytes());
+    rom[0x10E..0x110].copy_from_slice(&0x0002u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    memory.write_u16(0x00FF_0042, 0x0000);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    cpu.step(&mut memory); // movea.l
+    cpu.step(&mut memory); // move.l
+    let cycles = cpu.step(&mut memory); // divu.w (2,a0),d0
+
+    assert_eq!(cycles, 46);
+    assert_eq!(cpu.pc(), 0x0000_0200);
+    assert_eq!(cpu.d_regs[0], 0x0000_1234);
+    assert_eq!(memory.read_u32(0x00FF_0FFC), 0x0000_0110);
+}
+
+#[test]
 fn divs_word_with_register_source_handles_negative_result() {
     let mut rom = vec![0u8; 0x400];
     rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
@@ -1520,13 +1712,48 @@ fn divs_word_with_register_source_handles_negative_result() {
 
     cpu.step(&mut memory);
     cpu.step(&mut memory);
-    cpu.step(&mut memory);
+    let cycles = cpu.step(&mut memory);
 
     assert_eq!(cpu.d_regs[0], 0xFFFC_FFFA);
+    assert_eq!(cycles, 152);
     assert_eq!(cpu.sr() & CCR_Z, 0);
     assert_ne!(cpu.sr() & CCR_N, 0);
     assert_eq!(cpu.sr() & CCR_V, 0);
     assert_eq!(cpu.sr() & CCR_C, 0);
+}
+
+#[test]
+fn divs_by_zero_with_memory_source_uses_memory_cycles() {
+    let mut rom = vec![0u8; 0x800];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+    // Divide by zero vector #5
+    rom[0x14..0x18].copy_from_slice(&0x0000_0200u32.to_be_bytes());
+
+    // movea.l #$00FF0040, a0
+    rom[0x100..0x102].copy_from_slice(&0x207Cu16.to_be_bytes());
+    rom[0x102..0x106].copy_from_slice(&0x00FF_0040u32.to_be_bytes());
+    // move.l #$FFFFFED4 (-300), d0
+    rom[0x106..0x108].copy_from_slice(&0x203Cu16.to_be_bytes());
+    rom[0x108..0x10C].copy_from_slice(&0xFFFF_FED4u32.to_be_bytes());
+    // divs.w (2,a0), d0
+    rom[0x10C..0x10E].copy_from_slice(&0x81E8u16.to_be_bytes());
+    rom[0x10E..0x110].copy_from_slice(&0x0002u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    memory.write_u16(0x00FF_0042, 0x0000);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    cpu.step(&mut memory); // movea.l
+    cpu.step(&mut memory); // move.l
+    let cycles = cpu.step(&mut memory); // divs.w (2,a0),d0
+
+    assert_eq!(cycles, 46);
+    assert_eq!(cpu.pc(), 0x0000_0200);
+    assert_eq!(cpu.d_regs[0], 0xFFFF_FED4);
+    assert_eq!(memory.read_u32(0x00FF_0FFC), 0x0000_0110);
 }
 
 #[test]
@@ -1550,9 +1777,72 @@ fn divs_word_overflow_sets_v_and_keeps_destination() {
 
     cpu.step(&mut memory);
     cpu.step(&mut memory);
-    cpu.step(&mut memory);
+    let cycles = cpu.step(&mut memory);
 
     assert_eq!(cpu.d_regs[0], 0x0001_0000);
+    assert_eq!(cycles, 16);
+    assert_ne!(cpu.sr() & CCR_V, 0);
+    assert_eq!(cpu.sr() & CCR_C, 0);
+}
+
+#[test]
+fn divs_word_cycles_cover_long_and_short_paths() {
+    let mut rom = vec![0u8; 0x800];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+    // moveq #-1, d0 ; moveq #2, d1 ; divs.w d1,d0 (worst-case long path => 156 cycles)
+    rom[0x100..0x102].copy_from_slice(&0x70FFu16.to_be_bytes());
+    rom[0x102..0x104].copy_from_slice(&0x7202u16.to_be_bytes());
+    rom[0x104..0x106].copy_from_slice(&0x81C1u16.to_be_bytes());
+
+    // move.l #$0000FFFF, d0 ; moveq #1, d1 ; divs.w d1,d0 (best-case long path => 120 cycles)
+    rom[0x106..0x108].copy_from_slice(&0x203Cu16.to_be_bytes());
+    rom[0x108..0x10C].copy_from_slice(&0x0000_FFFFu32.to_be_bytes());
+    rom[0x10C..0x10E].copy_from_slice(&0x7201u16.to_be_bytes());
+    rom[0x10E..0x110].copy_from_slice(&0x81C1u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    cpu.step(&mut memory);
+    cpu.step(&mut memory);
+    let c_worst = cpu.step(&mut memory);
+    assert_eq!(c_worst, 156);
+    assert_eq!(cpu.d_regs[0], 0xFFFF_0000);
+
+    cpu.step(&mut memory);
+    cpu.step(&mut memory);
+    let c_best = cpu.step(&mut memory);
+    assert_eq!(c_best, 120);
+    assert_eq!(cpu.d_regs[0], 0x0000_FFFF);
+}
+
+#[test]
+fn divs_word_negative_absolute_overflow_uses_18_cycles() {
+    let mut rom = vec![0u8; 0x600];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+    // move.l #$80000000, d0 ; moveq #-1, d1 ; divs.w d1,d0
+    rom[0x100..0x102].copy_from_slice(&0x203Cu16.to_be_bytes());
+    rom[0x102..0x106].copy_from_slice(&0x8000_0000u32.to_be_bytes());
+    rom[0x106..0x108].copy_from_slice(&0x72FFu16.to_be_bytes());
+    rom[0x108..0x10A].copy_from_slice(&0x81C1u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    cpu.step(&mut memory);
+    cpu.step(&mut memory);
+    let cycles = cpu.step(&mut memory);
+
+    assert_eq!(cycles, 18);
+    assert_eq!(cpu.d_regs[0], 0x8000_0000);
     assert_ne!(cpu.sr() & CCR_V, 0);
     assert_eq!(cpu.sr() & CCR_C, 0);
 }
@@ -1843,6 +2133,38 @@ fn suba_word_and_long_immediate_are_decoded() {
 }
 
 #[test]
+fn add_sub_to_dn_accepts_immediate_effective_address() {
+    let mut rom = vec![0u8; 0x800];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+    // moveq #0, d0
+    rom[0x100..0x102].copy_from_slice(&0x7000u16.to_be_bytes());
+    // add.w #$1234, d0
+    rom[0x102..0x104].copy_from_slice(&0xD07Cu16.to_be_bytes());
+    rom[0x104..0x106].copy_from_slice(&0x1234u16.to_be_bytes());
+    // sub.w #$0020, d0
+    rom[0x106..0x108].copy_from_slice(&0x907Cu16.to_be_bytes());
+    rom[0x108..0x10A].copy_from_slice(&0x0020u16.to_be_bytes());
+    // add.l #$00010000, d0
+    rom[0x10A..0x10C].copy_from_slice(&0xD0BCu16.to_be_bytes());
+    rom[0x10C..0x110].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    for _ in 0..4 {
+        cpu.step(&mut memory);
+    }
+
+    assert_eq!(cpu.d_regs[0], 0x0001_1214);
+    assert_eq!(cpu.pc(), 0x0000_0110);
+    assert_eq!(cpu.unknown_opcode_total(), 0);
+}
+
+#[test]
 fn cmpi_sets_negative_and_carry_on_underflow() {
     let mut rom = vec![0u8; 0x400];
     rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
@@ -1865,6 +2187,75 @@ fn cmpi_sets_negative_and_carry_on_underflow() {
     assert_ne!(cpu.sr() & CCR_N, 0);
     assert_ne!(cpu.sr() & CCR_C, 0);
     assert_eq!(cpu.sr() & CCR_Z, 0);
+}
+
+#[test]
+fn cmp_to_dn_accepts_immediate_effective_address() {
+    let mut rom = vec![0u8; 0x800];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+    // moveq #5, d4
+    rom[0x100..0x102].copy_from_slice(&0x7805u16.to_be_bytes());
+    // cmp.b #$05, d4
+    rom[0x102..0x104].copy_from_slice(&0xB83Cu16.to_be_bytes());
+    rom[0x104..0x106].copy_from_slice(&0x0005u16.to_be_bytes());
+    // cmp.w #$0006, d4
+    rom[0x106..0x108].copy_from_slice(&0xB87Cu16.to_be_bytes());
+    rom[0x108..0x10A].copy_from_slice(&0x0006u16.to_be_bytes());
+    // cmp.l #$00000005, d4
+    rom[0x10A..0x10C].copy_from_slice(&0xB8BCu16.to_be_bytes());
+    rom[0x10C..0x110].copy_from_slice(&0x0000_0005u32.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    cpu.step(&mut memory);
+    cpu.step(&mut memory);
+    assert_ne!(cpu.sr() & CCR_Z, 0);
+
+    cpu.step(&mut memory);
+    assert_ne!(cpu.sr() & CCR_N, 0);
+    assert_ne!(cpu.sr() & CCR_C, 0);
+    assert_eq!(cpu.sr() & CCR_Z, 0);
+
+    cpu.step(&mut memory);
+    assert_ne!(cpu.sr() & CCR_Z, 0);
+    assert_eq!(cpu.unknown_opcode_total(), 0);
+}
+
+#[test]
+fn and_or_to_dn_accepts_immediate_effective_address() {
+    let mut rom = vec![0u8; 0x800];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+    // moveq #0, d0
+    rom[0x100..0x102].copy_from_slice(&0x7000u16.to_be_bytes());
+    // or.w #$00F0, d0
+    rom[0x102..0x104].copy_from_slice(&0x807Cu16.to_be_bytes());
+    rom[0x104..0x106].copy_from_slice(&0x00F0u16.to_be_bytes());
+    // and.w #$00CC, d0
+    rom[0x106..0x108].copy_from_slice(&0xC07Cu16.to_be_bytes());
+    rom[0x108..0x10A].copy_from_slice(&0x00CCu16.to_be_bytes());
+    // or.l #$00010000, d0
+    rom[0x10A..0x10C].copy_from_slice(&0x80BCu16.to_be_bytes());
+    rom[0x10C..0x110].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    for _ in 0..4 {
+        cpu.step(&mut memory);
+    }
+
+    assert_eq!(cpu.d_regs[0], 0x0001_00C0);
+    assert_eq!(cpu.unknown_opcode_total(), 0);
+    assert_eq!(cpu.pc(), 0x0000_0110);
 }
 
 #[test]
@@ -2074,9 +2465,9 @@ fn move_to_and_from_sr_supports_immediate_register_and_memory() {
     rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
     rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
 
-    // move.w #$A71F, sr
+    // move.w #$271F, sr
     rom[0x100..0x102].copy_from_slice(&0x46FCu16.to_be_bytes());
-    rom[0x102..0x104].copy_from_slice(&0xA71Fu16.to_be_bytes());
+    rom[0x102..0x104].copy_from_slice(&0x271Fu16.to_be_bytes());
     // move.w sr, d0
     rom[0x104..0x106].copy_from_slice(&0x40C0u16.to_be_bytes());
     // move.w sr, $00FF0000
@@ -2092,9 +2483,9 @@ fn move_to_and_from_sr_supports_immediate_register_and_memory() {
         cpu.step(&mut memory);
     }
 
-    assert_eq!(cpu.sr(), 0xA71F);
-    assert_eq!(cpu.d_regs[0] & 0xFFFF, 0xA71F);
-    assert_eq!(memory.read_u16(0x00FF_0000), 0xA71F);
+    assert_eq!(cpu.sr(), 0x271F);
+    assert_eq!(cpu.d_regs[0] & 0xFFFF, 0x271F);
+    assert_eq!(memory.read_u16(0x00FF_0000), 0x271F);
 }
 
 #[test]
@@ -2411,6 +2802,28 @@ fn tst_byte_supports_register_and_memory_effective_addresses() {
 }
 
 #[test]
+fn tst_pc_relative_is_illegal_on_68000() {
+    let mut rom = vec![0u8; 0x600];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+    // Illegal instruction vector #4.
+    rom[0x10..0x14].copy_from_slice(&0x0000_0180u32.to_be_bytes());
+    // tst.b (4,pc)
+    rom[0x100..0x102].copy_from_slice(&0x4A3Au16.to_be_bytes());
+    rom[0x102..0x104].copy_from_slice(&0x0004u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    let cycles = cpu.step(&mut memory);
+    assert_eq!(cycles, 34);
+    assert_eq!(cpu.pc(), 0x0000_0180);
+    assert_eq!(cpu.unknown_opcode_total(), 1);
+}
+
+#[test]
 fn clr_byte_clears_register_and_postincrement_memory_destination() {
     let mut rom = vec![0u8; 0x1000];
     rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
@@ -2610,6 +3023,96 @@ fn executes_roxl_and_roxr_register_forms() {
     assert_ne!(cpu.sr() & CCR_C, 0);
     assert_ne!(cpu.sr() & CCR_N, 0);
     assert_eq!(cpu.sr() & CCR_Z, 0);
+}
+
+#[test]
+fn shift_rotate_register_count_zero_uses_68000_flag_rules() {
+    let mut rom = vec![0u8; 0x800];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+    // move.w #$0010, d7 ; move.w d7, ccr (set X=1)
+    rom[0x100..0x102].copy_from_slice(&0x3E3Cu16.to_be_bytes());
+    rom[0x102..0x104].copy_from_slice(&0x0010u16.to_be_bytes());
+    rom[0x104..0x106].copy_from_slice(&0x44C7u16.to_be_bytes());
+    // moveq #0, d1 (shift count = 0)
+    rom[0x106..0x108].copy_from_slice(&0x7200u16.to_be_bytes());
+    // move.b #$81, d0
+    rom[0x108..0x10A].copy_from_slice(&0x103Cu16.to_be_bytes());
+    rom[0x10A..0x10C].copy_from_slice(&0x0081u16.to_be_bytes());
+    // asr.b d1,d0 ; roxr.b d1,d0 ; ror.b d1,d0
+    rom[0x10C..0x10E].copy_from_slice(&0xE220u16.to_be_bytes());
+    rom[0x10E..0x110].copy_from_slice(&0xE230u16.to_be_bytes());
+    rom[0x110..0x112].copy_from_slice(&0xE238u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    for _ in 0..4 {
+        cpu.step(&mut memory);
+    }
+
+    cpu.step(&mut memory); // asr.b d1,d0 (count 0)
+    assert_eq!(cpu.d_regs[0] & 0xFF, 0x81);
+    assert_ne!(cpu.sr() & CCR_X, 0);
+    assert_eq!(cpu.sr() & CCR_C, 0);
+    assert_eq!(cpu.sr() & CCR_V, 0);
+    assert_ne!(cpu.sr() & CCR_N, 0);
+    assert_eq!(cpu.sr() & CCR_Z, 0);
+
+    cpu.step(&mut memory); // roxr.b d1,d0 (count 0)
+    assert_eq!(cpu.d_regs[0] & 0xFF, 0x81);
+    assert_ne!(cpu.sr() & CCR_X, 0);
+    assert_ne!(cpu.sr() & CCR_C, 0);
+
+    cpu.step(&mut memory); // ror.b d1,d0 (count 0)
+    assert_eq!(cpu.d_regs[0] & 0xFF, 0x81);
+    assert_ne!(cpu.sr() & CCR_X, 0);
+    assert_eq!(cpu.sr() & CCR_C, 0);
+    assert_eq!(cpu.unknown_opcode_total(), 0);
+}
+
+#[test]
+fn asl_sets_overflow_when_sign_changes() {
+    let mut rom = vec![0u8; 0x800];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+    // move.b #$40,d0 ; asl.b #1,d0
+    rom[0x100..0x102].copy_from_slice(&0x103Cu16.to_be_bytes());
+    rom[0x102..0x104].copy_from_slice(&0x0040u16.to_be_bytes());
+    rom[0x104..0x106].copy_from_slice(&0xE300u16.to_be_bytes());
+
+    // movea.l #$00FF0040,a0 ; asl.w (16,a0)
+    rom[0x106..0x108].copy_from_slice(&0x207Cu16.to_be_bytes());
+    rom[0x108..0x10C].copy_from_slice(&0x00FF_0040u32.to_be_bytes());
+    rom[0x10C..0x10E].copy_from_slice(&0xE2E8u16.to_be_bytes());
+    rom[0x10E..0x110].copy_from_slice(&0x0010u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    memory.write_u16(0x00FF_0050, 0x4000);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    cpu.step(&mut memory); // move.b
+    cpu.step(&mut memory); // asl.b #1,d0
+    assert_eq!(cpu.d_regs[0] & 0xFF, 0x80);
+    assert_ne!(cpu.sr() & CCR_V, 0);
+    assert_ne!(cpu.sr() & CCR_N, 0);
+    assert_eq!(cpu.sr() & CCR_C, 0);
+    assert_eq!(cpu.sr() & CCR_X, 0);
+
+    cpu.step(&mut memory); // movea.l
+    cpu.step(&mut memory); // asl.w (16,a0)
+    assert_eq!(memory.read_u16(0x00FF_0050), 0x8000);
+    assert_ne!(cpu.sr() & CCR_V, 0);
+    assert_ne!(cpu.sr() & CCR_N, 0);
+    assert_eq!(cpu.sr() & CCR_C, 0);
+    assert_eq!(cpu.sr() & CCR_X, 0);
+    assert_eq!(cpu.unknown_opcode_total(), 0);
 }
 
 #[test]
@@ -2817,6 +3320,74 @@ fn illegal_opcode_vectors_to_exception_4() {
     assert_eq!(cpu.a_regs[7], 0x00FF_0FFA);
     assert_eq!(memory.read_u16(0x00FF_0FFA), 0x2700);
     assert_eq!(memory.read_u32(0x00FF_0FFC), 0x0000_0102);
+}
+
+#[test]
+fn add_sub_word_and_long_support_an_source() {
+    let mut rom = vec![0u8; 0x500];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+    // movea.l #$00000003, a0
+    rom[0x100..0x102].copy_from_slice(&0x207Cu16.to_be_bytes());
+    rom[0x102..0x106].copy_from_slice(&0x0000_0003u32.to_be_bytes());
+    // moveq #5, d0
+    rom[0x106..0x108].copy_from_slice(&0x7005u16.to_be_bytes());
+    // add.w a0,d0 ; sub.w a0,d0
+    rom[0x108..0x10A].copy_from_slice(&0xD048u16.to_be_bytes());
+    rom[0x10A..0x10C].copy_from_slice(&0x9048u16.to_be_bytes());
+    // add.l a0,d0 ; sub.l a0,d0
+    rom[0x10C..0x10E].copy_from_slice(&0xD088u16.to_be_bytes());
+    rom[0x10E..0x110].copy_from_slice(&0x9088u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    for _ in 0..6 {
+        cpu.step(&mut memory);
+    }
+
+    assert_eq!(cpu.unknown_opcode_total(), 0);
+    assert_eq!(cpu.d_regs[0], 0x0000_0005);
+}
+
+#[test]
+fn cmpi_rejects_non_data_alterable_destinations() {
+    let mut rom = vec![0u8; 0x500];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+    // Illegal instruction vector #4.
+    rom[0x10..0x14].copy_from_slice(&0x0000_0180u32.to_be_bytes());
+
+    // cmpi.w #$1234,a0 (An direct destination is illegal)
+    rom[0x100..0x102].copy_from_slice(&0x0C48u16.to_be_bytes());
+    rom[0x102..0x104].copy_from_slice(&0x1234u16.to_be_bytes());
+    // cmpi.w #$5678,(4,pc) (PC-relative destination is not alterable)
+    rom[0x104..0x106].copy_from_slice(&0x0C7Au16.to_be_bytes());
+    rom[0x106..0x108].copy_from_slice(&0x5678u16.to_be_bytes());
+    rom[0x108..0x10A].copy_from_slice(&0x0004u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    cpu.pc = 0x0000_0100;
+    cpu.a_regs[7] = cpu.ssp;
+    let c1 = cpu.step(&mut memory);
+    assert_eq!(c1, 34);
+    assert_eq!(cpu.pc(), 0x0000_0180);
+    let sp1 = cpu.a7();
+    assert_eq!(memory.read_u32(sp1 + 2), 0x0000_0102);
+
+    cpu.pc = 0x0000_0104;
+    cpu.a_regs[7] = cpu.ssp;
+    let c2 = cpu.step(&mut memory);
+    assert_eq!(c2, 34);
+    assert_eq!(cpu.pc(), 0x0000_0180);
+    let sp2 = cpu.a7();
+    assert_eq!(memory.read_u32(sp2 + 2), 0x0000_0106);
 }
 
 #[test]
@@ -3215,10 +3786,12 @@ fn stop_halts_fetch_until_interrupt() {
 }
 
 #[test]
-fn move_from_ccr_writes_low_five_flags() {
+fn move_from_ccr_is_illegal_on_68000() {
     let mut rom = vec![0u8; 0x500];
     rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
     rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+    // Illegal instruction vector #4.
+    rom[0x10..0x14].copy_from_slice(&0x0000_0180u32.to_be_bytes());
     // move from ccr to d0
     rom[0x100..0x102].copy_from_slice(&0x42C0u16.to_be_bytes());
 
@@ -3226,10 +3799,448 @@ fn move_from_ccr_writes_low_five_flags() {
     let mut memory = MemoryMap::new(cart);
     let mut cpu = M68k::new();
     cpu.reset(&mut memory);
-    cpu.sr = 0x27_1B;
 
     let cycles = cpu.step(&mut memory);
-    assert_eq!(cycles, 6);
-    assert_eq!(cpu.d_regs[0] & 0xFFFF, 0x001B);
-    assert_eq!(cpu.unknown_opcode_total(), 0);
+    assert_eq!(cycles, 34);
+    assert_eq!(cpu.pc(), 0x0000_0180);
+    assert_eq!(cpu.unknown_opcode_total(), 1);
+}
+
+#[test]
+fn address_error_on_odd_instruction_fetch_stacks_group0_frame() {
+    let mut rom = vec![0u8; 0x400];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    // Start from odd PC to force address error on instruction fetch.
+    rom[0x4..0x8].copy_from_slice(&0x0000_0101u32.to_be_bytes());
+    // Address error vector.
+    rom[0x0C..0x10].copy_from_slice(&0x0000_0200u32.to_be_bytes());
+    // Handler body can be anything simple.
+    rom[0x200..0x202].copy_from_slice(&0x4E71u16.to_be_bytes()); // nop
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    let cycles = cpu.step(&mut memory);
+    assert_eq!(cycles, 50);
+    assert_eq!(cpu.pc(), 0x0000_0200);
+    assert_eq!(cpu.exception_histogram.get(&3).copied(), Some(1));
+
+    // 68000 group-0 frame: 7 words.
+    let sp = cpu.a7();
+    assert_eq!(sp, 0x00FF_1000 - 14);
+    assert_eq!(memory.read_u16(sp), 0x0016); // read + instruction + supervisor program FC
+    assert_eq!(memory.read_u32(sp + 2), 0x0000_0101); // fault address
+    assert_eq!(memory.read_u16(sp + 6), 0x0000); // IR not yet fetched in this path
+    assert_eq!(memory.read_u16(sp + 8), 0x2700); // stacked SR
+    assert_eq!(memory.read_u32(sp + 10), 0x0000_0101); // stacked PC
+}
+
+#[test]
+fn address_error_on_misaligned_word_write_marks_data_write_access() {
+    let mut rom = vec![0u8; 0x800];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+    // Address error vector.
+    rom[0x0C..0x10].copy_from_slice(&0x0000_0200u32.to_be_bytes());
+    rom[0x200..0x202].copy_from_slice(&0x4E71u16.to_be_bytes()); // nop
+
+    // move.w #$1234, $00FF0001 (odd destination -> address error)
+    rom[0x100..0x102].copy_from_slice(&0x33FCu16.to_be_bytes());
+    rom[0x102..0x104].copy_from_slice(&0x1234u16.to_be_bytes());
+    rom[0x104..0x108].copy_from_slice(&0x00FF_0001u32.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    let cycles = cpu.step(&mut memory);
+    assert_eq!(cycles, 50);
+    assert_eq!(cpu.pc(), 0x0000_0200);
+    assert_eq!(cpu.exception_histogram.get(&3).copied(), Some(1));
+
+    let sp = cpu.a7();
+    assert_eq!(sp, 0x00FF_1000 - 14);
+    assert_eq!(memory.read_u16(sp), 0x000D); // write + data + supervisor data FC
+    assert_eq!(memory.read_u32(sp + 2), 0x00FF_0001); // fault address
+    assert_eq!(memory.read_u16(sp + 6), 0x33FC); // faulting instruction word
+    assert_eq!(memory.read_u16(sp + 8), 0x2700); // stacked SR
+    assert_eq!(memory.read_u32(sp + 10), 0x0000_0108); // PC after opcode extensions
+}
+
+#[test]
+fn rte_restores_group0_address_error_stack_frame() {
+    let mut rom = vec![0u8; 0x500];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    // Odd PC forces an address-error exception first.
+    rom[0x4..0x8].copy_from_slice(&0x0000_0101u32.to_be_bytes());
+    // Address error vector.
+    rom[0x0C..0x10].copy_from_slice(&0x0000_0200u32.to_be_bytes());
+    // Handler: rte
+    rom[0x200..0x202].copy_from_slice(&0x4E73u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    let fault_cycles = cpu.step(&mut memory);
+    assert_eq!(fault_cycles, 50);
+    assert_eq!(cpu.pc(), 0x0000_0200);
+    assert_eq!(cpu.a7(), 0x00FF_1000 - 14);
+
+    let rte_cycles = cpu.step(&mut memory);
+    assert_eq!(rte_cycles, 20);
+    assert_eq!(cpu.pc(), 0x0000_0101);
+    assert_eq!(cpu.sr(), 0x2700);
+    assert_eq!(cpu.a7(), 0x00FF_1000);
+}
+
+#[test]
+fn double_address_error_halts_cpu_until_reset() {
+    let mut rom = vec![0u8; 0x800];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    // First instruction fetch from odd PC -> address error.
+    rom[0x4..0x8].copy_from_slice(&0x0000_0101u32.to_be_bytes());
+    // Address error vector handler at 0x0200.
+    rom[0x0C..0x10].copy_from_slice(&0x0000_0200u32.to_be_bytes());
+    // Handler body intentionally causes another address error:
+    // move.w #$1111, $00FF0001 (odd address write)
+    rom[0x200..0x202].copy_from_slice(&0x33FCu16.to_be_bytes());
+    rom[0x202..0x204].copy_from_slice(&0x1111u16.to_be_bytes());
+    rom[0x204..0x208].copy_from_slice(&0x00FF_0001u32.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    let first_fault = cpu.step(&mut memory);
+    assert_eq!(first_fault, 50);
+    assert_eq!(cpu.pc(), 0x0000_0200);
+    assert_eq!(cpu.exception_histogram.get(&3).copied(), Some(1));
+
+    // Second address error during group-0 handling -> hard halt.
+    let second_fault = cpu.step(&mut memory);
+    assert_eq!(second_fault, 0);
+    assert!(cpu.hard_halted);
+    assert_eq!(cpu.exception_histogram.get(&3).copied(), Some(1));
+
+    // Once hard-halted, CPU no longer executes instructions.
+    let pc_after_halt = cpu.pc();
+    let halted_step = cpu.step(&mut memory);
+    assert_eq!(halted_step, 0);
+    assert_eq!(cpu.pc(), pc_after_halt);
+}
+
+#[test]
+fn cpu_reset_recovers_from_double_address_error_halt() {
+    let mut rom = vec![0u8; 0x800];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0101u32.to_be_bytes());
+    rom[0x0C..0x10].copy_from_slice(&0x0000_0200u32.to_be_bytes());
+    // Second fault in handler.
+    rom[0x200..0x202].copy_from_slice(&0x33FCu16.to_be_bytes());
+    rom[0x202..0x204].copy_from_slice(&0x1111u16.to_be_bytes());
+    rom[0x204..0x208].copy_from_slice(&0x00FF_0001u32.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    cpu.step(&mut memory); // first address error
+    cpu.step(&mut memory); // second address error -> hard halt
+    assert!(cpu.hard_halted);
+
+    // CPU-level reset acts as external reset and clears hard-halt state.
+    cpu.reset(&mut memory);
+    assert!(!cpu.hard_halted);
+    assert_eq!(cpu.pc(), 0x0000_0101);
+}
+
+#[test]
+fn write_sr_masks_reserved_bits_on_68000() {
+    let mut rom = vec![0u8; 0x500];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+    // move.w #$FFFF, sr
+    rom[0x100..0x102].copy_from_slice(&0x46FCu16.to_be_bytes());
+    rom[0x102..0x104].copy_from_slice(&0xFFFFu16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    cpu.step(&mut memory);
+    // 68000 exposes only T,S,IPL and CCR bits in SR.
+    assert_eq!(cpu.sr(), 0xA71F);
+}
+
+#[test]
+fn exception_entry_clears_trace_bit() {
+    let mut rom = vec![0u8; 0x600];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+    // TRAP #0 vector -> 0x0200.
+    rom[0x80..0x84].copy_from_slice(&0x0000_0200u32.to_be_bytes());
+    // trap #0
+    rom[0x100..0x102].copy_from_slice(&0x4E40u16.to_be_bytes());
+    // handler nop
+    rom[0x200..0x202].copy_from_slice(&0x4E71u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+    cpu.sr = 0xA700; // trace set, supervisor set
+
+    let cycles = cpu.step(&mut memory);
+    assert_eq!(cycles, 34);
+    assert_eq!(cpu.pc(), 0x0000_0200);
+    assert_eq!(cpu.sr() & 0x8000, 0);
+}
+
+#[test]
+fn trace_bit_raises_trace_exception_before_next_instruction() {
+    let mut rom = vec![0u8; 0x700];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+    // Trace vector #9 -> 0x0200.
+    rom[0x24..0x28].copy_from_slice(&0x0000_0200u32.to_be_bytes());
+
+    // move.w #$A700, sr (set T bit)
+    rom[0x100..0x102].copy_from_slice(&0x46FCu16.to_be_bytes());
+    rom[0x102..0x104].copy_from_slice(&0xA700u16.to_be_bytes());
+    // moveq #1, d0 (must not execute before trace exception)
+    rom[0x104..0x106].copy_from_slice(&0x7001u16.to_be_bytes());
+    // handler: nop
+    rom[0x200..0x202].copy_from_slice(&0x4E71u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    cpu.step(&mut memory); // move.w to sr
+    assert_eq!(cpu.pc(), 0x0000_0104);
+    assert_eq!(cpu.d_regs[0], 0);
+
+    let trace_cycles = cpu.step(&mut memory); // pending trace exception
+    assert_eq!(trace_cycles, 34);
+    assert_eq!(cpu.pc(), 0x0000_0200);
+    assert_eq!(cpu.d_regs[0], 0);
+    assert_eq!(cpu.exception_histogram.get(&9).copied(), Some(1));
+}
+
+#[test]
+fn representative_single_word_opcodes_do_not_fall_back_to_unknown() {
+    // Keep this list focused on one-word opcodes across major decode families.
+    // If dispatch ordering regresses, one or more of these will hit unknown.
+    let opcodes: &[u16] = &[
+        0x4E71, // nop
+        0x4E70, // reset
+        0x4E76, // trapv
+        0x7001, // moveq #1,d0
+        0x4000, // negx.b d0
+        0x4200, // clr.b d0
+        0x4400, // neg.b d0
+        0x4600, // not.b d0
+        0x4A00, // tst.b d0
+        0x4840, // swap d0
+        0x4880, // ext.w d0
+        0x48C0, // ext.l d0
+        0x8000, // or.b d0,d0
+        0x9000, // sub.b d0,d0
+        0xB000, // cmp.b d0,d0
+        0xC000, // and.b d0,d0
+        0xD000, // add.b d0,d0
+        0xE300, // asl.b #1,d0
+        0xD100, // addx.b d0,d0
+        0x9100, // subx.b d0,d0
+        0x4180, // chk.w d0,d0
+        0x80C0, // divu.w d0,d0
+        0x81C0, // divs.w d0,d0
+        0xC0C0, // mulu.w d0,d0
+        0xC1C0, // muls.w d0,d0
+        0xB0C0, // cmpa.w d0,a0
+        0xB1C0, // cmpa.l d0,a0
+        0xD0C0, // adda.w d0,a0
+        0xD1C0, // adda.l d0,a0
+        0x90C0, // suba.w d0,a0
+        0x91C0, // suba.l d0,a0
+        0xC140, // exg d0,d0
+        0xC148, // exg a0,a0
+        0xC188, // exg d0,a0
+        0x40C0, // move sr,d0
+        0x44C0, // move d0,ccr
+    ];
+
+    for &opcode in opcodes {
+        let mut rom = vec![0u8; 0x400];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        rom[0x100..0x102].copy_from_slice(&opcode.to_be_bytes());
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+        // Stable non-zero operands for arithmetic/divide/chk families.
+        cpu.d_regs[0] = 1;
+        cpu.a_regs[0] = 2;
+
+        let cycles = cpu.step(&mut memory);
+        assert!(
+            cycles > 0,
+            "opcode {:04X} must consume positive cycles",
+            opcode
+        );
+        assert_eq!(
+            cpu.unknown_opcode_total(),
+            0,
+            "opcode {:04X} unexpectedly fell back to unknown decode",
+            opcode
+        );
+    }
+}
+
+#[test]
+fn representative_extension_word_opcodes_do_not_fall_back_to_unknown() {
+    // Extension-word coverage across immediate, branch, control-flow and
+    // effective-address decoding paths.
+    let cases: &[(&str, &[u16])] = &[
+        ("ori_to_ccr", &[0x003C, 0x0011]),
+        ("ori_to_sr", &[0x007C, 0x2000]),
+        ("andi_to_ccr", &[0x023C, 0x001F]),
+        ("andi_to_sr", &[0x027C, 0x2700]),
+        ("eori_to_ccr", &[0x0A3C, 0x0001]),
+        ("eori_to_sr", &[0x0A7C, 0x0001]),
+        ("ori_b_imm_d0", &[0x0000, 0x0080]),
+        ("andi_w_imm_d0", &[0x0240, 0x00FF]),
+        ("subi_w_imm_d0", &[0x0440, 0x0001]),
+        ("addi_l_imm_d0", &[0x0680, 0x0000, 0x0001]),
+        ("eori_w_imm_d0", &[0x0A40, 0x00FF]),
+        ("cmpi_l_imm_d0", &[0x0C80, 0x0000, 0x0001]),
+        ("btst_imm_d0", &[0x0800, 0x0000]),
+        ("movea_l_imm_a0", &[0x207C, 0x00FF, 0x0000]),
+        ("lea_d16_a0", &[0x41E8, 0x0002]),
+        ("pea_d16_a0", &[0x4868, 0x0002]),
+        ("movem_l_d0_predec_a7", &[0x48E7, 0x0001]),
+        ("movem_l_postinc_a7_d0", &[0x4CDF, 0x0001]),
+        ("movep_w_mem_to_d0", &[0x0108, 0x0000]),
+        ("move_w_abs_l_d0", &[0x3039, 0x00FF, 0x0000]),
+        ("bra_w", &[0x6000, 0x0000]),
+        ("bsr_w", &[0x6100, 0x0000]),
+        ("bne_w", &[0x6600, 0x0000]),
+        ("jsr_abs_l", &[0x4EB9, 0x0000, 0x0120]),
+        ("jmp_abs_l", &[0x4EF9, 0x0000, 0x0120]),
+    ];
+
+    for &(name, words) in cases {
+        let mut rom = vec![0u8; 0x600];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+        for (i, word) in words.iter().enumerate() {
+            let offset = 0x100 + i * 2;
+            rom[offset..offset + 2].copy_from_slice(&word.to_be_bytes());
+        }
+        // JSR/JMP target body.
+        rom[0x120..0x122].copy_from_slice(&0x4E71u16.to_be_bytes());
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+
+        cpu.d_regs[0] = 1;
+        cpu.a_regs[0] = 0x00FF_0000;
+        memory.write_u32(0x00FF_0000, 0x1122_3344);
+        memory.write_u32(0x00FF_0004, 0x5566_7788);
+
+        let cycles = cpu.step(&mut memory);
+        assert!(cycles > 0, "{name}: instruction must consume cycles");
+        assert_eq!(
+            cpu.unknown_opcode_total(),
+            0,
+            "{name}: decode unexpectedly fell back to unknown",
+        );
+    }
+}
+
+#[test]
+fn representative_exception_and_privileged_opcodes_do_not_fall_back_to_unknown() {
+    fn run_case<F>(name: &str, words: &[u16], setup: F)
+    where
+        F: FnOnce(&mut M68k, &mut MemoryMap),
+    {
+        let mut rom = vec![0u8; 0x1000];
+        rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes());
+        rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+
+        // Exception vectors used by this test.
+        rom[0x10..0x14].copy_from_slice(&0x0000_0300u32.to_be_bytes()); // #4 illegal
+        rom[0x18..0x1C].copy_from_slice(&0x0000_0320u32.to_be_bytes()); // #6 CHK
+        rom[0x1C..0x20].copy_from_slice(&0x0000_0340u32.to_be_bytes()); // #7 TRAPV
+        rom[0x20..0x24].copy_from_slice(&0x0000_0360u32.to_be_bytes()); // #8 privilege
+        rom[0x28..0x2C].copy_from_slice(&0x0000_0380u32.to_be_bytes()); // #10 line A
+        rom[0x2C..0x30].copy_from_slice(&0x0000_03A0u32.to_be_bytes()); // #11 line F
+        rom[0x80..0x84].copy_from_slice(&0x0000_03C0u32.to_be_bytes()); // #32 trap #0
+        // Minimal handlers.
+        rom[0x300..0x302].copy_from_slice(&0x4E71u16.to_be_bytes());
+        rom[0x320..0x322].copy_from_slice(&0x4E71u16.to_be_bytes());
+        rom[0x340..0x342].copy_from_slice(&0x4E71u16.to_be_bytes());
+        rom[0x360..0x362].copy_from_slice(&0x4E71u16.to_be_bytes());
+        rom[0x380..0x382].copy_from_slice(&0x4E71u16.to_be_bytes());
+        rom[0x3A0..0x3A2].copy_from_slice(&0x4E71u16.to_be_bytes());
+        rom[0x3C0..0x3C2].copy_from_slice(&0x4E71u16.to_be_bytes());
+
+        for (i, word) in words.iter().enumerate() {
+            let offset = 0x100 + i * 2;
+            rom[offset..offset + 2].copy_from_slice(&word.to_be_bytes());
+        }
+
+        let cart = Cartridge::from_bytes(rom).expect("valid rom");
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+        setup(&mut cpu, &mut memory);
+
+        let cycles = cpu.step(&mut memory);
+        assert!(
+            cycles > 0,
+            "{name}: instruction must consume positive cycles"
+        );
+        assert_eq!(
+            cpu.unknown_opcode_total(),
+            0,
+            "{name}: decode unexpectedly fell back to unknown"
+        );
+    }
+
+    run_case("reset", &[0x4E70], |_cpu, _memory| {});
+    run_case("stop", &[0x4E72, 0x2000], |_cpu, _memory| {});
+    run_case("trap_0", &[0x4E40], |_cpu, _memory| {});
+    run_case("trapv_clear", &[0x4E76], |_cpu, _memory| {});
+    run_case("trapv_set", &[0x4E76], |cpu, _memory| {
+        cpu.sr |= CCR_V;
+    });
+    run_case("rtr", &[0x4E77], |cpu, memory| {
+        memory.write_u16(cpu.a_regs[7], 0x0015);
+        memory.write_u32(cpu.a_regs[7] + 2, 0x0000_0120);
+    });
+    run_case("rte", &[0x4E73], |cpu, memory| {
+        memory.write_u16(cpu.a_regs[7], 0x2700);
+        memory.write_u32(cpu.a_regs[7] + 2, 0x0000_0120);
+    });
+    run_case("illegal_opcode", &[0x4AFC], |_cpu, _memory| {});
+    run_case("bkpt_68000", &[0x4848], |_cpu, _memory| {});
+    run_case("line_a", &[0xA000], |_cpu, _memory| {});
+    run_case("line_f", &[0xF000], |_cpu, _memory| {});
+    run_case("move_to_sr_imm", &[0x46FC, 0x2700], |_cpu, _memory| {});
 }
