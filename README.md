@@ -1,54 +1,101 @@
 # Mega Drive Emulator (Rust)
 
-Rustでメガドライブ（Genesis）エミュレーターを実装するための初期ワークスペースです。
+Rustで実装している Mega Drive / Genesis エミュレーターです。
+68000 + Z80 + VDP + YM2612/PSG を `crates/core` に集約し、`crates/cli` で SDL/egui フロントエンドを提供しています。
 
-## 構成
+現在は「実機互換性を崩さずに動作範囲を広げる」ことを優先し、実 ROM での検証と回帰テストを併用して改善を進めています。
 
-- `crates/core`:
-  - エミュレーター本体の土台
-  - `Cartridge`（ROM読み込み/ヘッダ解析）
-  - `MemoryMap`（ROM + Work RAM + VDP + I/Oポート + Z80制御 + Z80 RAM窓口 + YM2612/PSGポート）
-  - `M68k`（最小命令: `NOP` / `BRA` / `BSR` / `Bcc`（`BEQ/BNE/BCC/BCS/BPL/BMI/...`）/ `CMPI` / `CMP` / `TST` / `CLR` / `ORI` / `ANDI` / `EORI` / `ADDI` / `SUBI` / `ADDQ` / `SUBQ` / `Scc` / `DBcc` / `MOVEQ` / `MOVE`一部（`MOVE.B/W/L` + `MOVE to/from SR`）/ `MOVEM.W/L`（主要EA）/ `MOVEA` / `ADDA` / `MULU.W` / `MULS.W` / `DIVU.W` / `DIVS.W` / `AND` / `OR` / `EOR` / `ADD` / `SUB` / `SWAP` / `EXT.W/L` / `LINK` / `UNLK` / `LEA` / `PEA` / `BTST/BCHG/BCLR/BSET`（即値/動的）/ `JSR` / `JMP` / `RTS` / `TRAP` / `RTE` / `ILLEGAL` + VDP VBlank割り込みオートベクタ）
-  - アドレッシング（実装済み範囲）: `Dn` / `(An)` / `(An)+` / `-(An)` / `(d16,An)` / `(d8,An,Xn)` / `(abs.w)` / `(abs.l)` / `(d16,PC)` / `(d8,PC,Xn)` / 一部 `#imm`
-  - `Vdp`（VRAM/CRAM/VSRAM + 最小タイル描画 + Windowプレーン（簡易） + Plane A全画面H/Vスクロール（簡易） + 最小スプライト描画（SAT参照） + Plane/Sprite優先度（簡易） + DMA fill/copy + 68k->VDP DMA（簡易） + data/control/HV-counterポート副作用 + auto-increment + 背景色レジスタ反映 + register副作用 + ROMリージョン連動のNTSC/PALタイミング切替）
-  - `IoBus`（3ボタン/6ボタンパッド入力、1P/2P）
-  - `Z80`（BUSREQ/RESETレジスタ、BUSREQ→BUSACK遅延、Z80 RAM、サイクル進行スタブ）
-  - `AudioBus`（YM2612レジスタ書き込み/PSG書き込み + 簡易モノラルサンプル生成スタブ）
-  - `Emulator`（stepループ）
-- `crates/cli`:
-  - ROMを読み込んでヘッダ情報を表示
-  - SDL2ウィンドウを開いてタイトルを表示
-  - VDPのVRAM/CRAMから生成したフレームバッファを描画
-  - `AudioBus` のサンプルを SDL2 `AudioQueue` へ送って再生
-  - キー入力
-    - 1P: 十字キー + `A`/`Z`/`X`/`Enter`（`A/B/C/Start`）、`S`/`D`/`F`/`Q`（`X/Y/Z/Mode`）
-    - 2P: `I`/`J`/`K`/`L` + `R`/`T`/`Y`/`Right Shift`（`A/B/C/Start`）、`U`/`O`/`P`/`/`（`X/Y/Z/Mode`）
+## Implemented
+- 68000 コア（主要命令群、例外処理、割り込み、主要アドレッシングモード）
+- Z80 コア（命令実行、BUSREQ/RESET、68k との RAM バス仲裁）
+- VDP（VRAM/CRAM/VSRAM、plane/sprite 合成、スクロール、window、DMA、NTSC/PAL タイミング）
+- 入力（1P/2P、3ボタン/6ボタン）
+- 音源経路（YM2612/PSG のレジスタモデルと出力ミキシング）
+- チート UI（egui）
+  - Hex Viewer
+  - Cheat Search（スナップショット比較）
+  - Cheat の有効/無効、編集、JSON保存/読込
+- 診断ツール
+  - `opcode_profile`（未知 opcode/例外/VDP DMA 追跡）
+  - `dump_frame.sh`（フレーム/ログ/各種 VDP 診断ダンプ）
 
-## 使い方
-
+## Quick Start
+推奨（release + チート UI 有効）:
 ```bash
-cargo test
-cargo run -p megadrive-cli -- path/to/rom.bin
+./run.sh roms/<game>.md
+./run.sh roms/<game>.md --boot-frames 600
 ```
 
-`megadrive-cli` は SDL2 ウィンドウを開き、ROM の国内向けタイトルをウィンドウタイトルに表示します。  
-終了はウィンドウを閉じるか `Esc` キーです。
-
-`run.sh` で release 実行できます。
-
+従来 SDL フロントエンド（egui なし）:
 ```bash
-./run.sh path/to/rom.bin
-./run.sh path/to/rom.bin --boot-frames 600
-./run.sh --no-egui path/to/rom.bin
+./run.sh --no-egui roms/<game>.md
 ```
 
-起動前の高速スキップは `--boot-frames` を優先し、未指定時は環境変数 `MEGADRIVE_BOOT_FRAMES` を参照します。  
-コントローラ種別は `MEGADRIVE_PAD1` / `MEGADRIVE_PAD2` (`3` または `6`) で切り替えできます（既定は `3`）。
-`run.sh` はデフォルトで `Tab` で表示できるチートパネル付き（Hex Viewer + Cheat Search）の OpenGL/egui フロントエンドを起動します。チートは `cheats/<ROM名>.json` に保存できます。従来の SDL フロントエンドで起動したい場合は `--no-egui` を指定してください。
+直接起動:
+```bash
+cargo run -p megadrive-cli --bin megadrive-egui -- roms/<game>.md
+cargo run -p megadrive-cli --bin megadrive-cli -- roms/<game>.md
+```
 
-## 次に実装する候補
+補足:
+- `run.sh` はデフォルトで `megadrive-egui` を起動します。
+- 起動前スキップは `--boot-frames` か `MEGADRIVE_BOOT_FRAMES` を使用します。
+- パッド種別は `MEGADRIVE_PAD1` / `MEGADRIVE_PAD2` に `3` または `6` を指定します。
 
-1. 68000命令の拡張（`MOVE.B` / `ORI/ANDI` / 例外命令）
-2. VDP描画精度向上（H/Vセルスクロール・優先度・sprite制限）とDMA精密化
-3. Z80 RAM・68k/Z80バス仲裁の詳細化（現在は簡易BUSACK遅延モデル）
-4. YM2612/PSGの実音生成とミキサー
+## Controls
+- 1P
+  - 十字: `↑ ↓ ← →`
+  - `A/B/C`: `A / Z / X`
+  - `X/Y/Z`: `S / D / F`
+  - `Start/Mode`: `Enter / Q`
+- 2P
+  - 十字: `I K J L`
+  - `A/B/C`: `R / T / Y`
+  - `X/Y/Z`: `U / O / P`
+  - `Start/Mode`: `Right Shift / /`
+- 共通
+  - 終了: `Esc`
+  - チートパネル表示切替（egui版）: `Tab`
+
+## Cheat UI
+- チートファイルは `cheats/<ROM名>.json` に保存されます。
+- Hex Viewer から直接 WRAM を編集できます。
+- Cheat Search はスナップショット比較で候補を絞り込み、候補をそのまま Cheat へ追加できます。
+
+## Debugging Tools
+フレームダンプ（`opcode_profile` ラッパー）:
+```bash
+./dump_frame.sh roms/<game>.md --steps 11000000 --out /tmp/frame.png
+./dump_frame.sh roms/<game>.md --stop-frame 900 --dump-line-state
+```
+
+`opcode_profile` 直接実行:
+```bash
+cargo run --release -p megadrive-cli --bin opcode_profile -- roms/<game>.md 12000000
+```
+
+## Project Layout
+- `crates/core`: CPU/Z80/VDP/Audio/MemoryMap/入力などエミュレータ本体
+- `crates/cli`: 実行フロントエンド (`megadrive-cli`, `megadrive-egui`, `opcode_profile`)
+- `run.sh`: release ランチャー（デフォルト egui）
+- `dump_frame.sh`: フレーム/診断ダンプ用スクリプト
+- `roms/`: 手動検証用 ROM（ローカル）
+- `tests`/`crates/core/tests`: 回帰テスト群
+
+## Development Commands
+```bash
+cargo fmt
+cargo test -q
+cargo test -q -p megadrive-core
+cargo test -q -p megadrive-cli
+cargo check -q
+```
+
+## Known Limitations
+- 命令/タイミング/バス仲裁は継続実装中で、タイトル依存の描画/音声差異が残る場合があります。
+- VDP の一部エッジケース（特殊スクロールや優先度競合）は改善途中です。
+- YM2612/PSG の完全な実機一致（微細なエンベロープ/ミキシング差）は未完です。
+
+## License
+
+教育・研究目的の実装です。
