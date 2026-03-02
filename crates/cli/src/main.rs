@@ -1,12 +1,11 @@
 use std::error::Error;
 use std::io;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use megadrive_core::{Button, Cartridge, ControllerType, Emulator, FRAME_HEIGHT, FRAME_WIDTH};
 use sdl2::audio::AudioSpecDesired;
 use sdl2::event::Event;
-use sdl2::keyboard::Keycode;
+use sdl2::keyboard::{Keycode, Mod};
 use sdl2::pixels::{Color, PixelFormatEnum};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +44,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("Region       : {}", header.region);
     println!("Controller 1 : {}", controller_type_label(pad1_type));
     println!("Controller 2 : {}", controller_type_label(pad2_type));
+    println!("State hotkey : Ctrl+0..9 save / 0..9 load");
     if boot_frames > 0 {
         fast_forward_boot_frames(&mut emulator, boot_frames);
         println!("Boot skip    : {} frames", boot_frames);
@@ -234,12 +234,9 @@ fn run_window_loop(
     let audio_queue_target_frames = ((output_sample_rate_hz as usize) / 10).clamp(2_048, 8_192);
     let audio_queue_feed_frames = (audio_queue_target_frames / 2).max(1_024);
     audio_queue.resume();
-
-    let frame_budget = Duration::from_nanos(16_666_667);
+    let mut state_slots: [Option<Emulator>; 10] = std::array::from_fn(|_| None);
 
     'running: loop {
-        let frame_start = Instant::now();
-
         for event in events.poll_iter() {
             match event {
                 Event::Quit { .. } => break 'running,
@@ -249,9 +246,24 @@ fn run_window_loop(
                 } => break 'running,
                 Event::KeyDown {
                     keycode: Some(key),
+                    keymod,
                     repeat: false,
                     ..
                 } => {
+                    if let Some(slot) = state_slot_from_keycode(key) {
+                        if keymod_has_ctrl(keymod) {
+                            state_slots[slot] = Some(emulator.clone());
+                            println!("Saved state slot {}", slot);
+                        } else if let Some(saved) = &state_slots[slot] {
+                            *emulator = saved.clone();
+                            emulator.set_audio_output_sample_rate_hz(output_sample_rate_hz);
+                            audio_queue.clear();
+                            println!("Loaded state slot {}", slot);
+                        } else {
+                            println!("State slot {} is empty", slot);
+                        }
+                        continue;
+                    }
                     if let Some((player, button)) = map_keycode_to_player_button(key) {
                         set_button_state(emulator, player, button, true);
                     }
@@ -299,11 +311,6 @@ fn run_window_loop(
             .copy(&frame_texture, None, None)
             .map_err(|err| io::Error::other(err.to_string()))?;
         canvas.present();
-
-        let elapsed = frame_start.elapsed();
-        if elapsed < frame_budget {
-            std::thread::sleep(frame_budget - elapsed);
-        }
     }
 
     Ok(())
@@ -375,9 +382,33 @@ fn map_keycode_to_player_button(key: Keycode) -> Option<(u8, Button)> {
     }
 }
 
+fn state_slot_from_keycode(key: Keycode) -> Option<usize> {
+    match key {
+        Keycode::Num0 | Keycode::Kp0 => Some(0),
+        Keycode::Num1 | Keycode::Kp1 => Some(1),
+        Keycode::Num2 | Keycode::Kp2 => Some(2),
+        Keycode::Num3 | Keycode::Kp3 => Some(3),
+        Keycode::Num4 | Keycode::Kp4 => Some(4),
+        Keycode::Num5 | Keycode::Kp5 => Some(5),
+        Keycode::Num6 | Keycode::Kp6 => Some(6),
+        Keycode::Num7 | Keycode::Kp7 => Some(7),
+        Keycode::Num8 | Keycode::Kp8 => Some(8),
+        Keycode::Num9 | Keycode::Kp9 => Some(9),
+        _ => None,
+    }
+}
+
+fn keymod_has_ctrl(keymod: Mod) -> bool {
+    keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CliOptions, convert_audio_channels, parse_cli_options};
+    use super::{
+        CliOptions, convert_audio_channels, keymod_has_ctrl, parse_cli_options,
+        state_slot_from_keycode,
+    };
+    use sdl2::keyboard::{Keycode, Mod};
 
     #[test]
     fn parses_rom_only() {
@@ -438,5 +469,21 @@ mod tests {
     fn duplicates_mono_to_stereo() {
         let out = convert_audio_channels(&[10, -20, 30], 1, 2);
         assert_eq!(out, vec![10, 10, -20, -20, 30, 30]);
+    }
+
+    #[test]
+    fn maps_number_keys_to_state_slots() {
+        assert_eq!(state_slot_from_keycode(Keycode::Num0), Some(0));
+        assert_eq!(state_slot_from_keycode(Keycode::Num5), Some(5));
+        assert_eq!(state_slot_from_keycode(Keycode::Num9), Some(9));
+        assert_eq!(state_slot_from_keycode(Keycode::Kp3), Some(3));
+        assert_eq!(state_slot_from_keycode(Keycode::A), None);
+    }
+
+    #[test]
+    fn detects_ctrl_modifier() {
+        assert!(keymod_has_ctrl(Mod::LCTRLMOD));
+        assert!(keymod_has_ctrl(Mod::RCTRLMOD));
+        assert!(!keymod_has_ctrl(Mod::NOMOD));
     }
 }

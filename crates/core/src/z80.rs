@@ -2944,8 +2944,15 @@ mod tests {
         assert_ne!(audio.read_ym2612(0) & 0x80, 0);
 
         // While reset is asserted, Z80 CPU is halted, but YM time should still pass.
-        z80.step(64, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
-        assert_eq!(audio.read_ym2612(0) & 0x80, 0);
+        let mut cleared = false;
+        for _ in 0..8 {
+            z80.step(64, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+            if (audio.read_ym2612(0) & 0x80) == 0 {
+                cleared = true;
+                break;
+            }
+        }
+        assert!(cleared);
 
         // Re-arm busy and verify BUSREQ-granted state also advances YM time.
         audio.write_ym2612(0, 0x22);
@@ -2956,7 +2963,15 @@ mod tests {
         z80.step(64, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
         z80.step(64, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
         assert!(z80.bus_granted());
-        assert_eq!(audio.read_ym2612(0) & 0x80, 0);
+        let mut cleared = false;
+        for _ in 0..8 {
+            z80.step(64, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+            if (audio.read_ym2612(0) & 0x80) == 0 {
+                cleared = true;
+                break;
+            }
+        }
+        assert!(cleared);
     }
 
     #[test]

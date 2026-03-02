@@ -10,41 +10,38 @@ enum YmEnvelopePhase {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct YmChannel {
-    fnum: u16,
-    block: u8,
-    key_on: bool,
-    phase: f32,
-    algorithm: u8,
-    feedback: u8,
-    feedback_sample: f32,
-    pan_left: bool,
-    pan_right: bool,
-    carrier_mul: u8,
-    carrier_tl: u8,
+struct YmOperator {
+    detune: u8,
+    mul: u8,
+    tl: u8,
+    key_scale: u8,
+    am_enable: bool,
+    ssg_eg: u8,
+    ssg_invert: bool,
+    ssg_hold_active: bool,
     attack_rate: u8,
     decay_rate: u8,
     sustain_rate: u8,
     sustain_level: u8,
     release_rate: u8,
+    key_on: bool,
+    phase: f32,
     envelope_phase: YmEnvelopePhase,
     envelope_level: f32,
+    last_output: f32,
 }
 
-impl Default for YmChannel {
+impl Default for YmOperator {
     fn default() -> Self {
         Self {
-            fnum: 0x200,
-            block: 4,
-            key_on: false,
-            phase: 0.0,
-            algorithm: 0,
-            feedback: 0,
-            feedback_sample: 0.0,
-            pan_left: true,
-            pan_right: true,
-            carrier_mul: 1,
-            carrier_tl: 0,
+            detune: 0,
+            mul: 1,
+            tl: 0,
+            key_scale: 0,
+            am_enable: false,
+            ssg_eg: 0,
+            ssg_invert: false,
+            ssg_hold_active: false,
             attack_rate: 31,
             decay_rate: 0,
             sustain_rate: 0,
@@ -52,8 +49,48 @@ impl Default for YmChannel {
             // Keep default release short to avoid lingering notes when a game
             // hasn't initialized operator envelopes yet.
             release_rate: 15,
+            key_on: false,
+            phase: 0.0,
             envelope_phase: YmEnvelopePhase::Off,
             envelope_level: 0.0,
+            last_output: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct YmChannel {
+    fnum: u16,
+    block: u8,
+    special_fnum: [u16; 3],
+    special_block: [u8; 3],
+    algorithm: u8,
+    feedback: u8,
+    feedback_sample: f32,
+    feedback_sample_prev: f32,
+    pan_left: bool,
+    pan_right: bool,
+    ams: u8,
+    fms: u8,
+    operators: [YmOperator; 4],
+}
+
+impl Default for YmChannel {
+    fn default() -> Self {
+        Self {
+            fnum: 0x200,
+            block: 4,
+            special_fnum: [0x200; 3],
+            special_block: [4; 3],
+            algorithm: 0,
+            feedback: 0,
+            feedback_sample: 0.0,
+            feedback_sample_prev: 0.0,
+            pan_left: true,
+            pan_right: true,
+            ams: 0,
+            fms: 0,
+            operators: [YmOperator::default(); 4],
         }
     }
 }
@@ -75,6 +112,9 @@ pub struct Ym2612 {
     timer_b_elapsed_ym_cycles: u64,
     dac_enabled: bool,
     dac_output: i16,
+    lfo_enabled: bool,
+    lfo_rate: u8,
+    lfo_phase: f32,
     channels: [YmChannel; 6],
 }
 
@@ -96,39 +136,66 @@ impl Default for Ym2612 {
             timer_b_elapsed_ym_cycles: 0,
             dac_enabled: false,
             dac_output: 0,
+            lfo_enabled: false,
+            lfo_rate: 0,
+            lfo_phase: 0.0,
             channels: [YmChannel::default(); 6],
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YmOperatorParam {
+    Mul,
+    Tl,
+    Attack,
+    Decay,
+    SustainRate,
+    SustainRelease,
+    SsgEg,
+}
+
 impl Ym2612 {
-    // YM2612 busy flag is asserted for a short write-cycle window.
-    // Approximate in Z80 cycles (about a few microseconds).
-    const BUSY_DURATION_Z80_CYCLES: u32 = 16;
+    // YM2612 BUSY stays asserted for 32 YM clocks after each port write.
+    const BUSY_DURATION_YM_CYCLES: u64 = 32;
     const MASTER_CLOCK_HZ: u64 = 7_670_454;
     const Z80_CLOCK_HZ: u64 = 3_579_545;
     const YM2612_DIVIDER: u64 = 7;
+    const BUSY_DURATION_Z80_CYCLES: u32 =
+        ((Self::BUSY_DURATION_YM_CYCLES * Self::Z80_CLOCK_HZ * Self::YM2612_DIVIDER
+            + (Self::MASTER_CLOCK_HZ - 1))
+            / Self::MASTER_CLOCK_HZ) as u32;
 
     fn write_port(&mut self, port: u8, value: u8) {
         match port & 0x03 {
-            0 => self.addr_port0 = value,
+            0 => {
+                self.addr_port0 = value;
+                self.arm_busy();
+            }
             1 => {
                 let reg = self.addr_port0;
                 self.regs[0][reg as usize] = value;
                 self.apply_write(0, reg, value);
                 self.writes += 1;
-                self.busy_z80_cycles = Self::BUSY_DURATION_Z80_CYCLES;
+                self.arm_busy();
             }
-            2 => self.addr_port1 = value,
+            2 => {
+                self.addr_port1 = value;
+                self.arm_busy();
+            }
             3 => {
                 let reg = self.addr_port1;
                 self.regs[1][reg as usize] = value;
                 self.apply_write(1, reg, value);
                 self.writes += 1;
-                self.busy_z80_cycles = Self::BUSY_DURATION_Z80_CYCLES;
+                self.arm_busy();
             }
             _ => {}
         }
+    }
+
+    fn arm_busy(&mut self) {
+        self.busy_z80_cycles = Self::BUSY_DURATION_Z80_CYCLES;
     }
 
     fn apply_write(&mut self, bank: usize, reg: u8, value: u8) {
@@ -138,29 +205,66 @@ impl Ym2612 {
             self.channels[channel].fnum =
                 (self.channels[channel].fnum & 0x00FF) | (((value & 0x07) as u16) << 8);
             self.channels[channel].block = (value >> 3) & 0x07;
+        } else if let Some(slot) = self.decode_channel3_special_low(bank, reg) {
+            let channel = &mut self.channels[2];
+            channel.special_fnum[slot] = (channel.special_fnum[slot] & 0x0700) | value as u16;
+        } else if let Some(slot) = self.decode_channel3_special_high(bank, reg) {
+            let channel = &mut self.channels[2];
+            channel.special_fnum[slot] =
+                (channel.special_fnum[slot] & 0x00FF) | (((value & 0x07) as u16) << 8);
+            channel.special_block[slot] = (value >> 3) & 0x07;
         } else if let Some(channel) = self.decode_pan_channel(bank, reg) {
             self.channels[channel].pan_left = (value & 0x80) != 0;
             self.channels[channel].pan_right = (value & 0x40) != 0;
+            self.channels[channel].ams = (value >> 4) & 0x03;
+            self.channels[channel].fms = value & 0x07;
         } else if let Some(channel) = self.decode_algorithm_channel(bank, reg) {
             self.channels[channel].algorithm = value & 0x07;
             self.channels[channel].feedback = (value >> 3) & 0x07;
-        } else if let Some(channel) = self.decode_carrier_mul_channel(bank, reg) {
-            self.channels[channel].carrier_mul = value & 0x0F;
-        } else if let Some(channel) = self.decode_carrier_tl_channel(bank, reg) {
-            self.channels[channel].carrier_tl = value & 0x7F;
-        } else if let Some(channel) = self.decode_carrier_attack_channel(bank, reg) {
-            self.channels[channel].attack_rate = value & 0x1F;
-        } else if let Some(channel) = self.decode_carrier_decay_channel(bank, reg) {
-            self.channels[channel].decay_rate = value & 0x1F;
-        } else if let Some(channel) = self.decode_carrier_sustain_rate_channel(bank, reg) {
-            self.channels[channel].sustain_rate = value & 0x1F;
-        } else if let Some(channel) = self.decode_carrier_sustain_release_channel(bank, reg) {
-            self.channels[channel].sustain_level = (value >> 4) & 0x0F;
-            self.channels[channel].release_rate = value & 0x0F;
+        } else if let Some((channel, slot, param)) = Self::decode_operator_target(bank, reg) {
+            let op = &mut self.channels[channel].operators[slot];
+            match param {
+                YmOperatorParam::Mul => {
+                    op.detune = (value >> 4) & 0x07;
+                    op.mul = value & 0x0F;
+                }
+                YmOperatorParam::Tl => {
+                    op.tl = value & 0x7F;
+                }
+                YmOperatorParam::Attack => {
+                    op.key_scale = (value >> 6) & 0x03;
+                    op.attack_rate = value & 0x1F;
+                }
+                YmOperatorParam::Decay => {
+                    op.am_enable = (value & 0x80) != 0;
+                    op.decay_rate = value & 0x1F;
+                }
+                YmOperatorParam::SustainRate => {
+                    op.sustain_rate = value & 0x1F;
+                }
+                YmOperatorParam::SustainRelease => {
+                    op.sustain_level = (value >> 4) & 0x0F;
+                    op.release_rate = value & 0x0F;
+                }
+                YmOperatorParam::SsgEg => {
+                    op.ssg_eg = value & 0x0F;
+                    if (op.ssg_eg & 0x08) == 0 {
+                        op.ssg_invert = false;
+                        op.ssg_hold_active = false;
+                    }
+                }
+            }
         }
 
         if bank == 0 {
             match reg {
+                0x22 => {
+                    self.lfo_enabled = (value & 0x08) != 0;
+                    self.lfo_rate = value & 0x07;
+                    if !self.lfo_enabled {
+                        self.lfo_phase = 0.0;
+                    }
+                }
                 0x24 => {
                     self.timer_a_value = (self.timer_a_value & 0x0003) | ((value as u16) << 2);
                 }
@@ -171,7 +275,6 @@ impl Ym2612 {
                     self.timer_b_value = value;
                 }
                 0x27 => {
-                    let previous = self.timer_control;
                     self.timer_control = value;
                     if (value & 0x10) != 0 {
                         self.timer_status &= !0x01;
@@ -179,30 +282,45 @@ impl Ym2612 {
                     if (value & 0x20) != 0 {
                         self.timer_status &= !0x02;
                     }
-                    if (value & 0x01) != 0 && (previous & 0x01) == 0 {
+                    if (value & 0x01) != 0 {
                         self.timer_a_elapsed_ym_cycles = 0;
                     }
-                    if (value & 0x02) != 0 && (previous & 0x02) == 0 {
+                    if (value & 0x02) != 0 {
                         self.timer_b_elapsed_ym_cycles = 0;
                     }
                 }
                 0x28 => {
                     if let Some(channel) = Self::decode_keyon_channel(value) {
-                        let next_key_on = (value & 0xF0) != 0;
-                        if next_key_on && !self.channels[channel].key_on {
-                            self.channels[channel].phase = 0.0;
-                            self.channels[channel].feedback_sample = 0.0;
-                            self.channels[channel].envelope_phase = YmEnvelopePhase::Attack;
-                            self.channels[channel].envelope_level = 0.0;
-                        } else if !next_key_on && self.channels[channel].key_on {
-                            self.channels[channel].envelope_phase =
-                                if self.channels[channel].envelope_level > 0.0 {
+                        let mut reset_feedback = false;
+                        let slot_mask = (value >> 4) & 0x0F;
+                        for op_index in 0..4 {
+                            let next_key_on =
+                                Self::keyon_slot_mask_targets_operator(slot_mask, op_index);
+                            let op = &mut self.channels[channel].operators[op_index];
+                            if next_key_on && !op.key_on {
+                                op.phase = 0.0;
+                                op.last_output = 0.0;
+                                op.envelope_phase = YmEnvelopePhase::Attack;
+                                op.envelope_level = 0.0;
+                                op.ssg_invert = false;
+                                op.ssg_hold_active = false;
+                                if op_index == 0 {
+                                    reset_feedback = true;
+                                }
+                            } else if !next_key_on && op.key_on {
+                                op.envelope_phase = if op.envelope_level > 0.0 {
                                     YmEnvelopePhase::Release
                                 } else {
                                     YmEnvelopePhase::Off
                                 };
+                                op.ssg_hold_active = false;
+                            }
+                            op.key_on = next_key_on;
                         }
-                        self.channels[channel].key_on = next_key_on;
+                        if reset_feedback {
+                            self.channels[channel].feedback_sample = 0.0;
+                            self.channels[channel].feedback_sample_prev = 0.0;
+                        }
                     }
                 }
                 0x2A => {
@@ -234,6 +352,22 @@ impl Ym2612 {
         }
     }
 
+    fn decode_channel3_special_low(&self, bank: usize, reg: u8) -> Option<usize> {
+        if bank == 0 && (0xA8..=0xAA).contains(&reg) {
+            Some((reg - 0xA8) as usize)
+        } else {
+            None
+        }
+    }
+
+    fn decode_channel3_special_high(&self, bank: usize, reg: u8) -> Option<usize> {
+        if bank == 0 && (0xAC..=0xAE).contains(&reg) {
+            Some((reg - 0xAC) as usize)
+        } else {
+            None
+        }
+    }
+
     fn decode_keyon_channel(value: u8) -> Option<usize> {
         match value & 0x07 {
             0 => Some(0),
@@ -243,6 +377,16 @@ impl Ym2612 {
             5 => Some(4),
             6 => Some(5),
             _ => None,
+        }
+    }
+
+    fn keyon_slot_mask_targets_operator(slot_mask: u8, op_index: usize) -> bool {
+        // YM2612 key-on bits: b4=OP1, b5=OP3, b6=OP2, b7=OP4.
+        match op_index.min(3) {
+            0 => (slot_mask & 0b0001) != 0, // OP1 (b4)
+            1 => (slot_mask & 0b0100) != 0, // OP2 (b6)
+            2 => (slot_mask & 0b0010) != 0, // OP3 (b5)
+            _ => (slot_mask & 0b1000) != 0, // OP4 (b7)
         }
     }
 
@@ -262,84 +406,195 @@ impl Ym2612 {
         }
     }
 
-    fn decode_carrier_mul_channel(&self, bank: usize, reg: u8) -> Option<usize> {
-        if (0x3C..=0x3E).contains(&reg) {
-            Some((bank & 1) * 3 + (reg as usize - 0x3C))
+    fn decode_operator_target(bank: usize, reg: u8) -> Option<(usize, usize, YmOperatorParam)> {
+        let param = match reg & 0xF0 {
+            0x30 => YmOperatorParam::Mul,
+            0x40 => YmOperatorParam::Tl,
+            0x50 => YmOperatorParam::Attack,
+            0x60 => YmOperatorParam::Decay,
+            0x70 => YmOperatorParam::SustainRate,
+            0x80 => YmOperatorParam::SustainRelease,
+            0x90 => YmOperatorParam::SsgEg,
+            _ => return None,
+        };
+
+        let low = reg & 0x0F;
+        if (low & 0x03) == 0x03 {
+            return None;
+        }
+        let channel_in_bank = (low & 0x03) as usize;
+        if channel_in_bank >= 3 {
+            return None;
+        }
+        let slot_group = (low >> 2) as usize;
+        let slot = match slot_group {
+            0 => 0, // OP1
+            1 => 2, // OP3
+            2 => 1, // OP2
+            3 => 3, // OP4
+            _ => return None,
+        };
+        let channel = (bank & 1) * 3 + channel_in_bank;
+        Some((channel, slot, param))
+    }
+
+    fn fnum_block_frequency_hz(fnum: u16, block: u8) -> f32 {
+        // OPN2/2612 pitch approximation:
+        // f ~= FNUM * 2^(BLOCK-1) * (master / (144 * 2^20))
+        // This keeps pitch much closer to real hardware than the previous
+        // A3-relative heuristic.
+        let base = Self::MASTER_CLOCK_HZ as f32 / (144.0 * 1_048_576.0);
+        let octave_scale = 2f32.powi(block as i32 - 1);
+        let freq = (fnum.max(1) as f32) * octave_scale * base;
+        freq.clamp(5.0, 14_000.0)
+    }
+
+    fn channel_base_frequency_hz(channel: &YmChannel) -> f32 {
+        Self::fnum_block_frequency_hz(channel.fnum, channel.block)
+    }
+
+    fn block_fnum_keycode(block: u8, fnum: u16) -> u8 {
+        ((block & 0x07) << 2) | (((fnum >> 8) & 0x03) as u8)
+    }
+
+    fn channel_keycode(channel: &YmChannel) -> u8 {
+        // 5-bit note code used by key-scale rate approximation.
+        Self::block_fnum_keycode(channel.block, channel.fnum)
+    }
+
+    fn channel3_special_mode_enabled(&self) -> bool {
+        (self.channel3_mode_bits() & 0x01) != 0
+    }
+
+    fn channel_operator_base_frequency_hz(
+        channel: &YmChannel,
+        operator_index: usize,
+        channel3_special_mode: bool,
+    ) -> f32 {
+        if channel3_special_mode && operator_index > 0 {
+            let slot = (operator_index - 1).min(2);
+            Self::fnum_block_frequency_hz(channel.special_fnum[slot], channel.special_block[slot])
         } else {
-            None
+            Self::channel_base_frequency_hz(channel)
         }
     }
 
-    fn decode_carrier_tl_channel(&self, bank: usize, reg: u8) -> Option<usize> {
-        if (0x4C..=0x4E).contains(&reg) {
-            Some((bank & 1) * 3 + (reg as usize - 0x4C))
+    fn channel_operator_keycode(
+        channel: &YmChannel,
+        operator_index: usize,
+        channel3_special_mode: bool,
+    ) -> u8 {
+        if channel3_special_mode && operator_index > 0 {
+            let slot = (operator_index - 1).min(2);
+            Self::block_fnum_keycode(channel.special_block[slot], channel.special_fnum[slot])
         } else {
-            None
+            Self::channel_keycode(channel)
         }
     }
 
-    fn decode_carrier_attack_channel(&self, bank: usize, reg: u8) -> Option<usize> {
-        if (0x5C..=0x5E).contains(&reg) {
-            Some((bank & 1) * 3 + (reg as usize - 0x5C))
-        } else {
-            None
+    fn key_scale_rate_boost(keycode: u8, key_scale: u8) -> u8 {
+        match key_scale & 0x03 {
+            0 => 0,
+            1 => keycode >> 3,
+            2 => keycode >> 2,
+            _ => keycode >> 1,
         }
     }
 
-    fn decode_carrier_decay_channel(&self, bank: usize, reg: u8) -> Option<usize> {
-        if (0x6C..=0x6E).contains(&reg) {
-            Some((bank & 1) * 3 + (reg as usize - 0x6C))
+    fn apply_key_scale_rate(base_rate: u8, key_scale: u8, keycode: u8) -> u8 {
+        let boost = Self::key_scale_rate_boost(keycode, key_scale);
+        base_rate.saturating_add(boost).min(31)
+    }
+
+    fn carrier_mul_factor(raw_mul: u8) -> f32 {
+        if (raw_mul & 0x0F) == 0 {
+            0.5
         } else {
-            None
+            (raw_mul & 0x0F) as f32
         }
     }
 
-    fn decode_carrier_sustain_rate_channel(&self, bank: usize, reg: u8) -> Option<usize> {
-        if (0x7C..=0x7E).contains(&reg) {
-            Some((bank & 1) * 3 + (reg as usize - 0x7C))
-        } else {
-            None
-        }
+    fn detune_ratio(detune: u8) -> f32 {
+        // Approximate YM2612 DT steps in semitones.
+        const DETUNE_SEMITONES: [f32; 8] = [0.0, 0.015, 0.03, 0.045, -0.045, -0.03, -0.015, 0.0];
+        let semitones = DETUNE_SEMITONES[(detune & 0x07) as usize];
+        2f32.powf(semitones / 12.0)
     }
 
-    fn decode_carrier_sustain_release_channel(&self, bank: usize, reg: u8) -> Option<usize> {
-        if (0x8C..=0x8E).contains(&reg) {
-            Some((bank & 1) * 3 + (reg as usize - 0x8C))
-        } else {
-            None
-        }
+    fn lfo_rate_hz(rate: u8) -> f32 {
+        // YM2612 LFO frequency steps (approximate).
+        const LFO_HZ: [f32; 8] = [3.98, 5.56, 6.02, 6.37, 6.88, 9.63, 48.10, 72.20];
+        LFO_HZ[(rate & 0x07) as usize]
     }
 
-    fn channel_frequency_hz(channel: &YmChannel) -> f32 {
-        let fnum_scale = (channel.fnum.max(1) as f32) / 1024.0;
-        let octave_scale = 2f32.powi(channel.block as i32 - 4);
-        let multiple = (channel.carrier_mul.max(1)) as f32;
-        let freq = 220.0 * fnum_scale * octave_scale * multiple;
-        freq.clamp(20.0, 12_000.0)
+    fn channel_ams_depth(ams: u8) -> f32 {
+        // Output amplitude modulation depth.
+        const AMS_DEPTH: [f32; 4] = [0.0, 0.06, 0.12, 0.24];
+        AMS_DEPTH[(ams & 0x03) as usize]
     }
 
-    fn channel_level_scale(channel: &YmChannel) -> f32 {
-        if channel.carrier_tl >= 0x7F {
+    fn channel_fms_depth(fms: u8) -> f32 {
+        // Frequency modulation sensitivity.
+        const FMS_DEPTH: [f32; 8] = [0.0, 0.0015, 0.003, 0.006, 0.012, 0.024, 0.036, 0.05];
+        FMS_DEPTH[(fms & 0x07) as usize]
+    }
+
+    fn operator_level_scale(op: &YmOperator) -> f32 {
+        if op.tl >= 0x7F {
             return 0.0;
         }
-        let attenuation_db = channel.carrier_tl as f32 * 0.75;
+        let attenuation_db = op.tl as f32 * 0.75;
         10f32.powf(-attenuation_db / 20.0)
     }
 
-    fn channel_algorithm_gain(channel: &YmChannel) -> f32 {
-        // Approximate YM2612 algorithm output scaling by carrier count.
-        // This keeps relative loudness closer across algorithms in this
-        // simplified one-operator-per-channel model.
-        const GAIN_BY_ALG: [f32; 8] = [0.35, 0.35, 0.35, 0.35, 0.55, 0.75, 0.75, 1.0];
-        GAIN_BY_ALG[(channel.algorithm & 0x07) as usize]
+    fn attack_rate_to_step(rate: u8, sample_rate_hz: f32) -> f32 {
+        if rate == 0 {
+            if sample_rate_hz <= 0.0 {
+                return 0.0;
+            }
+            // AR=0 is extremely slow on YM2612, not instant full level.
+            return (1.0 / (12.0 * sample_rate_hz)).clamp(0.0, 1.0);
+        }
+        // Envelope time approximation table (seconds to near-full level).
+        // Indexed by AR [0..31].
+        const ATTACK_SECONDS: [f32; 32] = [
+            0.0, 1.200, 1.050, 0.920, 0.810, 0.710, 0.620, 0.540, 0.470, 0.410, 0.360, 0.315,
+            0.275, 0.240, 0.210, 0.184, 0.160, 0.140, 0.122, 0.106, 0.092, 0.080, 0.070, 0.060,
+            0.052, 0.045, 0.039, 0.033, 0.028, 0.023, 0.018, 0.014,
+        ];
+        Self::rate_table_step(rate, sample_rate_hz, &ATTACK_SECONDS)
     }
 
-    fn rate_to_step(rate: u8, sample_rate_hz: f32, min_seconds: f32, max_seconds: f32) -> f32 {
-        if rate == 0 || sample_rate_hz <= 0.0 {
+    fn decay_rate_to_step(rate: u8, sample_rate_hz: f32) -> f32 {
+        // Approximate seconds for full-scale decay.
+        const DECAY_SECONDS: [f32; 32] = [
+            0.0, 7.500, 6.600, 5.800, 5.100, 4.500, 3.960, 3.480, 3.060, 2.690, 2.360, 2.070,
+            1.820, 1.590, 1.390, 1.220, 1.060, 0.920, 0.800, 0.700, 0.610, 0.530, 0.460, 0.400,
+            0.350, 0.305, 0.265, 0.230, 0.200, 0.175, 0.152, 0.132,
+        ];
+        Self::rate_table_step(rate, sample_rate_hz, &DECAY_SECONDS)
+    }
+
+    fn sustain_rate_to_step(rate: u8, sample_rate_hz: f32) -> f32 {
+        // SR is often gentler than DR in music patches.
+        const SUSTAIN_SECONDS: [f32; 32] = [
+            0.0, 10.000, 8.800, 7.750, 6.820, 6.000, 5.280, 4.640, 4.080, 3.590, 3.160, 2.780,
+            2.440, 2.140, 1.880, 1.650, 1.440, 1.260, 1.100, 0.960, 0.840, 0.730, 0.640, 0.560,
+            0.490, 0.430, 0.375, 0.328, 0.286, 0.250, 0.218, 0.190,
+        ];
+        Self::rate_table_step(rate, sample_rate_hz, &SUSTAIN_SECONDS)
+    }
+
+    fn release_rate_to_step(rate: u8, sample_rate_hz: f32) -> f32 {
+        const RELEASE_SECONDS: [f32; 16] = [
+            2.400, 2.000, 1.650, 1.350, 1.100, 0.900, 0.740, 0.600, 0.490, 0.400, 0.320, 0.260,
+            0.200, 0.150, 0.100, 0.0075,
+        ];
+        let rate = rate.min(15) as usize;
+        let seconds = RELEASE_SECONDS[rate];
+        if sample_rate_hz <= 0.0 || seconds <= 0.0 {
             return 0.0;
         }
-        let ratio = rate.min(31) as f32 / 31.0;
-        let seconds = max_seconds * (min_seconds / max_seconds).powf(ratio);
         (1.0 / (seconds * sample_rate_hz)).clamp(0.0, 1.0)
     }
 
@@ -351,65 +606,193 @@ impl Ym2612 {
         }
     }
 
-    fn release_rate_to_step(rate: u8, sample_rate_hz: f32) -> f32 {
-        if sample_rate_hz <= 0.0 {
+    fn rate_table_step(rate: u8, sample_rate_hz: f32, table: &[f32; 32]) -> f32 {
+        let idx = rate.min(31) as usize;
+        let seconds = table[idx];
+        if idx == 0 || sample_rate_hz <= 0.0 || seconds <= 0.0 {
             return 0.0;
         }
-        let ratio = rate.min(15) as f32 / 15.0;
-        let seconds = 0.8_f32 * (0.004_f32 / 0.8_f32).powf(ratio);
         (1.0 / (seconds * sample_rate_hz)).clamp(0.0, 1.0)
     }
 
-    fn advance_envelope(channel: &mut YmChannel, sample_rate_hz: f32) -> f32 {
-        match channel.envelope_phase {
+    fn ssg_eg_enabled(op: &YmOperator) -> bool {
+        (op.ssg_eg & 0x08) != 0
+    }
+
+    fn ssg_eg_effective_sustain_target(op: &YmOperator) -> f32 {
+        if Self::ssg_eg_enabled(op) {
+            0.0
+        } else {
+            Self::sustain_level_to_amplitude(op.sustain_level)
+        }
+    }
+
+    fn ssg_eg_output_level(op: &YmOperator, envelope: f32) -> f32 {
+        if !Self::ssg_eg_enabled(op) {
+            return envelope;
+        }
+        let attack_invert = (op.ssg_eg & 0x04) != 0;
+        let invert = attack_invert ^ op.ssg_invert;
+        if invert {
+            (1.0 - envelope).clamp(0.0, 1.0)
+        } else {
+            envelope.clamp(0.0, 1.0)
+        }
+    }
+
+    fn advance_ssg_eg_cycle(op: &mut YmOperator) {
+        if !Self::ssg_eg_enabled(op) || !op.key_on {
+            return;
+        }
+        if op.envelope_phase != YmEnvelopePhase::Sustain || op.envelope_level > 0.0 {
+            return;
+        }
+
+        let hold = (op.ssg_eg & 0x01) != 0;
+        let alternate = (op.ssg_eg & 0x02) != 0;
+        let attack = (op.ssg_eg & 0x04) != 0;
+        let current_top = attack ^ op.ssg_invert;
+        if hold {
+            if alternate {
+                op.ssg_invert = !op.ssg_invert;
+            }
+            // Keep output stable at the held terminal level.
+            // In this model, envelope=0 + invert chooses top/bottom.
+            if current_top {
+                op.ssg_invert = attack;
+            }
+            op.ssg_hold_active = true;
+            return;
+        }
+        if alternate {
+            op.ssg_invert = !op.ssg_invert;
+        }
+        op.envelope_phase = YmEnvelopePhase::Attack;
+        op.envelope_level = 0.0;
+    }
+
+    fn advance_envelope(op: &mut YmOperator, sample_rate_hz: f32, keycode: u8) -> f32 {
+        if Self::ssg_eg_enabled(op) && op.ssg_hold_active && op.key_on {
+            return op.envelope_level;
+        }
+        let attack_rate = Self::apply_key_scale_rate(op.attack_rate, op.key_scale, keycode);
+        let decay_rate = Self::apply_key_scale_rate(op.decay_rate, op.key_scale, keycode);
+        let sustain_rate = Self::apply_key_scale_rate(op.sustain_rate, op.key_scale, keycode);
+        let release_rate = op
+            .release_rate
+            .saturating_add((Self::key_scale_rate_boost(keycode, op.key_scale) + 1) >> 1)
+            .min(15);
+        match op.envelope_phase {
             YmEnvelopePhase::Off => {
-                channel.envelope_level = 0.0;
+                op.envelope_level = 0.0;
             }
             YmEnvelopePhase::Attack => {
-                let step = Self::rate_to_step(channel.attack_rate, sample_rate_hz, 0.002, 0.8);
-                if step <= 0.0 {
-                    channel.envelope_level = 1.0;
-                    channel.envelope_phase = YmEnvelopePhase::Decay;
-                } else {
-                    channel.envelope_level = (channel.envelope_level + step).min(1.0);
-                    if channel.envelope_level >= 1.0 {
-                        channel.envelope_phase = YmEnvelopePhase::Decay;
+                let step = Self::attack_rate_to_step(attack_rate, sample_rate_hz);
+                if step > 0.0 {
+                    // Attack is exponential toward 1.0 to avoid buzzy starts.
+                    op.envelope_level =
+                        (op.envelope_level + (1.0 - op.envelope_level) * step * 8.0).min(1.0);
+                    if op.envelope_level >= 0.999 {
+                        op.envelope_level = 1.0;
+                        op.envelope_phase = YmEnvelopePhase::Decay;
                     }
                 }
             }
             YmEnvelopePhase::Decay => {
-                let sustain_target = Self::sustain_level_to_amplitude(channel.sustain_level);
-                let step = Self::rate_to_step(channel.decay_rate, sample_rate_hz, 0.01, 3.0);
-                if step <= 0.0 || channel.envelope_level <= sustain_target {
-                    channel.envelope_level = sustain_target;
-                    channel.envelope_phase = YmEnvelopePhase::Sustain;
+                let sustain_target = Self::ssg_eg_effective_sustain_target(op);
+                let step = Self::decay_rate_to_step(decay_rate, sample_rate_hz);
+                if step <= 0.0 || op.envelope_level <= sustain_target {
+                    op.envelope_level = sustain_target;
+                    op.envelope_phase = YmEnvelopePhase::Sustain;
                 } else {
-                    channel.envelope_level = (channel.envelope_level - step).max(sustain_target);
-                    if channel.envelope_level <= sustain_target {
-                        channel.envelope_phase = YmEnvelopePhase::Sustain;
+                    op.envelope_level = (op.envelope_level - step).max(sustain_target);
+                    if op.envelope_level <= sustain_target {
+                        op.envelope_phase = YmEnvelopePhase::Sustain;
                     }
                 }
             }
             YmEnvelopePhase::Sustain => {
-                let step = Self::rate_to_step(channel.sustain_rate, sample_rate_hz, 0.03, 5.0);
+                let step = if Self::ssg_eg_enabled(op) && sustain_rate == 0 {
+                    // SSG-EG shapes often keep cycling even when SR is low/zero.
+                    // Use DR as fallback in this mode so looping waveforms keep moving.
+                    Self::decay_rate_to_step(decay_rate.max(1), sample_rate_hz)
+                } else {
+                    Self::sustain_rate_to_step(sustain_rate, sample_rate_hz)
+                };
                 if step > 0.0 {
-                    channel.envelope_level = (channel.envelope_level - step).max(0.0);
+                    op.envelope_level = (op.envelope_level - step).max(0.0);
                 }
             }
             YmEnvelopePhase::Release => {
-                let step = Self::release_rate_to_step(channel.release_rate, sample_rate_hz);
+                let step = Self::release_rate_to_step(release_rate, sample_rate_hz);
                 if step <= 0.0 {
-                    channel.envelope_level = 0.0;
-                    channel.envelope_phase = YmEnvelopePhase::Off;
+                    op.envelope_level = 0.0;
+                    op.envelope_phase = YmEnvelopePhase::Off;
                 } else {
-                    channel.envelope_level = (channel.envelope_level - step).max(0.0);
-                    if channel.envelope_level <= 0.0 {
-                        channel.envelope_phase = YmEnvelopePhase::Off;
+                    op.envelope_level = (op.envelope_level - step).max(0.0);
+                    if op.envelope_level <= 0.0 {
+                        op.envelope_phase = YmEnvelopePhase::Off;
                     }
                 }
             }
         }
-        channel.envelope_level
+        Self::advance_ssg_eg_cycle(op);
+        op.envelope_level
+    }
+
+    fn operator_active(op: &YmOperator) -> bool {
+        op.key_on || op.envelope_phase != YmEnvelopePhase::Off
+    }
+
+    fn channel_active(channel: &YmChannel) -> bool {
+        channel.operators.iter().any(Self::operator_active)
+    }
+
+    fn advance_lfo(&mut self, sample_rate_hz: f32) -> (f32, f32) {
+        if !self.lfo_enabled || sample_rate_hz <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let rate_hz = Self::lfo_rate_hz(self.lfo_rate);
+        self.lfo_phase += rate_hz / sample_rate_hz;
+        if self.lfo_phase >= 1.0 {
+            self.lfo_phase -= self.lfo_phase.floor();
+        }
+        let wave = (self.lfo_phase * TAU).sin();
+        let am = (wave + 1.0) * 0.5;
+        let pm = wave;
+        (am, pm)
+    }
+
+    fn advance_operator_sample(
+        op: &mut YmOperator,
+        base_freq_hz: f32,
+        sample_rate_hz: f32,
+        phase_mod_radians: f32,
+        keycode: u8,
+        lfo_am: f32,
+        channel_ams_depth: f32,
+    ) -> f32 {
+        if !Self::operator_active(op) {
+            op.last_output = 0.0;
+            return 0.0;
+        }
+
+        let freq = base_freq_hz * Self::carrier_mul_factor(op.mul) * Self::detune_ratio(op.detune);
+        op.phase += freq / sample_rate_hz;
+        if op.phase >= 1.0 {
+            op.phase -= op.phase.floor();
+        }
+        let mut envelope = Self::advance_envelope(op, sample_rate_hz, keycode);
+        if op.am_enable && channel_ams_depth > 0.0 {
+            envelope *= 1.0 - (lfo_am * channel_ams_depth * 0.85);
+            envelope = envelope.max(0.0);
+        }
+        envelope = Self::ssg_eg_output_level(op, envelope);
+        let sample = ((TAU * op.phase) + phase_mod_radians).sin()
+            * Self::operator_level_scale(op)
+            * envelope;
+        op.last_output = sample;
+        sample
     }
 
     pub fn writes(&self) -> u64 {
@@ -424,39 +807,332 @@ impl Ym2612 {
         self.channels
             .iter()
             .enumerate()
-            .filter(|(index, channel)| {
+            .filter(|(index, _)| {
                 let dac_channel = *index == 5;
-                (channel.key_on || channel.envelope_phase != YmEnvelopePhase::Off)
-                    && !(dac_channel && self.dac_enabled)
+                !dac_channel || !self.dac_enabled
             })
+            .filter(|(_, channel)| Self::channel_active(channel))
             .count()
     }
 
+    fn render_channel_sample(
+        channel: &mut YmChannel,
+        sample_rate_hz: f32,
+        lfo_am: f32,
+        lfo_pm: f32,
+        channel3_special_mode: bool,
+    ) -> f32 {
+        let am_depth = Self::channel_ams_depth(channel.ams);
+        let pm_factor = 1.0 + lfo_pm * Self::channel_fms_depth(channel.fms);
+        let op_freqs = [
+            (Self::channel_operator_base_frequency_hz(channel, 0, channel3_special_mode)
+                * pm_factor)
+                .max(1.0),
+            (Self::channel_operator_base_frequency_hz(channel, 1, channel3_special_mode)
+                * pm_factor)
+                .max(1.0),
+            (Self::channel_operator_base_frequency_hz(channel, 2, channel3_special_mode)
+                * pm_factor)
+                .max(1.0),
+            (Self::channel_operator_base_frequency_hz(channel, 3, channel3_special_mode)
+                * pm_factor)
+                .max(1.0),
+        ];
+        let op_keycodes = [
+            Self::channel_operator_keycode(channel, 0, channel3_special_mode),
+            Self::channel_operator_keycode(channel, 1, channel3_special_mode),
+            Self::channel_operator_keycode(channel, 2, channel3_special_mode),
+            Self::channel_operator_keycode(channel, 3, channel3_special_mode),
+        ];
+        // FM phase modulation depth (radians) for internal operator routing.
+        // This keeps timbre rich without driving every patch into metallic noise.
+        let op_mod_index = 4.5f32;
+        // YM2612 feedback level approximation (self-modulation on OP1).
+        const FEEDBACK_PHASE_RADIANS: [f32; 8] = [0.0, 0.08, 0.16, 0.32, 0.64, 1.2, 2.0, 3.2];
+        let fb_phase_mod = ((channel.feedback_sample + channel.feedback_sample_prev) * 0.5)
+            * FEEDBACK_PHASE_RADIANS[channel.feedback.min(7) as usize];
+        let o1 = Self::advance_operator_sample(
+            &mut channel.operators[0],
+            op_freqs[0],
+            sample_rate_hz,
+            fb_phase_mod,
+            op_keycodes[0],
+            lfo_am,
+            am_depth,
+        );
+        channel.feedback_sample_prev = channel.feedback_sample;
+        channel.feedback_sample = o1;
+        let alg = channel.algorithm & 0x07;
+
+        let (o2, o3, o4, out) = match alg {
+            0 => {
+                let o3 = Self::advance_operator_sample(
+                    &mut channel.operators[2],
+                    op_freqs[2],
+                    sample_rate_hz,
+                    o1 * op_mod_index,
+                    op_keycodes[2],
+                    lfo_am,
+                    am_depth,
+                );
+                let o2 = Self::advance_operator_sample(
+                    &mut channel.operators[1],
+                    op_freqs[1],
+                    sample_rate_hz,
+                    o3 * op_mod_index,
+                    op_keycodes[1],
+                    lfo_am,
+                    am_depth,
+                );
+                let o4 = Self::advance_operator_sample(
+                    &mut channel.operators[3],
+                    op_freqs[3],
+                    sample_rate_hz,
+                    o2 * op_mod_index,
+                    op_keycodes[3],
+                    lfo_am,
+                    am_depth,
+                );
+                (o2, o3, o4, o4)
+            }
+            1 => {
+                let o3 = Self::advance_operator_sample(
+                    &mut channel.operators[2],
+                    op_freqs[2],
+                    sample_rate_hz,
+                    0.0,
+                    op_keycodes[2],
+                    lfo_am,
+                    am_depth,
+                );
+                let o2 = Self::advance_operator_sample(
+                    &mut channel.operators[1],
+                    op_freqs[1],
+                    sample_rate_hz,
+                    (o1 + o3) * (op_mod_index * 0.5),
+                    op_keycodes[1],
+                    lfo_am,
+                    am_depth,
+                );
+                let o4 = Self::advance_operator_sample(
+                    &mut channel.operators[3],
+                    op_freqs[3],
+                    sample_rate_hz,
+                    o2 * op_mod_index,
+                    op_keycodes[3],
+                    lfo_am,
+                    am_depth,
+                );
+                (o2, o3, o4, o4)
+            }
+            2 => {
+                let o3 = Self::advance_operator_sample(
+                    &mut channel.operators[2],
+                    op_freqs[2],
+                    sample_rate_hz,
+                    0.0,
+                    op_keycodes[2],
+                    lfo_am,
+                    am_depth,
+                );
+                let o2 = Self::advance_operator_sample(
+                    &mut channel.operators[1],
+                    op_freqs[1],
+                    sample_rate_hz,
+                    o3 * op_mod_index,
+                    op_keycodes[1],
+                    lfo_am,
+                    am_depth,
+                );
+                let o4 = Self::advance_operator_sample(
+                    &mut channel.operators[3],
+                    op_freqs[3],
+                    sample_rate_hz,
+                    (o1 + o2) * (op_mod_index * 0.5),
+                    op_keycodes[3],
+                    lfo_am,
+                    am_depth,
+                );
+                (o2, o3, o4, o4)
+            }
+            3 => {
+                let o3 = Self::advance_operator_sample(
+                    &mut channel.operators[2],
+                    op_freqs[2],
+                    sample_rate_hz,
+                    o1 * op_mod_index,
+                    op_keycodes[2],
+                    lfo_am,
+                    am_depth,
+                );
+                let o2 = Self::advance_operator_sample(
+                    &mut channel.operators[1],
+                    op_freqs[1],
+                    sample_rate_hz,
+                    0.0,
+                    op_keycodes[1],
+                    lfo_am,
+                    am_depth,
+                );
+                let o4 = Self::advance_operator_sample(
+                    &mut channel.operators[3],
+                    op_freqs[3],
+                    sample_rate_hz,
+                    (o2 + o3) * (op_mod_index * 0.5),
+                    op_keycodes[3],
+                    lfo_am,
+                    am_depth,
+                );
+                (o2, o3, o4, o4)
+            }
+            4 => {
+                let o2 = Self::advance_operator_sample(
+                    &mut channel.operators[1],
+                    op_freqs[1],
+                    sample_rate_hz,
+                    o1 * op_mod_index,
+                    op_keycodes[1],
+                    lfo_am,
+                    am_depth,
+                );
+                let o3 = Self::advance_operator_sample(
+                    &mut channel.operators[2],
+                    op_freqs[2],
+                    sample_rate_hz,
+                    0.0,
+                    op_keycodes[2],
+                    lfo_am,
+                    am_depth,
+                );
+                let o4 = Self::advance_operator_sample(
+                    &mut channel.operators[3],
+                    op_freqs[3],
+                    sample_rate_hz,
+                    o3 * op_mod_index,
+                    op_keycodes[3],
+                    lfo_am,
+                    am_depth,
+                );
+                (o2, o3, o4, (o2 + o4) * 0.5)
+            }
+            5 => {
+                let o2 = Self::advance_operator_sample(
+                    &mut channel.operators[1],
+                    op_freqs[1],
+                    sample_rate_hz,
+                    o1 * op_mod_index,
+                    op_keycodes[1],
+                    lfo_am,
+                    am_depth,
+                );
+                let o3 = Self::advance_operator_sample(
+                    &mut channel.operators[2],
+                    op_freqs[2],
+                    sample_rate_hz,
+                    o1 * op_mod_index,
+                    op_keycodes[2],
+                    lfo_am,
+                    am_depth,
+                );
+                let o4 = Self::advance_operator_sample(
+                    &mut channel.operators[3],
+                    op_freqs[3],
+                    sample_rate_hz,
+                    o1 * op_mod_index,
+                    op_keycodes[3],
+                    lfo_am,
+                    am_depth,
+                );
+                (o2, o3, o4, (o2 + o3 + o4) / 3.0)
+            }
+            6 => {
+                let o2 = Self::advance_operator_sample(
+                    &mut channel.operators[1],
+                    op_freqs[1],
+                    sample_rate_hz,
+                    o1 * op_mod_index,
+                    op_keycodes[1],
+                    lfo_am,
+                    am_depth,
+                );
+                let o3 = Self::advance_operator_sample(
+                    &mut channel.operators[2],
+                    op_freqs[2],
+                    sample_rate_hz,
+                    0.0,
+                    op_keycodes[2],
+                    lfo_am,
+                    am_depth,
+                );
+                let o4 = Self::advance_operator_sample(
+                    &mut channel.operators[3],
+                    op_freqs[3],
+                    sample_rate_hz,
+                    0.0,
+                    op_keycodes[3],
+                    lfo_am,
+                    am_depth,
+                );
+                (o2, o3, o4, (o2 + o3 + o4) / 3.0)
+            }
+            _ => {
+                let o2 = Self::advance_operator_sample(
+                    &mut channel.operators[1],
+                    op_freqs[1],
+                    sample_rate_hz,
+                    0.0,
+                    op_keycodes[1],
+                    lfo_am,
+                    am_depth,
+                );
+                let o3 = Self::advance_operator_sample(
+                    &mut channel.operators[2],
+                    op_freqs[2],
+                    sample_rate_hz,
+                    0.0,
+                    op_keycodes[2],
+                    lfo_am,
+                    am_depth,
+                );
+                let o4 = Self::advance_operator_sample(
+                    &mut channel.operators[3],
+                    op_freqs[3],
+                    sample_rate_hz,
+                    0.0,
+                    op_keycodes[3],
+                    lfo_am,
+                    am_depth,
+                );
+                (o2, o3, o4, (o1 + o2 + o3 + o4) * 0.25)
+            }
+        };
+
+        let _ = (o2, o3, o4);
+        // Soft clip improves perceived loudness while reducing harsh edges.
+        out.tanh()
+    }
+
     fn next_sample_stereo(&mut self, sample_rate_hz: f32) -> (i16, i16) {
+        let (lfo_am, lfo_pm) = self.advance_lfo(sample_rate_hz);
         let mut left_mix = 0.0f32;
         let mut right_mix = 0.0f32;
         let mut left_active = 0usize;
         let mut right_active = 0usize;
+        let channel3_special_mode = self.channel3_special_mode_enabled();
         for (index, channel) in self.channels.iter_mut().enumerate() {
-            if !channel.key_on && channel.envelope_phase == YmEnvelopePhase::Off {
-                continue;
-            }
             if index == 5 && self.dac_enabled {
                 continue;
             }
-            let freq = Self::channel_frequency_hz(channel);
-            channel.phase += freq / sample_rate_hz;
-            if channel.phase >= 1.0 {
-                channel.phase -= channel.phase.floor();
+            if !Self::channel_active(channel) {
+                continue;
             }
-            let feedback_amount = (channel.feedback as f32 / 7.0) * 0.2;
-            let modulated_phase = channel.phase + channel.feedback_sample * feedback_amount;
-            let envelope = Self::advance_envelope(channel, sample_rate_hz);
-            let sample = (modulated_phase * TAU).sin()
-                * Self::channel_level_scale(channel)
-                * envelope
-                * Self::channel_algorithm_gain(channel);
-            channel.feedback_sample = sample;
+            let sample = Self::render_channel_sample(
+                channel,
+                sample_rate_hz,
+                lfo_am,
+                lfo_pm,
+                channel3_special_mode && index == 2,
+            );
             if channel.pan_left {
                 left_mix += sample;
                 left_active += 1;
@@ -469,14 +1145,12 @@ impl Ym2612 {
         let fm_left = if left_active == 0 {
             0
         } else {
-            ((left_mix / left_active as f32) * 7_500.0).clamp(i16::MIN as f32, i16::MAX as f32)
-                as i16
+            (left_mix * 18_000.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16
         };
         let fm_right = if right_active == 0 {
             0
         } else {
-            ((right_mix / right_active as f32) * 7_500.0).clamp(i16::MIN as f32, i16::MAX as f32)
-                as i16
+            (right_mix * 18_000.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16
         };
         let (dac_left, dac_right) = if self.dac_enabled {
             let channel = &self.channels[5];
@@ -515,6 +1189,9 @@ impl Ym2612 {
                 if (self.timer_control & 0x04) != 0 {
                     self.timer_status |= 0x01;
                 }
+                if self.csm_mode_enabled() {
+                    self.trigger_csm_channel3_key_on();
+                }
             }
         }
         if (self.timer_control & 0x02) != 0 {
@@ -526,6 +1203,28 @@ impl Ym2612 {
                     self.timer_status |= 0x02;
                 }
             }
+        }
+    }
+
+    fn csm_mode_enabled(&self) -> bool {
+        self.channel3_mode_bits() == 0b10
+    }
+
+    fn channel3_mode_bits(&self) -> u8 {
+        (self.timer_control >> 6) & 0x03
+    }
+
+    fn trigger_csm_channel3_key_on(&mut self) {
+        // CSM (bit7 of mode register) retriggers channel 3 on Timer A overflow.
+        let ch3 = &mut self.channels[2];
+        ch3.feedback_sample = 0.0;
+        ch3.feedback_sample_prev = 0.0;
+        for op in &mut ch3.operators {
+            op.phase = 0.0;
+            op.last_output = 0.0;
+            op.envelope_phase = YmEnvelopePhase::Attack;
+            op.envelope_level = 0.0;
+            op.key_on = true;
         }
     }
 
@@ -556,19 +1255,56 @@ impl Ym2612 {
     }
 
     pub fn channel_key_on(&self, channel: usize) -> bool {
-        self.channels[channel.min(5)].key_on
+        self.channels[channel.min(5)]
+            .operators
+            .iter()
+            .any(|op| op.key_on)
+    }
+
+    pub fn channel_operator_key_on(&self, channel: usize, operator: usize) -> bool {
+        let channel = self.channels[channel.min(5)];
+        channel.operators[operator.min(3)].key_on
+    }
+
+    pub fn lfo_enabled(&self) -> bool {
+        self.lfo_enabled
+    }
+
+    pub fn lfo_rate(&self) -> u8 {
+        self.lfo_rate
     }
 
     pub fn channel_frequency_hz_debug(&self, channel: usize) -> f32 {
-        Self::channel_frequency_hz(&self.channels[channel.min(5)])
+        self.channel_operator_frequency_hz_debug(channel, 3)
+    }
+
+    pub fn channel_operator_frequency_hz_debug(&self, channel: usize, operator: usize) -> f32 {
+        let channel_index = channel.min(5);
+        let operator_index = operator.min(3);
+        let channel = self.channels[channel_index];
+        let base_hz = Self::channel_operator_base_frequency_hz(
+            &channel,
+            operator_index,
+            channel_index == 2 && self.channel3_special_mode_enabled(),
+        );
+        let op = channel.operators[operator_index];
+        base_hz * Self::carrier_mul_factor(op.mul) * Self::detune_ratio(op.detune)
     }
 
     pub fn channel_carrier_mul(&self, channel: usize) -> u8 {
-        self.channels[channel.min(5)].carrier_mul
+        self.channels[channel.min(5)].operators[3].mul
+    }
+
+    pub fn channel_carrier_detune(&self, channel: usize) -> u8 {
+        self.channels[channel.min(5)].operators[3].detune
     }
 
     pub fn channel_carrier_tl(&self, channel: usize) -> u8 {
-        self.channels[channel.min(5)].carrier_tl
+        self.channels[channel.min(5)].operators[3].tl
+    }
+
+    pub fn channel_carrier_ssg_eg(&self, channel: usize) -> u8 {
+        self.channels[channel.min(5)].operators[3].ssg_eg
     }
 
     pub fn channel_algorithm_feedback(&self, channel: usize) -> (u8, u8) {
@@ -576,18 +1312,23 @@ impl Ym2612 {
         (channel.algorithm, channel.feedback)
     }
 
+    pub fn channel_ams_fms(&self, channel: usize) -> (u8, u8) {
+        let channel = self.channels[channel.min(5)];
+        (channel.ams, channel.fms)
+    }
+
     pub fn channel_envelope_level(&self, channel: usize) -> f32 {
-        self.channels[channel.min(5)].envelope_level
+        self.channels[channel.min(5)].operators[3].envelope_level
     }
 
     pub fn channel_envelope_params(&self, channel: usize) -> (u8, u8, u8, u8, u8) {
-        let channel = self.channels[channel.min(5)];
+        let op = self.channels[channel.min(5)].operators[3];
         (
-            channel.attack_rate,
-            channel.decay_rate,
-            channel.sustain_rate,
-            channel.sustain_level,
-            channel.release_rate,
+            op.attack_rate,
+            op.decay_rate,
+            op.sustain_rate,
+            op.sustain_level,
+            op.release_rate,
         )
     }
 
@@ -732,7 +1473,10 @@ impl Psg {
         let noise_uses_tone3 = (self.noise_control & 0x03) == 0x03;
         let mut tone3_falling_edges = 0usize;
         for channel in 0..3 {
-            self.tone_phase_acc[channel] += self.tone_frequency_hz(channel) / sample_rate_hz;
+            // The divider formula returns full square-wave frequency, while
+            // this phase accumulator toggles high/low once per wrap.
+            self.tone_phase_acc[channel] +=
+                (self.tone_frequency_hz(channel) * 2.0) / sample_rate_hz;
             while self.tone_phase_acc[channel] >= 1.0 {
                 self.tone_phase_acc[channel] -= 1.0;
                 let was_high = self.tone_phase_high[channel];
@@ -771,7 +1515,7 @@ impl Psg {
             -noise_amp
         };
 
-        (mix * 3000.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16
+        (mix * 1800.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16
     }
 }
 
@@ -849,7 +1593,9 @@ impl AudioBus {
         let produced = (self.sample_accumulator / Self::M68K_CLOCK_HZ) as usize;
         self.sample_accumulator %= Self::M68K_CLOCK_HZ;
         for _ in 0..produced {
-            let psg_sample = self.psg.next_sample(sample_rate_hz as f32) as i32;
+            // Keep PSG clearly below FM in the global mix so square-wave beeps
+            // do not overpower YM2612 music.
+            let psg_sample = (self.psg.next_sample(sample_rate_hz as f32) as i32) / 5;
             let (ym_left, ym_right) = self.ym2612.next_sample_stereo(sample_rate_hz as f32);
             let left = (psg_sample + ym_left as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             let right =

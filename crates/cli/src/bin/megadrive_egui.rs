@@ -4,7 +4,6 @@ mod egui_ui;
 use std::error::Error;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use egui_sdl2_gl::DpiScaling;
 use egui_sdl2_gl::ShaderVersion;
@@ -14,7 +13,7 @@ use egui_ui::gl_game::GlGameRenderer;
 use megadrive_core::{Button, Cartridge, ControllerType, Emulator, FRAME_HEIGHT, FRAME_WIDTH};
 use sdl2::audio::AudioSpecDesired;
 use sdl2::event::Event;
-use sdl2::keyboard::Keycode;
+use sdl2::keyboard::{Keycode, Mod};
 
 const SCALE: u32 = 3;
 const PANEL_WIDTH_DEFAULT: f32 = 420.0;
@@ -57,6 +56,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("Controller 1 : {}", controller_type_label(pad1_type));
     println!("Controller 2 : {}", controller_type_label(pad2_type));
     println!("Cheat panel  : Tab");
+    println!("State hotkey : Ctrl+0..9 save / 0..9 load");
     if boot_frames > 0 {
         fast_forward_boot_frames(&mut emulator, boot_frames);
         println!("Boot skip    : {} frames", boot_frames);
@@ -226,7 +226,23 @@ fn run_window_loop(
         .map_err(|err| io::Error::other(err.to_string()))?;
 
     gl::load_with(|name| video.gl_get_proc_address(name) as *const _);
-    let _ = video.gl_set_swap_interval(sdl2::video::SwapInterval::Immediate);
+    let vsync_requested = std::env::var("MEGADRIVE_GL_VSYNC")
+        .ok()
+        .map(|v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
+        .unwrap_or(true);
+    if vsync_requested {
+        if let Err(vsync_err) = video.gl_set_swap_interval(sdl2::video::SwapInterval::VSync) {
+            eprintln!(
+                "warning: failed to enable VSync ({}), using immediate swap",
+                vsync_err
+            );
+            let _ = video.gl_set_swap_interval(sdl2::video::SwapInterval::Immediate);
+        }
+        eprintln!("swap interval : {:?}", video.gl_get_swap_interval());
+    } else {
+        let _ = video.gl_set_swap_interval(sdl2::video::SwapInterval::Immediate);
+        eprintln!("swap interval : {:?}", video.gl_get_swap_interval());
+    }
 
     let (mut painter, mut egui_state) =
         egui_sdl2_gl::with_sdl2(&window, ShaderVersion::Default, DpiScaling::Default);
@@ -263,16 +279,13 @@ fn run_window_loop(
     let cheat_path = cheat_file_path(rom_path);
     let mut cheat_ui = CheatToolUi::new();
     let mut prev_panel_visible = false;
+    let mut state_slots: [Option<Emulator>; 10] = std::array::from_fn(|_| None);
 
     let text_input = video.text_input();
     let mut text_input_active = false;
     text_input.stop();
 
-    let frame_budget = Duration::from_nanos(16_666_667);
-
     'running: loop {
-        let frame_start = Instant::now();
-
         let should_enable_text_input = cheat_ui.panel_visible;
         if should_enable_text_input != text_input_active {
             if should_enable_text_input {
@@ -314,9 +327,28 @@ fn run_window_loop(
                 }
                 Event::KeyDown {
                     keycode: Some(key),
+                    keymod,
                     repeat: false,
                     ..
                 } => {
+                    if let Some(slot) = state_slot_from_keycode(key) {
+                        if keymod_has_ctrl(keymod) {
+                            state_slots[slot] = Some(emulator.clone());
+                            println!("Saved state slot {}", slot);
+                            continue;
+                        }
+                        if !egui_wants_keyboard {
+                            if let Some(saved) = &state_slots[slot] {
+                                *emulator = saved.clone();
+                                emulator.set_audio_output_sample_rate_hz(output_sample_rate_hz);
+                                audio_queue.clear();
+                                println!("Loaded state slot {}", slot);
+                            } else {
+                                println!("State slot {} is empty", slot);
+                            }
+                            continue;
+                        }
+                    }
                     if !egui_wants_keyboard {
                         if let Some((player, button)) = map_keycode_to_player_button(key) {
                             set_button_state(emulator, player, button, true);
@@ -381,25 +413,33 @@ fn run_window_loop(
 
         game_renderer.upload_frame_rgb24(emulator.frame_buffer(), FRAME_WIDTH, FRAME_HEIGHT);
 
-        let (win_w, win_h) = window.size();
+        let (win_w, _) = window.size();
+        let (drawable_w, drawable_h) = window.drawable_size();
         unsafe {
             gl::ClearColor(0.0, 0.0, 0.0, 1.0);
             gl::Clear(gl::COLOR_BUFFER_BIT);
         }
 
-        let panel_px = if cheat_ui.panel_visible {
+        let panel_px_logical = if cheat_ui.panel_visible {
             panel_width_px
         } else {
             0
         };
-        let game_vp_w = win_w.saturating_sub(panel_px);
-        game_renderer.draw(0, 0, game_vp_w as i32, win_h as i32);
+        let panel_px = if win_w > 0 {
+            (panel_px_logical as u64)
+                .saturating_mul(drawable_w as u64)
+                .saturating_div(win_w as u64) as u32
+        } else {
+            0
+        };
+        let game_vp_w = drawable_w.saturating_sub(panel_px);
+        game_renderer.draw(0, 0, game_vp_w as i32, drawable_h as i32);
 
         if cheat_ui.panel_visible {
-            painter.update_screen_rect((win_w, win_h));
+            painter.update_screen_rect((drawable_w, drawable_h));
             egui_state.input.screen_rect = Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(win_w as f32, win_h as f32),
+                egui::vec2(drawable_w as f32, drawable_h as f32),
             ));
 
             let mut ram_writes: Vec<(usize, u8)> = Vec::new();
@@ -450,11 +490,6 @@ fn run_window_loop(
         }
 
         window.gl_swap_window();
-
-        let elapsed = frame_start.elapsed();
-        if elapsed < frame_budget {
-            std::thread::sleep(frame_budget - elapsed);
-        }
     }
 
     Ok(())
@@ -522,6 +557,26 @@ fn map_keycode_to_player_button(key: Keycode) -> Option<(u8, Button)> {
         Keycode::RShift => Some((2, Button::Start)),
         _ => None,
     }
+}
+
+fn state_slot_from_keycode(key: Keycode) -> Option<usize> {
+    match key {
+        Keycode::Num0 | Keycode::Kp0 => Some(0),
+        Keycode::Num1 | Keycode::Kp1 => Some(1),
+        Keycode::Num2 | Keycode::Kp2 => Some(2),
+        Keycode::Num3 | Keycode::Kp3 => Some(3),
+        Keycode::Num4 | Keycode::Kp4 => Some(4),
+        Keycode::Num5 | Keycode::Kp5 => Some(5),
+        Keycode::Num6 | Keycode::Kp6 => Some(6),
+        Keycode::Num7 | Keycode::Kp7 => Some(7),
+        Keycode::Num8 | Keycode::Kp8 => Some(8),
+        Keycode::Num9 | Keycode::Kp9 => Some(9),
+        _ => None,
+    }
+}
+
+fn keymod_has_ctrl(keymod: Mod) -> bool {
+    keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD)
 }
 
 fn cheat_file_path(rom_path: &str) -> PathBuf {

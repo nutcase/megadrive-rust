@@ -79,7 +79,7 @@ impl ActiveBusDma {
             source_addr,
             next_source_addr: source_addr,
             dest_addr: request.dest_addr,
-            auto_increment: request.auto_increment.max(1),
+            auto_increment: request.auto_increment,
             words_total: request.words,
             words_remaining: request.words,
             first_word: None,
@@ -106,6 +106,7 @@ pub struct MemoryMap {
     dma_trace: VecDeque<DmaTraceEntry>,
     pending_bus_dma: VecDeque<BusDmaRequest>,
     active_bus_dma: Option<ActiveBusDma>,
+    active_bus_dma_cycle_carry: u32,
     dma_wait_cycles: u32,
 }
 
@@ -122,6 +123,9 @@ impl MemoryMap {
         let mut vdp = Vdp::with_video_standard(video_standard);
         if sonic3_compat_quirks_enabled(&cartridge) {
             vdp.set_quirk_plane_a_64x32_paged(true);
+        }
+        if comix_zone_compat_quirks_enabled(&cartridge) {
+            vdp.set_quirk_vscroll_swap_ab(true);
         }
         Self {
             cartridge,
@@ -140,6 +144,7 @@ impl MemoryMap {
             dma_trace: VecDeque::with_capacity(128),
             pending_bus_dma: VecDeque::with_capacity(8),
             active_bus_dma: None,
+            active_bus_dma_cycle_carry: 0,
             dma_wait_cycles: 0,
         }
     }
@@ -239,14 +244,31 @@ impl MemoryMap {
                     .pending_bus_dma
                     .pop_front()
                     .map(ActiveBusDma::from_request);
+                if self.active_bus_dma.is_some() {
+                    self.active_bus_dma_cycle_carry = 0;
+                }
             }
 
             let Some(mut dma) = self.active_bus_dma.take() else {
+                self.active_bus_dma_cycle_carry = 0;
                 frame_ready |= self.vdp.step(remaining);
                 break;
             };
 
-            while remaining >= DMA_BUS_WAIT_CYCLES_PER_WORD && dma.words_remaining > 0 {
+            while remaining > 0 && dma.words_remaining > 0 {
+                let needed =
+                    DMA_BUS_WAIT_CYCLES_PER_WORD.saturating_sub(self.active_bus_dma_cycle_carry);
+                let advance = remaining.min(needed.max(1));
+                frame_ready |= self.vdp.step(advance);
+                self.active_bus_dma_cycle_carry =
+                    self.active_bus_dma_cycle_carry.saturating_add(advance);
+                remaining -= advance;
+
+                if self.active_bus_dma_cycle_carry < DMA_BUS_WAIT_CYCLES_PER_WORD {
+                    continue;
+                }
+                self.active_bus_dma_cycle_carry = 0;
+
                 let source = dma.next_source_addr & 0x00FF_FFFE;
                 let hi = self.read_u8_mapped(source & 0x00FF_FFFF);
                 let lo = self.read_u8_mapped(source.wrapping_add(1) & 0x00FF_FFFF);
@@ -259,8 +281,6 @@ impl MemoryMap {
                 dma.words_remaining -= 1;
 
                 self.vdp.write_data_port(word);
-                frame_ready |= self.vdp.step(DMA_BUS_WAIT_CYCLES_PER_WORD);
-                remaining -= DMA_BUS_WAIT_CYCLES_PER_WORD;
             }
 
             if dma.words_remaining == 0 {
@@ -279,12 +299,9 @@ impl MemoryMap {
                     self.dma_trace.pop_front();
                 }
                 self.active_bus_dma = None;
+                self.active_bus_dma_cycle_carry = 0;
             } else {
                 self.active_bus_dma = Some(dma);
-                if remaining > 0 {
-                    frame_ready |= self.vdp.step(remaining);
-                    remaining = 0;
-                }
             }
         }
 
@@ -538,6 +555,16 @@ fn sonic3_compat_quirks_enabled(cartridge: &Cartridge) -> bool {
     domestic.contains("HEDGEHOG 3") || overseas.contains("HEDGEHOG 3")
 }
 
+fn comix_zone_compat_quirks_enabled(cartridge: &Cartridge) -> bool {
+    let header = cartridge.header();
+    if header.product_code.contains("G-4132") {
+        return true;
+    }
+    let domestic = header.domestic_title.to_ascii_uppercase();
+    let overseas = header.overseas_title.to_ascii_uppercase();
+    domestic.contains("COMIX ZONE") || overseas.contains("COMIX ZONE")
+}
+
 fn io_version_from_region(region: &str) -> u8 {
     let upper = region.trim().to_ascii_uppercase();
     if upper.contains('J') {
@@ -608,7 +635,8 @@ mod tests {
     use crate::cartridge::Cartridge;
     use crate::input::Button;
     use crate::memory::{
-        DmaTraceTarget, MemoryMap, io_version_from_region, video_standard_from_region,
+        DmaTraceTarget, MemoryMap, comix_zone_compat_quirks_enabled, io_version_from_region,
+        video_standard_from_region,
     };
     use crate::vdp::VideoStandard;
 
@@ -622,6 +650,34 @@ mod tests {
 
         assert_eq!(memory.read_u8(0xFF0000), 0x12);
         assert_eq!(memory.read_u16(0xFF0002), 0xABCD);
+    }
+
+    #[test]
+    fn comix_zone_compat_quirk_detects_product_code() {
+        let mut rom = vec![0; 0x400];
+        rom[0x182..0x18E].copy_from_slice(b" G-4132  -00");
+        let cart = Cartridge::from_bytes(rom).expect("valid cart");
+        assert!(comix_zone_compat_quirks_enabled(&cart));
+    }
+
+    #[test]
+    fn comix_zone_compat_quirk_detects_domestic_title() {
+        let mut rom = vec![0; 0x400];
+        let mut title = [b' '; 48];
+        title[..10].copy_from_slice(b"COMIX ZONE");
+        rom[0x120..0x150].copy_from_slice(&title);
+        let cart = Cartridge::from_bytes(rom).expect("valid cart");
+        assert!(comix_zone_compat_quirks_enabled(&cart));
+    }
+
+    #[test]
+    fn comix_zone_compat_quirk_enables_vscroll_swap() {
+        let mut rom = vec![0; 0x400];
+        rom[0x180..0x18E].copy_from_slice(b"GM G-4132  -00");
+        let cart = Cartridge::from_bytes(rom).expect("valid cart");
+        let memory = MemoryMap::new(cart);
+        assert!(memory.vdp().quirk_vscroll_swap_ab_enabled());
+        assert!(!memory.vdp().quirk_comix_pretitle_plane_b_bias_enabled());
     }
 
     #[test]
@@ -926,6 +982,49 @@ mod tests {
     }
 
     #[test]
+    fn bus_dma_respects_zero_auto_increment() {
+        let mut rom = vec![0; 0x400];
+        rom[0x200] = 0xAA;
+        rom[0x201] = 0xBB;
+        rom[0x202] = 0xCC;
+        rom[0x203] = 0xDD;
+
+        let cart = Cartridge::from_bytes(rom).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        // Enable VDP DMA (reg1 bit4) and set increment=0.
+        memory.write_u16(0xC00004, 0x8150);
+        memory.write_u16(0xC00004, 0x8F00);
+        // DMA length = 2 words.
+        memory.write_u16(0xC00004, 0x9302);
+        memory.write_u16(0xC00004, 0x9400);
+        // DMA source (word address): 0x000200 >> 1 = 0x000100.
+        memory.write_u16(0xC00004, 0x9500);
+        memory.write_u16(0xC00004, 0x9601);
+        memory.write_u16(0xC00004, 0x9700); // mode 00: 68k->VDP
+
+        // VRAM write DMA command @ 0x0000.
+        memory.write_u16(0xC00004, 0x4000);
+        memory.write_u16(0xC00004, 0x0080);
+
+        let dma_cycles = memory.take_dma_wait_cycles();
+        assert_eq!(dma_cycles, 4);
+        memory.step_vdp(dma_cycles);
+
+        // increment=0 keeps destination fixed, so only the latest word remains.
+        assert_eq!(memory.vdp().read_vram_u8(0x0000), 0xCC);
+        assert_eq!(memory.vdp().read_vram_u8(0x0001), 0xDD);
+        assert_eq!(memory.vdp().read_vram_u8(0x0002), 0x00);
+        assert_eq!(memory.vdp().read_vram_u8(0x0003), 0x00);
+
+        let trace = memory.dma_trace();
+        let last = trace.last().expect("dma trace entry");
+        assert_eq!(last.auto_increment, 0);
+        assert_eq!(last.first_word, 0xAABB);
+        assert_eq!(last.last_word, 0xCCDD);
+    }
+
+    #[test]
     fn bus_dma_progresses_as_vdp_cycles_advance() {
         let mut rom = vec![0; 0x400];
         rom[0x200] = 0xAA;
@@ -956,6 +1055,115 @@ mod tests {
         memory.step_vdp(2);
         assert_eq!(memory.vdp().read_vram_u8(0x0002), 0xCC);
         assert_eq!(memory.vdp().read_vram_u8(0x0003), 0xDD);
+    }
+
+    #[test]
+    fn bus_dma_progresses_with_fragmented_single_cycle_steps() {
+        let mut rom = vec![0; 0x400];
+        rom[0x200] = 0xAA;
+        rom[0x201] = 0xBB;
+        rom[0x202] = 0xCC;
+        rom[0x203] = 0xDD;
+
+        let cart = Cartridge::from_bytes(rom).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        memory.write_u16(0xC00004, 0x8150);
+        memory.write_u16(0xC00004, 0x8F02);
+        memory.write_u16(0xC00004, 0x9302);
+        memory.write_u16(0xC00004, 0x9400);
+        memory.write_u16(0xC00004, 0x9500);
+        memory.write_u16(0xC00004, 0x9601);
+        memory.write_u16(0xC00004, 0x9700);
+        memory.write_u16(0xC00004, 0x4000);
+        memory.write_u16(0xC00004, 0x0080);
+
+        memory.step_vdp(1);
+        assert_eq!(memory.vdp().read_vram_u8(0x0000), 0x00);
+        assert_eq!(memory.vdp().read_vram_u8(0x0001), 0x00);
+
+        memory.step_vdp(1);
+        assert_eq!(memory.vdp().read_vram_u8(0x0000), 0xAA);
+        assert_eq!(memory.vdp().read_vram_u8(0x0001), 0xBB);
+        assert_eq!(memory.vdp().read_vram_u8(0x0002), 0x00);
+        assert_eq!(memory.vdp().read_vram_u8(0x0003), 0x00);
+
+        memory.step_vdp(1);
+        assert_eq!(memory.vdp().read_vram_u8(0x0002), 0x00);
+        assert_eq!(memory.vdp().read_vram_u8(0x0003), 0x00);
+
+        memory.step_vdp(1);
+        assert_eq!(memory.vdp().read_vram_u8(0x0002), 0xCC);
+        assert_eq!(memory.vdp().read_vram_u8(0x0003), 0xDD);
+    }
+
+    #[test]
+    fn long_bus_dma_does_not_block_vblank_interrupt_timing() {
+        let cart = Cartridge::from_bytes(vec![0; 0x200]).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        // reg1: display + DMA enable + V-INT enable
+        memory.write_u16(0xC00004, 0x8170);
+        memory.write_u16(0xC00004, 0x8F02);
+        // DMA length = 0xFFFF words (longer than one NTSC frame worth of DMA slots).
+        memory.write_u16(0xC00004, 0x93FF);
+        memory.write_u16(0xC00004, 0x94FF);
+        memory.write_u16(0xC00004, 0x9500);
+        memory.write_u16(0xC00004, 0x9600);
+        memory.write_u16(0xC00004, 0x9700);
+        memory.write_u16(0xC00004, 0x4000);
+        memory.write_u16(0xC00004, 0x0080);
+
+        // Advance roughly one frame in fragmented 1-cycle slices.
+        let mut frame_ready = false;
+        for _ in 0..130_000 {
+            if memory.step_vdp(1) {
+                frame_ready = true;
+                break;
+            }
+        }
+        assert!(frame_ready, "expected frame boundary during long DMA");
+        assert_eq!(memory.vdp().pending_interrupt_level(), Some(6));
+        // DMA is still in progress at this point.
+        assert_ne!(
+            (memory.vdp().register(20), memory.vdp().register(19)),
+            (0x00, 0x00)
+        );
+    }
+
+    #[test]
+    fn long_bus_dma_does_not_block_hblank_interrupt_timing() {
+        let cart = Cartridge::from_bytes(vec![0; 0x200]).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        // H-INT every line, display+DMA enabled (no V-INT to avoid priority masking).
+        memory.write_u16(0xC00004, 0x8010);
+        memory.write_u16(0xC00004, 0x8A00);
+        memory.write_u16(0xC00004, 0x8150);
+        memory.write_u16(0xC00004, 0x8F02);
+        // DMA length = 0x0800 words.
+        memory.write_u16(0xC00004, 0x9300);
+        memory.write_u16(0xC00004, 0x9408);
+        memory.write_u16(0xC00004, 0x9500);
+        memory.write_u16(0xC00004, 0x9600);
+        memory.write_u16(0xC00004, 0x9700);
+        memory.write_u16(0xC00004, 0x4000);
+        memory.write_u16(0xC00004, 0x0080);
+
+        let mut saw_hint = false;
+        for _ in 0..2_000 {
+            if memory.vdp().pending_interrupt_level() == Some(4) {
+                saw_hint = true;
+                break;
+            }
+            memory.step_vdp(1);
+        }
+        assert!(saw_hint, "expected H-INT during active DMA transfer");
+        // DMA should still be active when the first H-INT appears.
+        assert_ne!(
+            (memory.vdp().register(20), memory.vdp().register(19)),
+            (0x00, 0x00)
+        );
     }
 
     #[test]

@@ -138,6 +138,13 @@ impl GlGameRenderer {
         }
 
         unsafe {
+            // egui's GL painter can leave pixel unpack state configured for its own uploads.
+            // Force a known unpack state so frame rows are interpreted correctly every frame.
+            gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
+            gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
+            gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
+            gl::PixelStorei(gl::UNPACK_SKIP_ROWS, 0);
+            gl::PixelStorei(gl::UNPACK_SKIP_PIXELS, 0);
             gl::BindTexture(gl::TEXTURE_2D, self.texture);
             if width != self.tex_w || height != self.tex_h {
                 gl::TexImage2D(

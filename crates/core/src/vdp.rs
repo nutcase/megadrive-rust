@@ -29,6 +29,7 @@ const REG_DMA_SOURCE_HIGH: usize = 23;
 const STATUS_BASE: u16 = 0x3400;
 const STATUS_HBLANK: u16 = 0x0004;
 const STATUS_VBLANK: u16 = 0x0008;
+const STATUS_ODD_FRAME: u16 = 0x0010;
 const STATUS_SPRITE_COLLISION: u16 = 0x0020;
 const STATUS_SPRITE_OVERFLOW: u16 = 0x0040;
 
@@ -95,6 +96,7 @@ pub struct Vdp {
     sprite_collision: bool,
     sprite_overflow: bool,
     h_interrupt_pending: bool,
+    h_interrupt_armed: bool,
     v_interrupt_pending: bool,
     h_interrupt_counter: u8,
     vram: [u8; VRAM_SIZE],
@@ -107,9 +109,12 @@ pub struct Vdp {
     line_hscroll: [[u16; 2]; FRAME_HEIGHT],
     line_cram: [[u16; CRAM_COLORS]; FRAME_HEIGHT],
     line_vram: Vec<[u8; VRAM_SIZE]>,
+    line_vram_latch_enabled: bool,
+    debug_line_latch_next: bool,
     control_latch: Option<u16>,
     access_addr: u16,
     access_mode: AccessMode,
+    vram_read_buffer: u16,
     dma_fill_pending: Option<DmaFillState>,
     dma_bus_pending: Option<BusDmaRequest>,
     dma_fill_ops: u64,
@@ -118,6 +123,8 @@ pub struct Vdp {
     quirk_live_plane_vram: bool,
     quirk_live_hscroll: bool,
     quirk_plane_a_64x32_paged: bool,
+    quirk_vscroll_swap_ab: bool,
+    quirk_comix_pretitle_plane_b_bias: bool,
 }
 
 impl Default for Vdp {
@@ -131,7 +138,6 @@ impl Vdp {
     const NTSC_CYCLES_PER_FRAME: u64 = 127_800;
     const NTSC_TOTAL_LINES: u64 = 262;
     const PAL_TOTAL_LINES: u64 = 313;
-    const TOTAL_DOTS_PER_LINE: u64 = 342;
     #[cfg(test)]
     const CYCLES_PER_FRAME: u64 = Self::NTSC_CYCLES_PER_FRAME;
     #[cfg(test)]
@@ -147,8 +153,8 @@ impl Vdp {
         registers[REG_PLANE_A_NAMETABLE] = 0x30; // Plane A name table base: 0xC000
         registers[REG_SPRITE_TABLE] = 0x70; // Sprite attribute table base: 0xE000
         registers[REG_HSCROLL_TABLE] = 0x3C; // Horizontal scroll table base: 0xF000
-        // Window off by default.
-        // Keep window disabled by default.
+                                             // Window off by default.
+                                             // Keep window disabled by default.
         registers[REG_WINDOW_HPOS] = 0x00;
         registers[REG_WINDOW_VPOS] = 0x00;
         registers[REG_AUTO_INCREMENT] = 2; // Word access by default
@@ -160,6 +166,7 @@ impl Vdp {
             sprite_collision: false,
             sprite_overflow: false,
             h_interrupt_pending: false,
+            h_interrupt_armed: false,
             v_interrupt_pending: false,
             h_interrupt_counter: registers[REG_H_INTERRUPT_COUNTER],
             vram: [0; VRAM_SIZE],
@@ -172,9 +179,12 @@ impl Vdp {
             line_hscroll: [[0; 2]; FRAME_HEIGHT],
             line_cram: [[0; CRAM_COLORS]; FRAME_HEIGHT],
             line_vram: vec![[0; VRAM_SIZE]; FRAME_HEIGHT],
+            line_vram_latch_enabled: std::env::var_os("MEGADRIVE_DEBUG_LINE_VRAM_LATCH").is_some(),
+            debug_line_latch_next: std::env::var_os("MEGADRIVE_DEBUG_LINE_LATCH_NEXT").is_some(),
             control_latch: None,
             access_addr: 0,
             access_mode: AccessMode::default(),
+            vram_read_buffer: 0,
             dma_fill_pending: None,
             dma_bus_pending: None,
             dma_fill_ops: 0,
@@ -183,9 +193,12 @@ impl Vdp {
             quirk_live_plane_vram: false,
             quirk_live_hscroll: false,
             quirk_plane_a_64x32_paged: false,
+            quirk_vscroll_swap_ab: false,
+            quirk_comix_pretitle_plane_b_bias: false,
         };
         vdp.reset_line_state();
         vdp.capture_line_state(0);
+        vdp.on_scanline_start(0);
         vdp.render_frame();
         vdp
     }
@@ -214,6 +227,24 @@ impl Vdp {
         self.quirk_plane_a_64x32_paged = enabled;
     }
 
+    pub fn set_quirk_vscroll_swap_ab(&mut self, enabled: bool) {
+        self.quirk_vscroll_swap_ab = enabled;
+    }
+
+    pub fn set_quirk_comix_pretitle_plane_b_bias(&mut self, enabled: bool) {
+        self.quirk_comix_pretitle_plane_b_bias = enabled;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quirk_vscroll_swap_ab_enabled(&self) -> bool {
+        self.quirk_vscroll_swap_ab
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quirk_comix_pretitle_plane_b_bias_enabled(&self) -> bool {
+        self.quirk_comix_pretitle_plane_b_bias
+    }
+
     fn cycles_per_frame(&self) -> u64 {
         match self.video_standard {
             VideoStandard::Ntsc => Self::NTSC_CYCLES_PER_FRAME,
@@ -235,7 +266,7 @@ impl Vdp {
             let advance = remaining.min(until_frame_end);
             let start = self.frame_cycles;
             let end = self.frame_cycles + advance;
-            self.process_line_crossings(start, end);
+            self.process_scanline_events(start, end);
             self.frame_cycles = end;
             remaining -= advance;
 
@@ -243,7 +274,7 @@ impl Vdp {
                 self.frame_cycles = 0;
                 self.frame_count += 1;
                 self.render_frame();
-                self.h_interrupt_counter = self.registers[REG_H_INTERRUPT_COUNTER];
+                self.h_interrupt_armed = false;
                 self.reset_line_state();
                 self.capture_line_state(0);
                 self.on_scanline_start(0);
@@ -291,7 +322,9 @@ impl Vdp {
     }
 
     pub fn line_vram_u8(&self, line: usize, addr: u16) -> u8 {
-        if line < FRAME_HEIGHT {
+        if !self.line_vram_latch_enabled {
+            self.vram[addr as usize % VRAM_SIZE]
+        } else if line < FRAME_HEIGHT {
             self.line_vram[line][addr as usize % VRAM_SIZE]
         } else {
             0
@@ -299,9 +332,9 @@ impl Vdp {
     }
 
     pub fn pending_interrupt_level(&self) -> Option<u8> {
-        if self.v_interrupt_pending {
+        if self.v_interrupt_pending && self.v_interrupt_enabled() {
             Some(6)
-        } else if self.h_interrupt_pending {
+        } else if self.h_interrupt_pending && self.h_interrupt_enabled() {
             Some(4)
         } else {
             None
@@ -334,6 +367,9 @@ impl Vdp {
         if self.vblank_active() {
             status |= STATUS_VBLANK;
         }
+        if self.interlace_mode_enabled() && (self.frame_count & 1) != 0 {
+            status |= STATUS_ODD_FRAME;
+        }
         if self.sprite_collision {
             status |= STATUS_SPRITE_COLLISION;
         }
@@ -346,9 +382,15 @@ impl Vdp {
     }
 
     fn hblank_active(&self) -> bool {
-        let cycles_per_line = self.cycles_per_line().max(1);
-        let cycle_in_line = self.frame_cycles % cycles_per_line;
-        cycle_in_line >= self.hblank_start_cycle(cycles_per_line)
+        let (_, line_start, line_end) = self.line_cycle_bounds_for_cycle(self.frame_cycles);
+        let line_cycles = line_end.saturating_sub(line_start).max(1);
+        let cycle_in_line = self.frame_cycles.saturating_sub(line_start);
+        let h = self.h_counter_value(cycle_in_line, line_cycles);
+        if self.h40_mode() {
+            h >= 0xB3 || h <= 0x05
+        } else {
+            h >= 0x93 || h <= 0x04
+        }
     }
 
     fn current_line_index(&self) -> usize {
@@ -360,43 +402,135 @@ impl Vdp {
         self.current_line_index() >= self.active_display_height()
     }
 
-    fn cycles_per_line(&self) -> u64 {
-        (self.cycles_per_frame() / self.total_lines()).max(1)
-    }
-
     fn hblank_start_cycle(&self, cycles_per_line: u64) -> u64 {
-        // Model active display time by dot count. H40: 320 visible dots,
-        // H32: 256 visible dots, total line width is 342 dots.
-        let active_dots = if self.h40_mode() { 320 } else { 256 };
-        (cycles_per_line.saturating_mul(active_dots) / Self::TOTAL_DOTS_PER_LINE)
-            .min(cycles_per_line.saturating_sub(1))
+        // Compute the first cycle where the quantized H-counter reaches the
+        // HBlank threshold. Equivalent to the previous scan loop but O(1).
+        let threshold_step = if self.h40_mode() { 0xB3u64 } else { 0x93u64 };
+        let steps = self.h_counter_step_count().max(1);
+        let cycle = (threshold_step
+            .saturating_mul(cycles_per_line)
+            .saturating_add(steps - 1))
+            / steps;
+        cycle.min(cycles_per_line.saturating_sub(1))
     }
 
     pub fn read_hv_counter(&self) -> u16 {
-        let total_lines = self.total_lines();
-        let cycles_per_line = self.cycles_per_line();
-        let v = ((self.frame_cycles / cycles_per_line) % total_lines) as u8;
-        let h = ((self.frame_cycles % cycles_per_line) * 256 / cycles_per_line) as u8;
+        let (line, line_start, line_end) = self.line_cycle_bounds_for_cycle(self.frame_cycles);
+        let line_cycles = line_end.saturating_sub(line_start).max(1);
+        let cycle_in_line = self.frame_cycles.saturating_sub(line_start);
+        let v = self.v_counter_value_for_line(line);
+        let h = self.h_counter_value(cycle_in_line, line_cycles);
         u16::from_be_bytes([v, h])
     }
 
-    fn process_line_crossings(&mut self, start: u64, end: u64) {
+    fn h_counter_step_count(&self) -> u64 {
+        if self.h40_mode() {
+            // H40 progression: 00-B6, E4-FF
+            0xB7 + (0xFF - 0xE4 + 1)
+        } else {
+            // H32 progression: 00-93, E9-FF
+            0x94 + (0xFF - 0xE9 + 1)
+        }
+    }
+
+    fn h_counter_value(&self, cycle_in_line: u64, line_cycles: u64) -> u8 {
+        let steps = self.h_counter_step_count().max(1);
+        let step = ((cycle_in_line * steps) / line_cycles).min(steps.saturating_sub(1));
+        if self.h40_mode() {
+            if step <= 0xB6 {
+                step as u8
+            } else {
+                (0xE4 + (step - 0xB7)) as u8
+            }
+        } else if step <= 0x93 {
+            step as u8
+        } else {
+            (0xE9 + (step - 0x94)) as u8
+        }
+    }
+
+    fn v_counter_value_for_line(&self, line: u64) -> u8 {
+        let line = line.min(self.total_lines().saturating_sub(1));
+        let v30_mode = self.active_display_height() == FRAME_HEIGHT;
+        match (self.video_standard, v30_mode) {
+            // NTSC V28: 00-EA, E5-FF
+            (VideoStandard::Ntsc, false) => {
+                if line <= 0xEA {
+                    line as u8
+                } else {
+                    (0xE5 + (line - 0xEB)) as u8
+                }
+            }
+            // NTSC V30: treat as linear 8-bit wrap (00-FF, 00-05 for 262 lines).
+            // This keeps timing stable without introducing invalid rolling-mode behavior.
+            (VideoStandard::Ntsc, true) => line as u8,
+            // PAL V28: 00-FF, 00-02, CA-FF
+            (VideoStandard::Pal, false) => {
+                if line <= 0xFF {
+                    line as u8
+                } else if line <= 0x102 {
+                    (line - 0x100) as u8
+                } else {
+                    (0xCA + (line - 0x103)) as u8
+                }
+            }
+            // PAL V30: 00-FF, 00-0A, D2-FF
+            (VideoStandard::Pal, true) => {
+                if line <= 0xFF {
+                    line as u8
+                } else if line <= 0x10A {
+                    (line - 0x100) as u8
+                } else {
+                    (0xD2 + (line - 0x10B)) as u8
+                }
+            }
+        }
+    }
+
+    fn line_cycle_bounds_for_cycle(&self, cycle: u64) -> (u64, u64, u64) {
+        let line = self.line_index_for_cycle(cycle);
+        self.line_cycle_bounds(line)
+    }
+
+    fn line_cycle_bounds(&self, line: u64) -> (u64, u64, u64) {
+        let cycles_per_frame = self.cycles_per_frame();
+        let total_lines = self.total_lines().max(1);
+        let clamped_line = line.min(total_lines.saturating_sub(1));
+        let start = (clamped_line * cycles_per_frame) / total_lines;
+        let end = ((clamped_line + 1) * cycles_per_frame) / total_lines;
+        (clamped_line, start, end.max(start + 1))
+    }
+
+    fn process_scanline_events(&mut self, start: u64, end: u64) {
         if end <= start {
             return;
         }
         let start_line = self.line_index_for_cycle(start);
         let end_line = self.line_index_for_cycle(end);
-        let latch_next_line = std::env::var_os("MEGADRIVE_DEBUG_LINE_LATCH_NEXT").is_some();
-        for line in (start_line + 1)..=end_line {
-            let line = line as usize;
-            // Latch line state on scanline boundary; optional line+1 probe helps
-            // diagnose transition-frame timing issues.
-            if latch_next_line {
-                self.capture_line_state(line.saturating_add(1));
-            } else {
-                self.capture_line_state(line);
+        let total_lines = self.total_lines();
+
+        for line in start_line..=end_line {
+            let (line_idx, line_start, line_end) = self.line_cycle_bounds(line);
+            let line_cycles = line_end.saturating_sub(line_start).max(1);
+            let hblank_start = line_start + self.hblank_start_cycle(line_cycles);
+            if hblank_start > start && hblank_start <= end {
+                self.on_hblank_start(line_idx as usize);
             }
-            self.on_scanline_start(line);
+
+            if line_end > start && line_end <= end {
+                let next_line = line_idx + 1;
+                if next_line < total_lines {
+                    let next_line = next_line as usize;
+                    // Latch line state on scanline boundary; optional line+1 probe helps
+                    // diagnose transition-frame timing issues.
+                    if self.debug_line_latch_next {
+                        self.capture_line_state(next_line.saturating_add(1));
+                    } else {
+                        self.capture_line_state(next_line);
+                    }
+                    self.on_scanline_start(next_line);
+                }
+            }
         }
     }
 
@@ -414,7 +548,9 @@ impl Vdp {
             self.line_vsram[line] = self.vsram;
             self.line_hscroll[line] = self.current_line_hscroll_words(line, &self.registers);
             self.line_cram[line] = self.cram;
-            self.line_vram[line].copy_from_slice(&self.vram);
+            if self.line_vram_latch_enabled {
+                self.line_vram[line].copy_from_slice(&self.vram);
+            }
         }
     }
 
@@ -424,7 +560,9 @@ impl Vdp {
             self.line_vsram[line] = self.vsram;
             self.line_hscroll[line] = self.current_line_hscroll_words(line, &self.registers);
             self.line_cram[line] = self.cram;
-            self.line_vram[line].copy_from_slice(&self.vram);
+            if self.line_vram_latch_enabled {
+                self.line_vram[line].copy_from_slice(&self.vram);
+            }
         }
     }
 
@@ -439,20 +577,26 @@ impl Vdp {
     }
 
     fn on_scanline_start(&mut self, line: usize) {
-        if line == self.active_display_height() && self.v_interrupt_enabled() {
+        // V-INT condition is latched on VBlank entry; IRQ output is gated by
+        // the current enable bit (register #1 bit 5).
+        if line == self.active_display_height() {
             self.v_interrupt_pending = true;
         }
-        if line >= self.active_display_height() {
-            return;
-        }
-
         if self.h_interrupt_counter == 0 {
-            if self.h_interrupt_enabled() {
-                self.h_interrupt_pending = true;
-            }
+            // H-INT condition is latched by line counter timing; IRQ output is
+            // gated by the current enable bit (register #0 bit 4).
+            self.h_interrupt_armed = line < self.active_display_height();
             self.h_interrupt_counter = self.registers[REG_H_INTERRUPT_COUNTER];
         } else {
+            self.h_interrupt_armed = false;
             self.h_interrupt_counter = self.h_interrupt_counter.wrapping_sub(1);
+        }
+    }
+
+    fn on_hblank_start(&mut self, line: usize) {
+        if line < self.active_display_height() && self.h_interrupt_armed {
+            self.h_interrupt_pending = true;
+            self.h_interrupt_armed = false;
         }
     }
 
@@ -474,30 +618,50 @@ impl Vdp {
     }
 
     pub fn read_data_port(&mut self) -> u16 {
-        let value = match self.access_mode {
-            AccessMode::VramRead | AccessMode::VramWrite => {
+        match self.access_mode {
+            AccessMode::VramRead => {
+                let value = self.vram_read_buffer;
+                self.vram_read_buffer = {
+                    let hi = self.vram[self.access_addr as usize];
+                    let lo = self.vram[self.access_addr.wrapping_add(1) as usize];
+                    u16::from_be_bytes([hi, lo])
+                };
+                self.advance_access_addr();
+                value
+            }
+            AccessMode::VramWrite => {
                 let hi = self.vram[self.access_addr as usize];
                 let lo = self.vram[self.access_addr.wrapping_add(1) as usize];
-                u16::from_be_bytes([hi, lo])
+                let value = u16::from_be_bytes([hi, lo]);
+                self.advance_access_addr();
+                value
             }
             AccessMode::CramRead | AccessMode::CramWrite => {
-                self.read_cram_u16((self.access_addr >> 1) as u8)
+                let value = self.read_cram_u16((self.access_addr >> 1) as u8);
+                self.advance_access_addr();
+                value
             }
             AccessMode::VsramRead | AccessMode::VsramWrite => {
-                self.read_vsram_u16((self.access_addr >> 1) as u8)
+                let value = self.read_vsram_u16((self.access_addr >> 1) as u8);
+                self.advance_access_addr();
+                value
             }
-            AccessMode::Unsupported => 0,
-        };
-        self.advance_access_addr();
-        value
+            AccessMode::Unsupported => {
+                self.advance_access_addr();
+                0
+            }
+        }
     }
 
     pub fn write_data_port(&mut self, value: u16) {
         if let Some(fill) = self.dma_fill_pending.take() {
+            let no_prewrite = std::env::var_os("MEGADRIVE_DEBUG_DMA_FILL_NO_PREWRITE").is_some();
             // DMA fill is triggered by a regular data-port write: apply the
             // initial write first, then stream fill bytes.
-            self.write_data_value(value);
-            self.advance_access_addr();
+            if !no_prewrite {
+                self.write_data_value(value);
+                self.advance_access_addr();
+            }
             self.execute_dma_fill(fill.remaining_words, value);
             return;
         }
@@ -596,8 +760,7 @@ impl Vdp {
     }
 
     fn auto_increment(&self) -> u16 {
-        let increment = self.registers[REG_AUTO_INCREMENT] as u16;
-        increment.max(1)
+        self.registers[REG_AUTO_INCREMENT] as u16
     }
 
     fn write_register(&mut self, reg: usize, value: u8) {
@@ -644,6 +807,15 @@ impl Vdp {
             _ => AccessMode::Unsupported,
         };
 
+        if self.access_mode == AccessMode::VramRead {
+            // VRAM read setup prefetches into an internal read buffer and
+            // advances the address once before the first data-port read.
+            let hi = self.vram[self.access_addr as usize];
+            let lo = self.vram[self.access_addr.wrapping_add(1) as usize];
+            self.vram_read_buffer = u16::from_be_bytes([hi, lo]);
+            self.advance_access_addr();
+        }
+
         if dma_request && self.dma_enabled() {
             self.start_dma(base_code);
         }
@@ -666,7 +838,11 @@ impl Vdp {
     fn dma_length(&self) -> usize {
         let len = ((self.registers[REG_DMA_LENGTH_HIGH] as usize) << 8)
             | self.registers[REG_DMA_LENGTH_LOW] as usize;
-        if len == 0 { 0x10000 } else { len }
+        if len == 0 {
+            0x10000
+        } else {
+            len
+        }
     }
 
     fn clear_dma_length(&mut self) {
@@ -747,12 +923,23 @@ impl Vdp {
 
     fn execute_dma_fill(&mut self, words: usize, value: u16) {
         let fill_byte = (value & 0x00FF) as u8;
+        let fill_word = std::env::var_os("MEGADRIVE_DEBUG_DMA_FILL_WORD").is_some();
+        let lane_no_xor = std::env::var_os("MEGADRIVE_DEBUG_DMA_FILL_LANE_NO_XOR").is_some();
         let increment = self.auto_increment();
         for _ in 0..words {
-            // VRAM fill writes target the byte lane selected by A0, matching
-            // hardware behavior used by line-scroll effects.
-            let addr = (self.access_addr as usize ^ 0x0001) % VRAM_SIZE;
-            self.vram[addr] = fill_byte;
+            if fill_word {
+                let addr = self.access_addr as usize % VRAM_SIZE;
+                self.vram[addr] = fill_byte;
+                self.vram[(addr + 1) % VRAM_SIZE] = fill_byte;
+            } else {
+                // VRAM fill writes target the byte lane selected by A0.
+                let addr = if lane_no_xor {
+                    self.access_addr as usize
+                } else {
+                    self.access_addr as usize ^ 0x0001
+                } % VRAM_SIZE;
+                self.vram[addr] = fill_byte;
+            }
             self.access_addr = self.access_addr.wrapping_add(increment);
         }
         if self.frame_cycles == 0 {
@@ -872,6 +1059,8 @@ impl Vdp {
         scroll_plane_layout: bool,
         plane_paged_layout: bool,
         plane_paged_xmajor: bool,
+        interlace_mode_2: bool,
+        interlace_field: usize,
     ) -> Option<PlaneSample> {
         let tile_x = (sample_x / 8) % plane_width_tiles.max(1);
         let tile_y = (sample_y / 8) % plane_height_tiles.max(1);
@@ -905,7 +1094,17 @@ impl Vdp {
             in_tile_y = 7 - in_tile_y;
         }
 
-        let tile_addr = tile_index * TILE_SIZE_BYTES + in_tile_y * 4 + in_tile_x / 2;
+        let tile_stride = if interlace_mode_2 {
+            TILE_SIZE_BYTES * 2
+        } else {
+            TILE_SIZE_BYTES
+        };
+        let in_tile_y = if interlace_mode_2 {
+            (in_tile_y << 1) | (interlace_field & 1)
+        } else {
+            in_tile_y
+        };
+        let tile_addr = tile_index * tile_stride + in_tile_y * 4 + in_tile_x / 2;
         let tile_byte = vram[tile_addr % VRAM_SIZE];
         let pixel = if in_tile_x & 1 == 0 {
             tile_byte >> 4
@@ -1015,6 +1214,36 @@ impl Vdp {
         hactive && vactive
     }
 
+    fn comix_pretitle_plane_b_bias_active(
+        regs: &[u8; REG_COUNT],
+        vsram: &[u16; VSRAM_WORDS],
+    ) -> bool {
+        regs[REG_PLANE_B_NAMETABLE] == 0x07
+            && (regs[REG_MODE_SET_2] & 0x40) != 0
+            && regs[REG_PLANE_SIZE] == 0x11
+            && (vsram[0] & 0x07FF) == 0x00B8
+    }
+
+    fn comix_pretitle_vscroll_swap_active(regs: &[u8; REG_COUNT]) -> bool {
+        // Comix Zone uses swapped A/B VSRAM sources during the early pre-title logo scene
+        // (32x32 plane setup with per-line hscroll). Later title rollout uses normal mapping.
+        regs[REG_PLANE_B_NAMETABLE] == 0x07
+            && (regs[REG_MODE_SET_2] & 0x40) != 0
+            && regs[REG_HSCROLL_TABLE] == 0x3C
+            && regs[REG_PLANE_SIZE] == 0x01
+            && regs[11] == 0x03
+    }
+
+    fn comix_title_roll_active(regs: &[u8; REG_COUNT], vsram: &[u16; VSRAM_WORDS]) -> bool {
+        regs[REG_PLANE_B_NAMETABLE] == 0x07
+            && (regs[REG_MODE_SET_2] & 0x40) != 0
+            && regs[REG_HSCROLL_TABLE] == 0x3C
+            && regs[REG_PLANE_SIZE] == 0x11
+            && regs[11] == 0x00
+            && (regs[12] & 0x08) != 0
+            && (vsram[0] & 0x07FF) == 0x00B8
+    }
+
     fn render_frame(&mut self) {
         self.sprite_collision = false;
         self.sprite_overflow = false;
@@ -1027,7 +1256,7 @@ impl Vdp {
             || std::env::var_os("DISABLE_SPRITES").is_some();
         let invert_vscroll_a = std::env::var_os("MEGADRIVE_DEBUG_VSCROLL_INVERT_A").is_some();
         let invert_vscroll_b = std::env::var_os("MEGADRIVE_DEBUG_VSCROLL_INVERT_B").is_some();
-        let swap_vscroll_ab = std::env::var_os("MEGADRIVE_DEBUG_VSCROLL_SWAP_AB").is_some();
+        let debug_swap_vscroll_ab = std::env::var_os("MEGADRIVE_DEBUG_VSCROLL_SWAP_AB").is_some();
         let plane_paged_layout = std::env::var_os("MEGADRIVE_DEBUG_PLANE_PAGED").is_some();
         let plane_paged_layout_a =
             plane_paged_layout || std::env::var_os("MEGADRIVE_DEBUG_PLANE_A_PAGED").is_some();
@@ -1038,7 +1267,9 @@ impl Vdp {
             || std::env::var_os("MEGADRIVE_DEBUG_PLANE_A_PAGED_XMAJOR").is_some();
         let plane_paged_xmajor_b = plane_paged_xmajor
             || std::env::var_os("MEGADRIVE_DEBUG_PLANE_B_PAGED_XMAJOR").is_some();
-        let plane_live_vram = std::env::var_os("MEGADRIVE_DEBUG_PLANE_LIVE_VRAM").is_some();
+        let force_plane_live_vram = std::env::var_os("MEGADRIVE_DEBUG_PLANE_LIVE_VRAM").is_some();
+        let use_plane_line_latch = self.line_vram_latch_enabled
+            && std::env::var_os("MEGADRIVE_DEBUG_PLANE_LINE_LATCH").is_some();
         let live_cram = std::env::var_os("MEGADRIVE_DEBUG_LIVE_CRAM").is_some();
         let line_offset = std::env::var("MEGADRIVE_DEBUG_LINE_OFFSET")
             .ok()
@@ -1047,6 +1278,9 @@ impl Vdp {
         let bottom_bg_mask = self.quirk_bottom_bg_mask
             || std::env::var_os("MEGADRIVE_DEBUG_BOTTOM_BG_MASK").is_some();
         let mut plane_meta = vec![0u8; FRAME_WIDTH * FRAME_HEIGHT];
+        let mut line_plane_b_opaque_pixels = [0usize; FRAME_HEIGHT];
+        let mut comix_title_roll_any = false;
+        let mut comix_title_roll_active_height = 0usize;
         for y in 0..FRAME_HEIGHT {
             let line_idx = y
                 .saturating_add_signed(line_offset)
@@ -1074,11 +1308,12 @@ impl Vdp {
             } else {
                 self.line_cram.get(line_idx).copied().unwrap_or(self.cram)
             };
-            let vram = if plane_live_vram || self.quirk_live_plane_vram {
-                &self.vram
-            } else {
-                self.line_vram.get(line_idx).unwrap_or(&self.vram)
-            };
+            let vram =
+                if use_plane_line_latch && !force_plane_live_vram && !self.quirk_live_plane_vram {
+                    self.line_vram.get(line_idx).unwrap_or(&self.vram)
+                } else {
+                    &self.vram
+                };
             let row = y * FRAME_WIDTH * 3;
             if !Self::display_enabled_from_regs(&regs) {
                 self.frame_buffer[row..row + FRAME_WIDTH * 3].fill(0);
@@ -1116,11 +1351,41 @@ impl Vdp {
             let window_width_px = window_width_tiles * 8;
             let window_height_px = window_height_tiles * 8;
             let bg_color_index = Self::background_color_index_from_regs(&regs);
+            let interlace_mode_2 = Self::interlace_mode_2_from_regs(&regs);
+            let interlace_field = if interlace_mode_2 {
+                (self.frame_count & 1) as usize
+            } else {
+                0
+            };
 
             let a_hscroll =
                 normalize_scroll(Self::sign_extend_11(hscroll_words[0]), plane_width_px);
             let b_hscroll =
                 normalize_scroll(Self::sign_extend_11(hscroll_words[1]), plane_width_px);
+            let comix_b_bias_active = Self::comix_pretitle_plane_b_bias_active(&regs, &vsram);
+            let comix_b_bias = self.quirk_comix_pretitle_plane_b_bias
+                && std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_BIAS").is_none()
+                && comix_b_bias_active;
+            let comix_title_roll = self.quirk_vscroll_swap_ab
+                && Self::comix_title_roll_active(&regs, &vsram)
+                && std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_ROLL_FIX").is_none();
+            let swap_vscroll_ab = debug_swap_vscroll_ab
+                || (self.quirk_vscroll_swap_ab && Self::comix_pretitle_vscroll_swap_active(&regs));
+            let comix_b_bias_offset = std::env::var("MEGADRIVE_DEBUG_COMIX_BIAS_Y")
+                .ok()
+                .and_then(|v| v.parse::<i16>().ok())
+                .unwrap_or(64);
+            let comix_roll_offset = std::env::var("MEGADRIVE_DEBUG_COMIX_ROLL_Y")
+                .ok()
+                .and_then(|v| v.parse::<i16>().ok())
+                .unwrap_or(0);
+            let disable_comix_roll_sparse_mask =
+                std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_ROLL_SPARSE_MASK").is_some();
+            if comix_title_roll {
+                comix_title_roll_any = true;
+                comix_title_roll_active_height = line_active_height;
+            }
+            let mut line_b_opaque = 0usize;
 
             for x in 0..FRAME_WIDTH {
                 if x >= line_active_width {
@@ -1135,26 +1400,42 @@ impl Vdp {
                 } else {
                     (0usize, 1usize)
                 };
-                let a_vscroll = normalize_scroll(
-                    Self::sign_extend_11(
-                        vsram[Self::vscroll_index_for_x_from_regs(&regs, a_idx, x) % VSRAM_WORDS],
-                    ),
-                    plane_height_px,
+                let a_vscroll_raw = Self::sign_extend_11(
+                    vsram[Self::vscroll_index_for_x_from_regs(&regs, a_idx, x) % VSRAM_WORDS],
                 );
-                let b_vscroll = normalize_scroll(
-                    Self::sign_extend_11(
-                        vsram[Self::vscroll_index_for_x_from_regs(&regs, b_idx, x) % VSRAM_WORDS],
-                    ),
-                    plane_height_px,
+                let b_vscroll_raw = Self::sign_extend_11(
+                    vsram[Self::vscroll_index_for_x_from_regs(&regs, b_idx, x) % VSRAM_WORDS],
                 );
+                let a_vscroll_raw = if interlace_mode_2 {
+                    a_vscroll_raw >> 1
+                } else {
+                    a_vscroll_raw
+                };
+                let b_vscroll_raw = if interlace_mode_2 {
+                    b_vscroll_raw >> 1
+                } else {
+                    b_vscroll_raw
+                };
+                let a_vscroll = normalize_scroll(a_vscroll_raw, plane_height_px);
+                let b_vscroll = normalize_scroll(b_vscroll_raw, plane_height_px);
                 let plane_b = if disable_plane_b {
                     None
                 } else {
-                    let sample_y = if invert_vscroll_b {
+                    let mut sample_y = if invert_vscroll_b {
                         (y + plane_height_px - b_vscroll) % plane_height_px
                     } else {
                         (y + b_vscroll) % plane_height_px
                     };
+                    if comix_b_bias {
+                        sample_y = (sample_y as isize + comix_b_bias_offset as isize)
+                            .rem_euclid(plane_height_px as isize)
+                            as usize;
+                    }
+                    if comix_title_roll {
+                        sample_y = (sample_y as isize + comix_roll_offset as isize)
+                            .rem_euclid(plane_height_px as isize)
+                            as usize;
+                    }
                     self.sample_plane_pixel(
                         vram,
                         plane_b_base,
@@ -1166,8 +1447,13 @@ impl Vdp {
                         true,
                         plane_paged_layout_b,
                         plane_paged_xmajor_b,
+                        interlace_mode_2,
+                        interlace_field,
                     )
                 };
+                if plane_b.is_some() {
+                    line_b_opaque = line_b_opaque.saturating_add(1);
+                }
 
                 let front_plane = if !disable_window && self.window_active_at(&regs, x, y) {
                     self.sample_plane_pixel(
@@ -1181,6 +1467,8 @@ impl Vdp {
                         false,
                         false,
                         false,
+                        interlace_mode_2,
+                        interlace_field,
                     )
                 } else {
                     let sample_y = if invert_vscroll_a {
@@ -1199,6 +1487,8 @@ impl Vdp {
                         true,
                         plane_paged_layout_a,
                         plane_paged_xmajor_a,
+                        interlace_mode_2,
+                        interlace_field,
                     )
                 };
                 let front_plane = if disable_plane_a { None } else { front_plane };
@@ -1226,6 +1516,45 @@ impl Vdp {
                     plane_meta[meta_index] = 0;
                 }
             }
+            if comix_title_roll && !disable_comix_roll_sparse_mask {
+                line_plane_b_opaque_pixels[y] = line_b_opaque;
+            }
+        }
+
+        if comix_title_roll_any
+            && std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_ROLL_SPARSE_MASK").is_none()
+        {
+            let min_pixels = std::env::var("MEGADRIVE_DEBUG_COMIX_ROLL_MIN_PIXELS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or((FRAME_WIDTH * 3) / 5);
+            let run_required = std::env::var("MEGADRIVE_DEBUG_COMIX_ROLL_MIN_RUN")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(6)
+                .max(1);
+            let search_start = (comix_title_roll_active_height / 3).max(48);
+            let search_end = comix_title_roll_active_height.min(FRAME_HEIGHT);
+            let mut run = 0usize;
+            let mut clip_start = None;
+            for y in search_start..search_end {
+                if line_plane_b_opaque_pixels[y] < min_pixels {
+                    run = run.saturating_add(1);
+                    if run >= run_required {
+                        clip_start = Some(y + 1 - run_required);
+                        break;
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+            if let Some(start) = clip_start {
+                for y in start..search_end {
+                    let row = y * FRAME_WIDTH * 3;
+                    self.frame_buffer[row..row + FRAME_WIDTH * 3].fill(0);
+                    plane_meta[y * FRAME_WIDTH..(y + 1) * FRAME_WIDTH].fill(0);
+                }
+            }
         }
 
         if !disable_sprites {
@@ -1234,10 +1563,11 @@ impl Vdp {
     }
 
     fn render_sprites(&mut self, plane_meta: &[u8]) {
-        const MAX_SPRITES: usize = 80;
-        let sat_use_live = std::env::var_os("MEGADRIVE_DEBUG_SAT_LIVE").is_some();
-        let sat_use_line_latched =
-            std::env::var_os("MEGADRIVE_DEBUG_SAT_LINE_LATCH").is_some() || !sat_use_live;
+        let max_sat_sprites = if self.h40_mode() { 80usize } else { 64usize };
+        let sat_use_line_latched = self.line_vram_latch_enabled
+            && std::env::var_os("MEGADRIVE_DEBUG_SAT_LINE_LATCH").is_some();
+        let sat_use_live =
+            std::env::var_os("MEGADRIVE_DEBUG_SAT_LIVE").is_some() || !sat_use_line_latched;
         let sat_per_line = std::env::var_os("MEGADRIVE_DEBUG_SAT_PER_LINE").is_some();
         let sprite_x_offset = std::env::var("MEGADRIVE_DEBUG_SPRITE_X_OFFSET")
             .ok()
@@ -1262,11 +1592,10 @@ impl Vdp {
         let mut sprite_filled = vec![false; FRAME_WIDTH * FRAME_HEIGHT];
         let mut index = 0usize;
 
-        for _ in 0..MAX_SPRITES {
+        for _ in 0..max_sat_sprites {
             let entry_addr = self.sprite_table_base() + index * 8;
             let (mut y_word, mut size_link, mut attr, mut x_word) = {
-                // Default to line-0 latched SAT to avoid next-frame SAT leaking
-                // into current output. Optional live-SAT mode helps diagnostics.
+                // Use live SAT by default; line-latched SAT can be enabled for diagnostics.
                 let sat_vram = if sat_use_live {
                     &self.vram
                 } else {
@@ -1280,7 +1609,10 @@ impl Vdp {
                 )
             };
             if sat_use_line_latched {
-                let y = (y_word & 0x03FF) as i32 - 128;
+                let mut y = (y_word & 0x03FF) as i32 - 128;
+                if self.interlace_mode_enabled() {
+                    y >>= 1;
+                }
                 let line = y.clamp(0, (FRAME_HEIGHT - 1) as i32) as usize;
                 let sat_vram = self.line_vram.get(line).unwrap_or(&self.vram);
                 y_word = read_u16_be_wrapped(sat_vram, entry_addr);
@@ -1304,7 +1636,7 @@ impl Vdp {
             );
 
             let link = (size_link & 0x007F) as usize;
-            if link == 0 || link == index || link >= MAX_SPRITES {
+            if link == 0 || link == index || link >= max_sat_sprites {
                 break;
             }
             index = link;
@@ -1319,7 +1651,6 @@ impl Vdp {
         sprite_x_offset: i32,
         sprite_y_offset: i32,
     ) {
-        const MAX_SPRITES: usize = 80;
         let swap_size = std::env::var_os("MEGADRIVE_DEBUG_SPRITE_SWAP_SIZE").is_some();
         let sprite_pattern_line0 = std::env::var_os("MEGADRIVE_DEBUG_SPRITE_PATTERN_LINE0")
             .is_some()
@@ -1340,6 +1671,12 @@ impl Vdp {
                 .get(dy)
                 .copied()
                 .unwrap_or(self.registers);
+            let interlace_mode_2 = Self::interlace_mode_2_from_regs(&regs);
+            let interlace_field = if interlace_mode_2 {
+                (self.frame_count & 1) as usize
+            } else {
+                0
+            };
             if !Self::display_enabled_from_regs(&regs) {
                 continue;
             }
@@ -1353,25 +1690,38 @@ impl Vdp {
             } else {
                 (16usize, line_active_width)
             };
+            let max_sat_sprites = if Self::h40_mode_from_regs(&regs) {
+                80usize
+            } else {
+                64usize
+            };
             let sat_vram = if sat_use_live {
                 &self.vram
             } else {
                 self.line_vram.get(dy).unwrap_or(&self.vram)
             };
             let pattern_vram = if sprite_pattern_line0 {
-                self.line_vram.first().unwrap_or(&self.vram)
+                if sat_use_live {
+                    &self.vram
+                } else {
+                    self.line_vram.first().unwrap_or(&self.vram)
+                }
             } else {
-                self.line_vram.get(dy).unwrap_or(&self.vram)
+                if sat_use_live {
+                    &self.vram
+                } else {
+                    self.line_vram.get(dy).unwrap_or(&self.vram)
+                }
             };
 
             let mut masked = false;
             let mut line_sprites = 0usize;
             let mut line_pixels = 0usize;
             let mut index = 0usize;
-            let mut visited = [false; MAX_SPRITES];
+            let mut visited = vec![false; max_sat_sprites];
 
-            for _ in 0..MAX_SPRITES {
-                if index >= MAX_SPRITES || visited[index] {
+            for _ in 0..max_sat_sprites {
+                if index >= max_sat_sprites || visited[index] {
                     break;
                 }
                 visited[index] = true;
@@ -1383,7 +1733,10 @@ impl Vdp {
                 let link = (size_link & 0x007F) as usize;
 
                 let x = (x_word & 0x01FF) as i32 - 128 + sprite_x_offset;
-                let y = (y_word & 0x03FF) as i32 - 128 + sprite_y_offset;
+                let mut y = (y_word & 0x03FF) as i32 - 128 + sprite_y_offset;
+                if interlace_mode_2 {
+                    y >>= 1;
+                }
                 let is_mask_sprite = (x_word & 0x01FF) == 0 && !disable_mask_sprite;
                 let (width_tiles, height_tiles) = if swap_size {
                     (
@@ -1419,6 +1772,16 @@ impl Vdp {
                             let src_y = if vflip { height_px - 1 - sy } else { sy };
                             let tile_row = src_y / 8;
                             let in_tile_y = src_y & 7;
+                            let in_tile_y = if interlace_mode_2 {
+                                (in_tile_y << 1) | interlace_field
+                            } else {
+                                in_tile_y
+                            };
+                            let tile_stride = if interlace_mode_2 {
+                                TILE_SIZE_BYTES * 2
+                            } else {
+                                TILE_SIZE_BYTES
+                            };
                             for sx in 0..width_px {
                                 if line_pixels >= max_pixels_per_line {
                                     self.sprite_overflow = true;
@@ -1440,7 +1803,7 @@ impl Vdp {
                                     tile_base + tile_col * height_tiles + tile_row
                                 };
                                 let tile_addr =
-                                    tile_index * TILE_SIZE_BYTES + in_tile_y * 4 + in_tile_x / 2;
+                                    tile_index * tile_stride + in_tile_y * 4 + in_tile_x / 2;
                                 let tile_byte = pattern_vram[tile_addr % VRAM_SIZE];
                                 let pixel = if in_tile_x & 1 == 0 {
                                     tile_byte >> 4
@@ -1515,7 +1878,7 @@ impl Vdp {
                     }
                 }
 
-                if link == 0 || link == index || link >= MAX_SPRITES {
+                if link == 0 || link == index || link >= max_sat_sprites {
                     break;
                 }
                 index = link;
@@ -1539,7 +1902,10 @@ impl Vdp {
     ) {
         // Sprite X coordinate is 9-bit (0..511), offset by 128.
         let x = (x_word & 0x01FF) as i32 - 128 + sprite_x_offset;
-        let y = (y_word & 0x03FF) as i32 - 128 + sprite_y_offset;
+        let mut y = (y_word & 0x03FF) as i32 - 128 + sprite_y_offset;
+        if self.interlace_mode_enabled() {
+            y >>= 1;
+        }
         let swap_size = std::env::var_os("MEGADRIVE_DEBUG_SPRITE_SWAP_SIZE").is_some();
         let (width_tiles, height_tiles) = if swap_size {
             (
@@ -1593,6 +1959,12 @@ impl Vdp {
                 } else {
                     (16usize, line_active_width)
                 };
+            let interlace_mode_2 = Self::interlace_mode_2_from_regs(&regs);
+            let interlace_field = if interlace_mode_2 {
+                (self.frame_count & 1) as usize
+            } else {
+                0
+            };
             let line_shadow_highlight = Self::shadow_highlight_mode_from_regs(&regs);
             if is_mask_sprite {
                 masked_line[dy_index] = true;
@@ -1609,6 +1981,16 @@ impl Vdp {
 
             let tile_row = src_y / 8;
             let in_tile_y = src_y & 7;
+            let in_tile_y = if interlace_mode_2 {
+                (in_tile_y << 1) | interlace_field
+            } else {
+                in_tile_y
+            };
+            let tile_stride = if interlace_mode_2 {
+                TILE_SIZE_BYTES * 2
+            } else {
+                TILE_SIZE_BYTES
+            };
             for sx in 0..width_px {
                 let src_x = if hflip { width_px - 1 - sx } else { sx };
                 let dx = x + sx as i32;
@@ -1632,12 +2014,16 @@ impl Vdp {
                     // Sprite pattern index advances in column-major order on the MD VDP.
                     tile_base + tile_col * height_tiles + tile_row
                 };
-                let tile_addr = tile_index * TILE_SIZE_BYTES + in_tile_y * 4 + in_tile_x / 2;
+                let tile_addr = tile_index * tile_stride + in_tile_y * 4 + in_tile_x / 2;
                 let tile_byte = {
-                    let vram = if sprite_pattern_line0 {
-                        self.line_vram.first().unwrap_or(&self.vram)
+                    let vram = if self.line_vram_latch_enabled {
+                        if sprite_pattern_line0 {
+                            self.line_vram.first().unwrap_or(&self.vram)
+                        } else {
+                            self.line_vram.get(dy_index).unwrap_or(&self.vram)
+                        }
                     } else {
-                        self.line_vram.get(dy_index).unwrap_or(&self.vram)
+                        &self.vram
                     };
                     vram[tile_addr % VRAM_SIZE]
                 };
@@ -1719,6 +2105,17 @@ impl Vdp {
 
     fn h40_mode(&self) -> bool {
         Self::h40_mode_from_regs(&self.registers)
+    }
+
+    fn interlace_mode_enabled(&self) -> bool {
+        Self::interlace_mode_2_from_regs(&self.registers)
+    }
+
+    fn interlace_mode_2_from_regs(regs: &[u8; REG_COUNT]) -> bool {
+        // Reg 12 bits 2:1 select interlace mode.
+        // Mode 3 (binary 11, often called interlace mode 2) doubles tile row
+        // addressing and toggles odd/even field each frame.
+        ((regs[12] >> 1) & 0x03) == 0x03
     }
 
     fn shadow_highlight_mode_from_regs(regs: &[u8; REG_COUNT]) -> bool {
