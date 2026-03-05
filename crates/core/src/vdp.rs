@@ -116,6 +116,37 @@ impl VideoStandard {
     }
 }
 
+/// A Vec wrapper that serializes as empty (scratch buffers need not be persisted).
+#[derive(Debug, Clone, Default)]
+struct ScratchBuf<T>(Vec<T>);
+
+impl<T> std::ops::Deref for ScratchBuf<T> {
+    type Target = Vec<T>;
+    fn deref(&self) -> &Vec<T> {
+        &self.0
+    }
+}
+impl<T> std::ops::DerefMut for ScratchBuf<T> {
+    fn deref_mut(&mut self) -> &mut Vec<T> {
+        &mut self.0
+    }
+}
+impl<T> bincode::Encode for ScratchBuf<T> {
+    fn encode<E: bincode::enc::Encoder>(&self, _encoder: &mut E) -> Result<(), bincode::error::EncodeError> {
+        Ok(())
+    }
+}
+impl<C, T> bincode::Decode<C> for ScratchBuf<T> {
+    fn decode<D: bincode::de::Decoder<Context = C>>(_decoder: &mut D) -> Result<Self, bincode::error::DecodeError> {
+        Ok(ScratchBuf(Vec::new()))
+    }
+}
+impl<'de, C, T> bincode::BorrowDecode<'de, C> for ScratchBuf<T> {
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = C>>(_decoder: &mut D) -> Result<Self, bincode::error::DecodeError> {
+        Ok(ScratchBuf(Vec::new()))
+    }
+}
+
 #[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct Vdp {
     video_standard: VideoStandard,
@@ -155,6 +186,10 @@ pub struct Vdp {
     quirk_plane_a_64x32_paged: bool,
     quirk_vscroll_swap_ab: bool,
     quirk_comix_pretitle_plane_b_bias: bool,
+    /// Scratch buffer for per-pixel plane metadata (reused across frames).
+    render_plane_meta: ScratchBuf<u8>,
+    /// Scratch buffer for sprite pixel fill tracking (reused across frames).
+    render_sprite_filled: ScratchBuf<bool>,
 }
 
 impl Default for Vdp {
@@ -227,6 +262,8 @@ impl Vdp {
             quirk_plane_a_64x32_paged: false,
             quirk_vscroll_swap_ab: false,
             quirk_comix_pretitle_plane_b_bias: false,
+            render_plane_meta: ScratchBuf(vec![0u8; FRAME_WIDTH * FRAME_HEIGHT]),
+            render_sprite_filled: ScratchBuf(vec![false; FRAME_WIDTH * FRAME_HEIGHT]),
         };
         vdp.reset_line_state();
         vdp.capture_line_state(0);
@@ -1194,7 +1231,7 @@ impl Vdp {
         plane_paged_xmajor: bool,
         interlace_mode_2: bool,
         interlace_field: usize,
-    ) -> Option<PlaneSample> {
+    ) -> (Option<PlaneSample>, bool) {
         let tile_x = (sample_x / 8) % plane_width_tiles.max(1);
         let tile_y = (sample_y / 8) % plane_height_tiles.max(1);
         let mut in_tile_x = sample_x & 7;
@@ -1245,14 +1282,14 @@ impl Vdp {
             tile_byte & 0x0F
         };
         if pixel == 0 {
-            return None;
+            return (None, priority_high);
         }
 
-        Some(PlaneSample {
+        (Some(PlaneSample {
             color_index: palette_line * 16 + pixel as usize,
             opaque: true,
             priority_high,
-        })
+        }), priority_high)
     }
 
     fn scroll_plane_name_addr(
@@ -1305,8 +1342,9 @@ impl Vdp {
         &self,
         front: Option<PlaneSample>,
         back: Option<PlaneSample>,
+        ignore_priority: bool,
     ) -> Option<PlaneSample> {
-        if std::env::var_os("MEGADRIVE_DEBUG_IGNORE_PLANE_PRIORITY").is_some() {
+        if ignore_priority {
             return front.or(back);
         }
         match (front, back) {
@@ -1448,7 +1486,39 @@ impl Vdp {
             .unwrap_or(0);
         let bottom_bg_mask = self.quirk_bottom_bg_mask
             || std::env::var_os("MEGADRIVE_DEBUG_BOTTOM_BG_MASK").is_some();
-        let mut plane_meta = vec![0u8; FRAME_WIDTH * FRAME_HEIGHT];
+        let hscroll_live =
+            self.quirk_live_hscroll || std::env::var_os("MEGADRIVE_DEBUG_HSCROLL_LIVE").is_some();
+        let disable_64x32_paged =
+            std::env::var_os("MEGADRIVE_DEBUG_DISABLE_64X32_PAGED").is_some();
+        let disable_64x32_paged_a =
+            std::env::var_os("MEGADRIVE_DEBUG_DISABLE_64X32_PAGED_A").is_some();
+        let disable_64x32_paged_b =
+            std::env::var_os("MEGADRIVE_DEBUG_DISABLE_64X32_PAGED_B").is_some();
+        let debug_plane_a_64x32_paged =
+            std::env::var_os("MEGADRIVE_DEBUG_PLANE_A_64X32_PAGED").is_some();
+        let debug_plane_b_64x32_paged =
+            std::env::var_os("MEGADRIVE_DEBUG_PLANE_B_64X32_PAGED").is_some();
+        let disable_comix_bias =
+            std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_BIAS").is_some();
+        let disable_comix_roll_fix =
+            std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_ROLL_FIX").is_some();
+        let comix_b_bias_offset = std::env::var("MEGADRIVE_DEBUG_COMIX_BIAS_Y")
+            .ok()
+            .and_then(|v| v.parse::<i16>().ok())
+            .unwrap_or(64);
+        let comix_roll_offset = std::env::var("MEGADRIVE_DEBUG_COMIX_ROLL_Y")
+            .ok()
+            .and_then(|v| v.parse::<i16>().ok())
+            .unwrap_or(0);
+        let disable_comix_roll_sparse_mask =
+            std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_ROLL_SPARSE_MASK").is_some();
+        let ignore_plane_priority =
+            std::env::var_os("MEGADRIVE_DEBUG_IGNORE_PLANE_PRIORITY").is_some();
+        let mut plane_meta = std::mem::take(&mut self.render_plane_meta);
+        if plane_meta.len() != FRAME_WIDTH * FRAME_HEIGHT {
+            plane_meta.resize(FRAME_WIDTH * FRAME_HEIGHT, 0);
+        }
+        plane_meta.fill(0);
         let mut line_plane_b_opaque_pixels = [0usize; FRAME_HEIGHT];
         let mut comix_title_roll_any = false;
         let mut comix_title_roll_active_height = 0usize;
@@ -1467,9 +1537,7 @@ impl Vdp {
                 .get(line_idx)
                 .copied()
                 .unwrap_or_else(|| self.current_line_hscroll_words(y, &regs));
-            let hscroll_words = if self.quirk_live_hscroll
-                || std::env::var_os("MEGADRIVE_DEBUG_HSCROLL_LIVE").is_some()
-            {
+            let hscroll_words = if hscroll_live {
                 self.current_line_hscroll_words(line_idx, &regs)
             } else {
                 hscroll_words
@@ -1504,19 +1572,13 @@ impl Vdp {
                 Self::plane_tile_dimensions_from_regs(&regs);
             let (window_width_tiles, window_height_tiles) =
                 Self::window_tile_dimensions_from_regs(&regs);
-            let disable_64x32_paged =
-                std::env::var_os("MEGADRIVE_DEBUG_DISABLE_64X32_PAGED").is_some();
-            let disable_64x32_paged_a =
-                std::env::var_os("MEGADRIVE_DEBUG_DISABLE_64X32_PAGED_A").is_some();
-            let disable_64x32_paged_b =
-                std::env::var_os("MEGADRIVE_DEBUG_DISABLE_64X32_PAGED_B").is_some();
             let plane_a_uses_64x32_paged = !disable_64x32_paged
                 && !disable_64x32_paged_a
-                && (std::env::var_os("MEGADRIVE_DEBUG_PLANE_A_64X32_PAGED").is_some()
+                && (debug_plane_a_64x32_paged
                     || (self.quirk_plane_a_64x32_paged && plane_width_tiles > 64));
             let plane_b_uses_64x32_paged = !disable_64x32_paged
                 && !disable_64x32_paged_b
-                && std::env::var_os("MEGADRIVE_DEBUG_PLANE_B_64X32_PAGED").is_some();
+                && debug_plane_b_64x32_paged;
             let plane_width_px = plane_width_tiles * 8;
             let plane_height_px = plane_height_tiles * 8;
             let window_width_px = window_width_tiles * 8;
@@ -1535,11 +1597,11 @@ impl Vdp {
                 normalize_scroll(Self::sign_extend_11(hscroll_words[1]), plane_width_px);
             let comix_b_bias_active = Self::comix_pretitle_plane_b_bias_active(&regs, &vsram);
             let comix_b_bias = self.quirk_comix_pretitle_plane_b_bias
-                && std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_BIAS").is_none()
+                && !disable_comix_bias
                 && comix_b_bias_active;
             let comix_title_roll = self.quirk_vscroll_swap_ab
                 && Self::comix_title_roll_active(&regs, &vsram)
-                && std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_ROLL_FIX").is_none();
+                && !disable_comix_roll_fix;
             // Suppress plane B pixels whose nametable entries fall inside the
             // HSCROLL table region.  This is computed from the actual register
             // values each line (independent of comix_title_roll_active) so that
@@ -1551,16 +1613,6 @@ impl Vdp {
             };
             let swap_vscroll_ab = debug_swap_vscroll_ab
                 || (self.quirk_vscroll_swap_ab && Self::comix_pretitle_vscroll_swap_active(&regs));
-            let comix_b_bias_offset = std::env::var("MEGADRIVE_DEBUG_COMIX_BIAS_Y")
-                .ok()
-                .and_then(|v| v.parse::<i16>().ok())
-                .unwrap_or(64);
-            let comix_roll_offset = std::env::var("MEGADRIVE_DEBUG_COMIX_ROLL_Y")
-                .ok()
-                .and_then(|v| v.parse::<i16>().ok())
-                .unwrap_or(0);
-            let disable_comix_roll_sparse_mask =
-                std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_ROLL_SPARSE_MASK").is_some();
             if comix_title_roll {
                 comix_title_roll_any = true;
                 comix_title_roll_active_height = line_active_height;
@@ -1598,8 +1650,8 @@ impl Vdp {
                 };
                 let a_vscroll = normalize_scroll(a_vscroll_raw, plane_height_px);
                 let b_vscroll = normalize_scroll(b_vscroll_raw, plane_height_px);
-                let plane_b = if disable_plane_b {
-                    None
+                let (plane_b, plane_b_raw_pri) = if disable_plane_b {
+                    (None, false)
                 } else {
                     let mut sample_y = if invert_vscroll_b {
                         (y + plane_height_px - b_vscroll) % plane_height_px
@@ -1619,7 +1671,7 @@ impl Vdp {
                     if comix_roll_overlap_limit
                         .map_or(false, |limit| sample_y >= limit)
                     {
-                        None
+                        (None, false)
                     } else {
                         self.sample_plane_pixel(
                             vram,
@@ -1641,7 +1693,7 @@ impl Vdp {
                     line_b_opaque = line_b_opaque.saturating_add(1);
                 }
 
-                let front_plane = if !disable_window && self.window_active_at(&regs, x, y) {
+                let (front_plane, front_raw_pri) = if !disable_window && self.window_active_at(&regs, x, y) {
                     self.sample_plane_pixel(
                         vram,
                         window_base,
@@ -1679,7 +1731,7 @@ impl Vdp {
                 };
                 let front_plane = if disable_plane_a { None } else { front_plane };
 
-                let mut composed = self.compose_plane_samples(front_plane, plane_b);
+                let mut composed = self.compose_plane_samples(front_plane, plane_b, ignore_plane_priority);
                 if bottom_bg_mask && y >= line_active_height.saturating_sub(32) {
                     composed = None;
                 }
@@ -1689,12 +1741,12 @@ impl Vdp {
                 let color = cram[color_index % CRAM_COLORS];
                 let (r, g, b) = md_color_to_rgb888(color);
 
-                // Shadow/Highlight mode: low-priority plane pixels are shadowed,
-                // high-priority plane pixels are at normal brightness.
+                // Shadow/Highlight mode: if ANY plane has priority set at this
+                // pixel (even if transparent), the pixel is at normal brightness.
+                // Otherwise it is shadowed.
                 let line_sh = Self::shadow_highlight_mode_from_regs(&regs);
-                let (r, g, b) = if line_sh
-                    && !composed.map(|s| s.priority_high).unwrap_or(false)
-                {
+                let any_plane_priority = front_raw_pri || plane_b_raw_pri;
+                let (r, g, b) = if line_sh && !any_plane_priority {
                     (shadow_channel(r), shadow_channel(g), shadow_channel(b))
                 } else {
                     (r, g, b)
@@ -1706,24 +1758,20 @@ impl Vdp {
                 self.frame_buffer[out + 2] = b;
 
                 let meta_index = y * FRAME_WIDTH + x;
-                // Encode: bit 0 = opaque, bit 1 = priority_high, bits 2..7 = color_index
+                // Encode: bit 0 = opaque, bit 1 = any_plane_priority (for S/H),
+                // bits 2..7 = color_index
                 let ci = (color_index as u8) & 0x3F;
-                if let Some(sample) = composed {
-                    plane_meta[meta_index] = (sample.opaque as u8)
-                        | ((sample.priority_high as u8) << 1)
-                        | (ci << 2);
-                } else {
-                    plane_meta[meta_index] = ci << 2;
-                }
+                let opaque = composed.map(|s| s.opaque).unwrap_or(false);
+                plane_meta[meta_index] = (opaque as u8)
+                    | ((any_plane_priority as u8) << 1)
+                    | (ci << 2);
             }
             if comix_title_roll && !disable_comix_roll_sparse_mask {
                 line_plane_b_opaque_pixels[y] = line_b_opaque;
             }
         }
 
-        if comix_title_roll_any
-            && std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_ROLL_SPARSE_MASK").is_none()
-        {
+        if comix_title_roll_any && !disable_comix_roll_sparse_mask {
             let min_pixels = std::env::var("MEGADRIVE_DEBUG_COMIX_ROLL_MIN_PIXELS")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -1760,6 +1808,7 @@ impl Vdp {
         if !disable_sprites {
             self.render_sprites(&plane_meta);
         }
+        self.render_plane_meta = plane_meta;
     }
 
     fn render_sprites(&mut self, plane_meta: &[u8]) {
@@ -1789,7 +1838,11 @@ impl Vdp {
         let mut sprites_on_line = [0u8; FRAME_HEIGHT];
         let mut sprite_pixels_on_line = [0u16; FRAME_HEIGHT];
         let mut masked_line = [false; FRAME_HEIGHT];
-        let mut sprite_filled = vec![false; FRAME_WIDTH * FRAME_HEIGHT];
+        let mut sprite_filled = std::mem::take(&mut self.render_sprite_filled);
+        if sprite_filled.len() != FRAME_WIDTH * FRAME_HEIGHT {
+            sprite_filled.resize(FRAME_WIDTH * FRAME_HEIGHT, false);
+        }
+        sprite_filled.fill(false);
         let mut index = 0usize;
 
         for _ in 0..max_sat_sprites {
@@ -1841,6 +1894,7 @@ impl Vdp {
             }
             index = link;
         }
+        self.render_sprite_filled = sprite_filled;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1856,14 +1910,13 @@ impl Vdp {
             .is_some()
             && std::env::var_os("MEGADRIVE_DEBUG_SPRITE_PATTERN_PER_LINE").is_none();
         let sprite_row_major = std::env::var_os("MEGADRIVE_DEBUG_SPRITE_ROW_MAJOR").is_some();
-        let control_no_occupy = std::env::var_os("MEGADRIVE_DEBUG_CONTROL_NO_OCCUPY").is_some();
-        let control_behind_hi_plane =
-            std::env::var_os("MEGADRIVE_DEBUG_CONTROL_BEHIND_HIPLANE").is_some();
-        let control_require_plane_opaque =
-            std::env::var_os("MEGADRIVE_DEBUG_CONTROL_REQUIRE_PLANE_OPAQUE").is_some();
         let disable_mask_sprite = std::env::var_os("MEGADRIVE_DEBUG_DISABLE_SPRITE_MASK").is_some();
 
-        let mut sprite_filled = vec![false; FRAME_WIDTH * FRAME_HEIGHT];
+        let mut sprite_filled = std::mem::take(&mut self.render_sprite_filled);
+        if sprite_filled.len() != FRAME_WIDTH * FRAME_HEIGHT {
+            sprite_filled.resize(FRAME_WIDTH * FRAME_HEIGHT, false);
+        }
+        sprite_filled.fill(false);
         let sat_base = self.sprite_table_base();
         for dy in 0..FRAME_HEIGHT {
             let regs = self
@@ -2026,41 +2079,21 @@ impl Vdp {
                                     && palette_line == 3
                                     && (pixel == 14 || pixel == 15)
                                 {
-                                    if control_require_plane_opaque && !plane_opaque {
-                                        continue;
-                                    }
-                                    if control_behind_hi_plane
-                                        && plane_opaque
-                                        && plane_priority_high
-                                    {
-                                        continue;
-                                    }
-                                    if !control_no_occupy && sprite_filled[meta_index] {
-                                        self.sprite_collision = true;
-                                        continue;
-                                    }
-                                    // Use stored plane color index for correct S/H
-                                    // brightness without compounding errors.
                                     let plane_ci = ((meta >> 2) & 0x3F) as usize;
                                     let plane_color =
                                         self.line_cram[dy][plane_ci % CRAM_COLORS];
                                     let (pr, pg, pb) = md_color_to_rgb888(plane_color);
                                     let out = meta_index * 3;
                                     if pixel == 15 {
-                                        // Shadow control: always shadow.
                                         self.frame_buffer[out] = shadow_channel(pr);
                                         self.frame_buffer[out + 1] = shadow_channel(pg);
                                         self.frame_buffer[out + 2] = shadow_channel(pb);
                                     } else {
-                                        // Highlight control: shadow→normal,
-                                        // normal→highlight.
                                         if !plane_priority_high {
-                                            // Was shadowed → restore to normal.
                                             self.frame_buffer[out] = pr;
                                             self.frame_buffer[out + 1] = pg;
                                             self.frame_buffer[out + 2] = pb;
                                         } else {
-                                            // Was normal → highlight.
                                             self.frame_buffer[out] =
                                                 highlight_channel(pr);
                                             self.frame_buffer[out + 1] =
@@ -2068,9 +2101,6 @@ impl Vdp {
                                             self.frame_buffer[out + 2] =
                                                 highlight_channel(pb);
                                         }
-                                    }
-                                    if !control_no_occupy {
-                                        sprite_filled[meta_index] = true;
                                     }
                                     continue;
                                 }
@@ -2123,6 +2153,7 @@ impl Vdp {
                 index = link;
             }
         }
+        self.render_sprite_filled = sprite_filled;
     }
 
     fn draw_sprite(
@@ -2170,7 +2201,6 @@ impl Vdp {
             .is_some()
             && std::env::var_os("MEGADRIVE_DEBUG_SPRITE_PATTERN_PER_LINE").is_none();
         let sprite_row_major = std::env::var_os("MEGADRIVE_DEBUG_SPRITE_ROW_MAJOR").is_some();
-        let control_no_occupy = std::env::var_os("MEGADRIVE_DEBUG_CONTROL_NO_OCCUPY").is_some();
 
         for sy in 0..height_px {
             let src_y = if vflip { height_px - 1 - sy } else { sy };
@@ -2284,28 +2314,16 @@ impl Vdp {
                 }
 
                 if line_shadow_highlight && palette_line == 3 && (pixel == 14 || pixel == 15) {
-                    let control_behind_hi_plane =
-                        std::env::var_os("MEGADRIVE_DEBUG_CONTROL_BEHIND_HIPLANE").is_some();
-                    let control_require_plane_opaque =
-                        std::env::var_os("MEGADRIVE_DEBUG_CONTROL_REQUIRE_PLANE_OPAQUE").is_some();
-                    if control_require_plane_opaque && !plane_opaque {
-                        continue;
-                    }
-                    if control_behind_hi_plane && plane_opaque && plane_priority_high {
-                        continue;
-                    }
-                    if !control_no_occupy && sprite_filled[meta_index] {
-                        self.sprite_collision = true;
-                        continue;
-                    }
-                    // Use stored plane color index for correct S/H brightness.
+                    // S/H control sprites modify brightness of the underlying
+                    // plane pixel.  They are transparent — they do NOT occupy
+                    // the sprite layer and do NOT trigger collision.
                     let plane_ci = ((meta >> 2) & 0x3F) as usize;
                     let plane_color =
                         self.line_cram[dy_index][plane_ci % CRAM_COLORS];
                     let (pr, pg, pb) = md_color_to_rgb888(plane_color);
                     let out = meta_index * 3;
                     if pixel == 15 {
-                        // Shadow control: always shadow.
+                        // Shadow control: always shadow the plane color.
                         self.frame_buffer[out] = shadow_channel(pr);
                         self.frame_buffer[out + 1] = shadow_channel(pg);
                         self.frame_buffer[out + 2] = shadow_channel(pb);
@@ -2322,9 +2340,6 @@ impl Vdp {
                             self.frame_buffer[out + 1] = highlight_channel(pg);
                             self.frame_buffer[out + 2] = highlight_channel(pb);
                         }
-                    }
-                    if !control_no_occupy {
-                        sprite_filled[meta_index] = true;
                     }
                     continue;
                 }
@@ -2651,21 +2666,16 @@ fn md_color_to_rgb888(color: u16) -> (u8, u8, u8) {
     (r * 36, g * 36, b * 36)
 }
 
-fn rgb888_to_md_level(channel: u8) -> u8 {
-    ((channel as u16 + 18) / 36).min(7) as u8
-}
-
-fn md_level_to_rgb888(level: u8) -> u8 {
-    (level.min(7) as u16 * 36) as u8
-}
-
 fn shadow_channel(channel: u8) -> u8 {
-    md_level_to_rgb888(rgb888_to_md_level(channel) / 2)
+    // S/H mode uses a 4-bit DAC: shadow output = L (vs normal 2L).
+    // This is exactly half the normal brightness.
+    channel >> 1
 }
 
 fn highlight_channel(channel: u8) -> u8 {
-    let level = ((rgb888_to_md_level(channel) as u16 * 3) / 2).min(7) as u8;
-    md_level_to_rgb888(level)
+    // S/H mode highlight output = 2L+1 (vs normal 2L).
+    // One DAC step (252/14 = 18) above normal brightness.
+    (channel as u16 + 18).min(255) as u8
 }
 
 fn plane_size_code_to_tiles(code: u8) -> usize {
