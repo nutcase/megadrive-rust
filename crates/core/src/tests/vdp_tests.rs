@@ -1613,6 +1613,8 @@ fn dma_fill_writes_repeated_bytes_to_vram() {
     vdp.write_control_port(0x0080);
     // Fill value provided via data port.
     vdp.write_data_port(0xA1B2);
+    // Flush the gradual DMA fill so bytes are written immediately for test.
+    vdp.flush_pending_dma();
 
     // Current model writes the initial data-port word first, then fills the
     // byte lane selected by A0 while auto-incrementing.
@@ -1648,6 +1650,8 @@ fn dma_copy_copies_vram_bytes() {
     // VRAM write DMA command @ 0x0200 (code with DMA bit set).
     vdp.write_control_port(0x4200);
     vdp.write_control_port(0x0080);
+    // Flush the gradual DMA copy so bytes are written immediately for test.
+    vdp.flush_pending_dma();
 
     assert_eq!(vdp.read_vram_u8(0x0200), 0x11);
     assert_eq!(vdp.read_vram_u8(0x0201), 0x22);

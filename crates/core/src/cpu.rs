@@ -335,18 +335,13 @@ impl M68k {
             return None;
         }
 
+        let src_ea = self.word_ea_calculation_cycles(src_mode, src_reg)?;
         let src = self.read_ea_byte(src_mode, src_reg, memory)?;
         self.write_ea_byte(dst_mode, dst_reg, src, memory)?;
         self.update_move_flags_byte(src);
 
-        let mut cycles = 8;
-        if src_mode == 0b101 || src_mode == 0b111 {
-            cycles += 4;
-        }
-        if dst_mode == 0b101 || dst_mode == 0b111 {
-            cycles += 4;
-        }
-        Some(cycles)
+        let base = Self::move_dest_base_cycles(dst_mode, dst_reg, false);
+        Some(base + src_ea)
     }
 
     fn exec_move_w_family(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -360,18 +355,13 @@ impl M68k {
             return None;
         }
 
+        let src_ea = self.word_ea_calculation_cycles(src_mode, src_reg)?;
         let src = self.read_ea_word(src_mode, src_reg, memory)?;
         self.write_ea_word(dst_mode, dst_reg, src, memory)?;
         self.update_move_flags_word(src);
 
-        let mut cycles = 8;
-        if src_mode == 0b101 || src_mode == 0b111 {
-            cycles += 4;
-        }
-        if dst_mode == 0b101 || dst_mode == 0b111 {
-            cycles += 4;
-        }
-        Some(cycles)
+        let base = Self::move_dest_base_cycles(dst_mode, dst_reg, false);
+        Some(base + src_ea)
     }
 
     fn exec_move_l_imm_abs_l(&mut self, memory: &mut MemoryMap) -> u32 {
@@ -379,7 +369,7 @@ impl M68k {
         let dst = self.fetch_u32(memory);
         memory.write_u32(dst, value);
         self.update_move_flags_long(value);
-        20
+        28 // MOVE.L #imm,xxx.L: dest_base(xxx.L,long)=20 + src_ea_long(#imm)=8
     }
 
     fn exec_move_l_family(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -393,18 +383,13 @@ impl M68k {
             return None;
         }
 
+        let src_ea = self.long_ea_calculation_cycles(src_mode, src_reg)?;
         let src = self.read_ea_long(src_mode, src_reg, memory)?;
         self.write_ea_long(dst_mode, dst_reg, src, memory)?;
         self.update_move_flags_long(src);
 
-        let mut cycles = 12;
-        if src_mode == 0b101 || src_mode == 0b111 {
-            cycles += 4;
-        }
-        if dst_mode == 0b101 || dst_mode == 0b111 {
-            cycles += 4;
-        }
-        Some(cycles)
+        let base = Self::move_dest_base_cycles(dst_mode, dst_reg, true);
+        Some(base + src_ea)
     }
 
     fn exec_move_l_imm_dn(&mut self, opcode: u16, memory: &mut MemoryMap) -> u32 {
@@ -421,7 +406,7 @@ impl M68k {
         let value = self.d_regs[src];
         memory.write_u32(dst, value);
         self.update_move_flags_long(value);
-        16
+        20 // MOVE.L Dn,xxx.L: dest_base(xxx.L,long)=20 + src_ea(Dn)=0
     }
 
     fn exec_moveq(&mut self, opcode: u16) -> u32 {
@@ -436,18 +421,20 @@ impl M68k {
         let dst = ((opcode >> 9) & 0x7) as usize;
         let mode = ((opcode >> 3) & 0x7) as u8;
         let reg = (opcode & 0x7) as usize;
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         let value = self.read_ea_word(mode, reg, memory)? as i16 as i32 as u32;
         self.a_regs[dst] = value;
-        Some(8)
+        Some(4 + ea_cycles) // MOVEA.W: 4 + ea
     }
 
     fn exec_movea_l(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
         let dst = ((opcode >> 9) & 0x7) as usize;
         let mode = ((opcode >> 3) & 0x7) as u8;
         let reg = (opcode & 0x7) as usize;
+        let ea_cycles = self.long_ea_calculation_cycles(mode, reg)?;
         let value = self.read_ea_long(mode, reg, memory)?;
         self.a_regs[dst] = value;
-        Some(12)
+        Some(4 + ea_cycles) // MOVEA.L: 4 + ea(long)
     }
 
     fn exec_sub_ea_to_dn(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -573,6 +560,7 @@ impl M68k {
 
         match opmode {
             0b000 => {
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let src = self.read_ea_byte(mode, reg, memory)?;
                 let dst_val = self.d_regs[reg_x] as u8;
                 let result = match op {
@@ -581,16 +569,10 @@ impl M68k {
                 };
                 self.d_regs[reg_x] = (self.d_regs[reg_x] & 0xFFFF_FF00) | result as u32;
                 self.update_test_flags_byte(result);
-                let mut cycles = 4;
-                if mode != 0b000 {
-                    cycles += 4;
-                }
-                if mode == 0b101 || mode == 0b111 {
-                    cycles += 4;
-                }
-                Some(cycles)
+                Some(4 + ea_cycles)
             }
             0b001 => {
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let src = self.read_ea_word(mode, reg, memory)?;
                 let dst_val = self.d_regs[reg_x] as u16;
                 let result = match op {
@@ -599,14 +581,7 @@ impl M68k {
                 };
                 self.d_regs[reg_x] = (self.d_regs[reg_x] & 0xFFFF_0000) | result as u32;
                 self.update_test_flags_word(result);
-                let mut cycles = 4;
-                if mode != 0b000 {
-                    cycles += 4;
-                }
-                if mode == 0b101 || mode == 0b111 {
-                    cycles += 4;
-                }
-                Some(cycles)
+                Some(4 + ea_cycles)
             }
             0b010 => {
                 let src = self.read_ea_long(mode, reg, memory)?;
@@ -617,14 +592,14 @@ impl M68k {
                 };
                 self.d_regs[reg_x] = result;
                 self.update_test_flags_long(result);
-                let mut cycles = 8;
-                if mode != 0b000 {
-                    cycles += 4;
+                // Long to Dn: Dn/An/#imm → 8+word_ea; memory → 6+long_ea
+                if mode == 0b000 || mode == 0b001 || (mode == 0b111 && reg == 0b100) {
+                    let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
+                    Some(8 + ea_cycles)
+                } else {
+                    let ea_cycles = self.long_ea_calculation_cycles(mode, reg)?;
+                    Some(6 + ea_cycles)
                 }
-                if mode == 0b101 || mode == 0b111 {
-                    cycles += 4;
-                }
-                Some(cycles)
             }
             _ => None,
         }
@@ -646,6 +621,7 @@ impl M68k {
 
         match opmode {
             0b100 => {
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let src = self.d_regs[src_dn] as u8;
                 let result = if mode == 0b000 {
                     let dst = self.d_regs[reg] as u8;
@@ -666,9 +642,11 @@ impl M68k {
                     result
                 };
                 self.update_test_flags_byte(result);
-                Some(if mode == 0b000 { 4 } else { 8 })
+                // AND/OR Dn,<ea> byte: Dn→4, memory→8+ea
+                Some(if mode == 0b000 { 4 } else { 8 + ea_cycles })
             }
             0b101 => {
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let src = self.d_regs[src_dn] as u16;
                 let result = if mode == 0b000 {
                     let dst = self.d_regs[reg] as u16;
@@ -689,9 +667,11 @@ impl M68k {
                     result
                 };
                 self.update_test_flags_word(result);
-                Some(if mode == 0b000 { 4 } else { 8 })
+                // AND/OR Dn,<ea> word: Dn→4, memory→8+ea
+                Some(if mode == 0b000 { 4 } else { 8 + ea_cycles })
             }
             0b110 => {
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let src = self.d_regs[src_dn];
                 let result = if mode == 0b000 {
                     let dst = self.d_regs[reg];
@@ -712,7 +692,8 @@ impl M68k {
                     result
                 };
                 self.update_test_flags_long(result);
-                Some(if mode == 0b000 { 8 } else { 12 })
+                // AND/OR Dn,<ea> long: Dn→8, memory→12+ea
+                Some(if mode == 0b000 { 8 } else { 12 + ea_cycles })
             }
             _ => None,
         }
@@ -731,6 +712,7 @@ impl M68k {
 
         match opmode {
             0b000 => {
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let src = self.read_ea_byte(mode, reg, memory)?;
                 let dst_val = self.d_regs[dst] as u8;
                 match op {
@@ -746,16 +728,10 @@ impl M68k {
                         self.update_sub_flags_byte_with_extend(dst_val, src, result);
                     }
                 }
-                let mut cycles = 4;
-                if mode != 0b000 {
-                    cycles += 4;
-                }
-                if mode == 0b101 || mode == 0b111 {
-                    cycles += 4;
-                }
-                Some(cycles)
+                Some(4 + ea_cycles) // ADD/SUB byte <ea>,Dn: 4+ea
             }
             0b001 => {
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let src = self.read_ea_word(mode, reg, memory)?;
                 let dst_val = self.d_regs[dst] as u16;
                 match op {
@@ -771,14 +747,7 @@ impl M68k {
                         self.update_sub_flags_word_with_extend(dst_val, src, result);
                     }
                 }
-                let mut cycles = 4;
-                if mode != 0b000 {
-                    cycles += 4;
-                }
-                if mode == 0b101 || mode == 0b111 {
-                    cycles += 4;
-                }
-                Some(cycles)
+                Some(4 + ea_cycles) // ADD/SUB word <ea>,Dn: 4+ea
             }
             0b010 => {
                 let src = self.read_ea_long(mode, reg, memory)?;
@@ -796,20 +765,21 @@ impl M68k {
                         self.update_sub_flags_long_with_extend(dst_val, src, result);
                     }
                 }
-                let mut cycles = 8;
-                if mode != 0b000 {
-                    cycles += 4;
+                // ADD/SUB long <ea>,Dn: Dn/An/#imm → 8+word_ea; memory → 6+long_ea
+                if mode == 0b000 || mode == 0b001 || (mode == 0b111 && reg == 0b100) {
+                    let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
+                    Some(8 + ea_cycles)
+                } else {
+                    let ea_cycles = self.long_ea_calculation_cycles(mode, reg)?;
+                    Some(6 + ea_cycles)
                 }
-                if mode == 0b101 || mode == 0b111 {
-                    cycles += 4;
-                }
-                Some(cycles)
             }
             0b100 => {
                 // Destination EA must be data alterable.
                 if mode == 0b001 || (mode == 0b111 && reg >= 0b010) {
                     return None;
                 }
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let src = self.d_regs[dst] as u8;
                 let dst_val = if mode == 0b000 {
                     self.d_regs[reg] as u8
@@ -838,11 +808,7 @@ impl M68k {
                             self.update_sub_flags_byte_with_extend(dst_val, src, result)
                         }
                     }
-                    let mut cycles = 8;
-                    if mode == 0b101 || mode == 0b110 || mode == 0b111 {
-                        cycles += 4;
-                    }
-                    return Some(cycles);
+                    return Some(8 + ea_cycles); // ADD/SUB Dn,<ea> byte mem: 8+ea
                 };
 
                 let (result, carry, overflow) = match op {
@@ -863,13 +829,14 @@ impl M68k {
                     ArithOp::Add => self.update_add_flags_byte_with_extend(result, carry, overflow),
                     ArithOp::Sub => self.update_sub_flags_byte_with_extend(dst_val, src, result),
                 }
-                Some(4)
+                Some(4) // ADD/SUB Dn,Dn byte: 4
             }
             0b101 => {
                 // Destination EA must be data alterable.
                 if mode == 0b001 || (mode == 0b111 && reg >= 0b010) {
                     return None;
                 }
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let src = self.d_regs[dst] as u16;
                 let dst_val = if mode == 0b000 {
                     self.d_regs[reg] as u16
@@ -898,11 +865,7 @@ impl M68k {
                             self.update_sub_flags_word_with_extend(dst_val, src, result)
                         }
                     }
-                    let mut cycles = 8;
-                    if mode == 0b101 || mode == 0b110 || mode == 0b111 {
-                        cycles += 4;
-                    }
-                    return Some(cycles);
+                    return Some(8 + ea_cycles); // ADD/SUB Dn,<ea> word mem: 8+ea
                 };
 
                 let (result, carry, overflow) = match op {
@@ -923,13 +886,14 @@ impl M68k {
                     ArithOp::Add => self.update_add_flags_word_with_extend(result, carry, overflow),
                     ArithOp::Sub => self.update_sub_flags_word_with_extend(dst_val, src, result),
                 }
-                Some(4)
+                Some(4) // ADD/SUB Dn,Dn word: 4
             }
             0b110 => {
                 // Destination EA must be data alterable.
                 if mode == 0b001 || (mode == 0b111 && reg >= 0b010) {
                     return None;
                 }
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let src = self.d_regs[dst];
                 let dst_val = if mode == 0b000 {
                     self.d_regs[reg]
@@ -960,11 +924,7 @@ impl M68k {
                             self.update_sub_flags_long_with_extend(dst_val, src, result)
                         }
                     }
-                    let mut cycles = 12;
-                    if mode == 0b101 || mode == 0b110 || mode == 0b111 {
-                        cycles += 4;
-                    }
-                    return Some(cycles);
+                    return Some(12 + ea_cycles); // ADD/SUB Dn,<ea> long mem: 12+ea
                 };
 
                 let (result, carry, overflow) = match op {
@@ -985,7 +945,7 @@ impl M68k {
                     ArithOp::Add => self.update_add_flags_long_with_extend(result, carry, overflow),
                     ArithOp::Sub => self.update_sub_flags_long_with_extend(dst_val, src, result),
                 }
-                Some(8)
+                Some(8) // ADD/SUB Dn,Dn long: 8
             }
             _ => None,
         }
@@ -1077,6 +1037,7 @@ impl M68k {
             return Some(8);
         }
 
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         let cycles = match size {
             0b00 => {
                 let addr = self.resolve_data_alterable_address(mode, reg, 1, memory)?;
@@ -1092,7 +1053,7 @@ impl M68k {
                     memory.write_u8(addr, result);
                     self.update_add_flags_byte_with_extend(result, carry, overflow);
                 }
-                8
+                8 + ea_cycles // ADDQ/SUBQ byte mem: 8+ea
             }
             0b01 => {
                 let addr = self.resolve_data_alterable_address(mode, reg, 2, memory)?;
@@ -1108,7 +1069,7 @@ impl M68k {
                     memory.write_u16(addr, result);
                     self.update_add_flags_word_with_extend(result, carry, overflow);
                 }
-                8
+                8 + ea_cycles // ADDQ/SUBQ word mem: 8+ea
             }
             0b10 => {
                 let addr = self.resolve_data_alterable_address(mode, reg, 4, memory)?;
@@ -1124,7 +1085,7 @@ impl M68k {
                     memory.write_u32(addr, result);
                     self.update_add_flags_long_with_extend(result, carry, overflow);
                 }
-                12
+                12 + ea_cycles // ADDQ/SUBQ long mem: 12+ea
             }
             _ => return None,
         };
@@ -1137,18 +1098,16 @@ impl M68k {
             return None;
         }
 
-        let value = if self.condition_true(cond) {
-            0xFF
-        } else {
-            0x00
-        };
+        let condition = self.condition_true(cond);
+        let value = if condition { 0xFF } else { 0x00 };
         if mode == 0b000 {
             self.d_regs[reg] = (self.d_regs[reg] & 0xFFFF_FF00) | value as u32;
-            Some(4)
+            Some(if condition { 6 } else { 4 }) // Scc Dn: true=6, false=4
         } else {
+            let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
             let addr = self.resolve_data_alterable_address(mode, reg, 1, memory)?;
             memory.write_u8(addr, value);
-            Some(8)
+            Some(8 + ea_cycles) // Scc memory: 8+ea
         }
     }
 
@@ -1175,9 +1134,10 @@ impl M68k {
         let dst = ((opcode >> 9) & 0x7) as usize;
         let mode = ((opcode >> 3) & 0x7) as u8;
         let reg = (opcode & 0x7) as usize;
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         let value = self.read_ea_word(mode, reg, memory)? as i16 as i32 as u32;
         self.a_regs[dst] = self.a_regs[dst].wrapping_add(value);
-        Some(8)
+        Some(8 + ea_cycles) // ADDA.W: 8+ea
     }
 
     fn exec_mulu_w(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -1324,16 +1284,24 @@ impl M68k {
         let reg = (opcode & 0x7) as usize;
         let value = self.read_ea_long(mode, reg, memory)?;
         self.a_regs[dst] = self.a_regs[dst].wrapping_add(value);
-        Some(8)
+        // ADDA.L: Dn/An/#imm → 8+word_ea; memory → 6+long_ea
+        if mode == 0b000 || mode == 0b001 || (mode == 0b111 && reg == 0b100) {
+            let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
+            Some(8 + ea_cycles)
+        } else {
+            let ea_cycles = self.long_ea_calculation_cycles(mode, reg)?;
+            Some(6 + ea_cycles)
+        }
     }
 
     fn exec_suba_w(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
         let dst = ((opcode >> 9) & 0x7) as usize;
         let mode = ((opcode >> 3) & 0x7) as u8;
         let reg = (opcode & 0x7) as usize;
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         let value = self.read_ea_word(mode, reg, memory)? as i16 as i32 as u32;
         self.a_regs[dst] = self.a_regs[dst].wrapping_sub(value);
-        Some(8)
+        Some(8 + ea_cycles) // SUBA.W: 8+ea
     }
 
     fn exec_suba_l(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -1342,7 +1310,14 @@ impl M68k {
         let reg = (opcode & 0x7) as usize;
         let value = self.read_ea_long(mode, reg, memory)?;
         self.a_regs[dst] = self.a_regs[dst].wrapping_sub(value);
-        Some(8)
+        // SUBA.L: Dn/An/#imm → 8+word_ea; memory → 6+long_ea
+        if mode == 0b000 || mode == 0b001 || (mode == 0b111 && reg == 0b100) {
+            let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
+            Some(8 + ea_cycles)
+        } else {
+            let ea_cycles = self.long_ea_calculation_cycles(mode, reg)?;
+            Some(6 + ea_cycles)
+        }
     }
 
     fn exec_addx(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -1489,7 +1464,21 @@ impl M68k {
         let reg = (opcode & 0x7) as usize;
         let addr = self.resolve_control_address(mode, reg, memory)?;
         self.a_regs[dst] = addr;
-        Some(8)
+        // LEA timing per addressing mode
+        let cycles = match mode {
+            0b010 => 4,  // (An)
+            0b101 => 8,  // d(An)
+            0b110 => 12, // d(An,Xn)
+            0b111 => match reg {
+                0b000 => 8,  // xxx.W
+                0b001 => 12, // xxx.L
+                0b010 => 8,  // d(PC)
+                0b011 => 12, // d(PC,Xn)
+                _ => 8,
+            },
+            _ => 4,
+        };
+        Some(cycles)
     }
 
     fn exec_cmpi(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -1504,25 +1493,31 @@ impl M68k {
 
         match size {
             0b00 => {
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let imm = self.fetch_u16(memory) as u8;
                 let value = self.read_ea_byte(mode, reg, memory)?;
                 let result = value.wrapping_sub(imm);
                 self.update_sub_flags_byte(value, imm, result);
-                Some(8)
+                // CMPI byte: Dn=8, memory=8+ea
+                Some(if mode == 0b000 { 8 } else { 8 + ea_cycles })
             }
             0b01 => {
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let imm = self.fetch_u16(memory);
                 let value = self.read_ea_word(mode, reg, memory)?;
                 let result = value.wrapping_sub(imm);
                 self.update_sub_flags_word(value, imm, result);
-                Some(8)
+                // CMPI word: Dn=8, memory=8+ea
+                Some(if mode == 0b000 { 8 } else { 8 + ea_cycles })
             }
             0b10 => {
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let imm = self.fetch_u32(memory);
                 let value = self.read_ea_long(mode, reg, memory)?;
                 let result = value.wrapping_sub(imm);
                 self.update_sub_flags_long(value, imm, result);
-                Some(12)
+                // CMPI long: Dn=14, memory=12+ea
+                Some(if mode == 0b000 { 14 } else { 12 + ea_cycles })
             }
             _ => None,
         }
@@ -1544,46 +1539,28 @@ impl M68k {
                 if mode == 0b001 {
                     return None;
                 }
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let src = self.read_ea_byte(mode, reg, memory)?;
                 let dst_val = self.d_regs[reg_x] as u8;
                 let result = dst_val.wrapping_sub(src);
                 self.update_sub_flags_byte(dst_val, src, result);
-                let mut cycles = 4;
-                if mode != 0b000 {
-                    cycles += 4;
-                }
-                if mode == 0b101 || mode == 0b111 {
-                    cycles += 4;
-                }
-                Some(cycles)
+                Some(4 + ea_cycles) // CMP byte: 4+ea
             }
             0b001 => {
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let src = self.read_ea_word(mode, reg, memory)?;
                 let dst_val = self.d_regs[reg_x] as u16;
                 let result = dst_val.wrapping_sub(src);
                 self.update_sub_flags_word(dst_val, src, result);
-                let mut cycles = 4;
-                if mode != 0b000 {
-                    cycles += 4;
-                }
-                if mode == 0b101 || mode == 0b111 {
-                    cycles += 4;
-                }
-                Some(cycles)
+                Some(4 + ea_cycles) // CMP word: 4+ea
             }
             0b010 => {
+                let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
                 let src = self.read_ea_long(mode, reg, memory)?;
                 let dst_val = self.d_regs[reg_x];
                 let result = dst_val.wrapping_sub(src);
                 self.update_sub_flags_long(dst_val, src, result);
-                let mut cycles = 6;
-                if mode != 0b000 {
-                    cycles += 4;
-                }
-                if mode == 0b101 || mode == 0b111 {
-                    cycles += 4;
-                }
-                Some(cycles)
+                Some(6 + ea_cycles) // CMP long: 6+ea
             }
             _ => None,
         }
@@ -1593,22 +1570,24 @@ impl M68k {
         let dst = ((opcode >> 9) & 0x7) as usize;
         let mode = ((opcode >> 3) & 0x7) as u8;
         let reg = (opcode & 0x7) as usize;
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         let src = self.read_ea_word(mode, reg, memory)? as i16 as i32 as u32;
         let dst_val = self.a_regs[dst];
         let result = dst_val.wrapping_sub(src);
         self.update_sub_flags_long(dst_val, src, result);
-        Some(6)
+        Some(6 + ea_cycles) // CMPA.W: 6+ea
     }
 
     fn exec_cmpa_l(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
         let dst = ((opcode >> 9) & 0x7) as usize;
         let mode = ((opcode >> 3) & 0x7) as u8;
         let reg = (opcode & 0x7) as usize;
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         let src = self.read_ea_long(mode, reg, memory)?;
         let dst_val = self.a_regs[dst];
         let result = dst_val.wrapping_sub(src);
         self.update_sub_flags_long(dst_val, src, result);
-        Some(6)
+        Some(6 + ea_cycles) // CMPA.L: 6+ea
     }
 
     fn exec_cmpm(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -1661,19 +1640,20 @@ impl M68k {
         if mode == 0b001 {
             return None;
         }
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         let upper = self.read_ea_word(mode, reg, memory)? as i16 as i32;
         let value = self.d_regs[dn] as i16 as i32;
         if value < 0 {
             self.set_flag(CCR_N, true);
             self.raise_exception(6, memory, None);
-            return Some(40);
+            return Some(40 + ea_cycles);
         }
         if value > upper {
             self.set_flag(CCR_N, false);
             self.raise_exception(6, memory, None);
-            return Some(40);
+            return Some(40 + ea_cycles);
         }
-        Some(10)
+        Some(10 + ea_cycles) // CHK no trap: 10+ea
     }
 
     fn exec_eor_dn_to_ea(
@@ -1689,6 +1669,7 @@ impl M68k {
             return None;
         }
 
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         match opmode {
             0b100 => {
                 let src = self.d_regs[src_dn] as u8;
@@ -1705,7 +1686,8 @@ impl M68k {
                     result
                 };
                 self.update_test_flags_byte(result);
-                Some(if mode == 0b000 { 4 } else { 8 })
+                // EOR Dn,<ea> byte: Dn=4, memory=8+ea
+                Some(if mode == 0b000 { 4 } else { 8 + ea_cycles })
             }
             0b101 => {
                 let src = self.d_regs[src_dn] as u16;
@@ -1722,7 +1704,8 @@ impl M68k {
                     result
                 };
                 self.update_test_flags_word(result);
-                Some(if mode == 0b000 { 4 } else { 8 })
+                // EOR Dn,<ea> word: Dn=4, memory=8+ea
+                Some(if mode == 0b000 { 4 } else { 8 + ea_cycles })
             }
             0b110 => {
                 let src = self.d_regs[src_dn];
@@ -1739,7 +1722,8 @@ impl M68k {
                     result
                 };
                 self.update_test_flags_long(result);
-                Some(if mode == 0b000 { 8 } else { 12 })
+                // EOR Dn,<ea> long: Dn=8, memory=12+ea
+                Some(if mode == 0b000 { 8 } else { 12 + ea_cycles })
             }
             _ => None,
         }
@@ -1756,21 +1740,22 @@ impl M68k {
             return None;
         }
 
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         match size {
             0b00 => {
                 let value = self.read_ea_byte(mode, reg, memory)?;
                 self.update_test_flags_byte(value);
-                Some(4)
+                Some(4 + ea_cycles) // TST byte: 4+ea
             }
             0b01 => {
                 let value = self.read_ea_word(mode, reg, memory)?;
                 self.update_test_flags_word(value);
-                Some(4)
+                Some(4 + ea_cycles) // TST word: 4+ea
             }
             0b10 => {
                 let value = self.read_ea_long(mode, reg, memory)?;
                 self.update_test_flags_long(value);
-                Some(4)
+                Some(4 + ea_cycles) // TST long: 4+ea
             }
             _ => None,
         }
@@ -1809,6 +1794,7 @@ impl M68k {
             return None;
         }
 
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         match size {
             0b00 => {
                 let imm = self.fetch_u16(memory) as u8;
@@ -1825,7 +1811,8 @@ impl M68k {
                     result
                 };
                 self.update_test_flags_byte(result);
-                Some(if mode == 0b000 { 8 } else { 12 })
+                // ORI/ANDI/EORI byte: Dn=8, memory=12+ea
+                Some(if mode == 0b000 { 8 } else { 12 + ea_cycles })
             }
             0b01 => {
                 let imm = self.fetch_u16(memory);
@@ -1842,7 +1829,8 @@ impl M68k {
                     result
                 };
                 self.update_test_flags_word(result);
-                Some(if mode == 0b000 { 8 } else { 12 })
+                // ORI/ANDI/EORI word: Dn=8, memory=12+ea
+                Some(if mode == 0b000 { 8 } else { 12 + ea_cycles })
             }
             0b10 => {
                 let imm = self.fetch_u32(memory);
@@ -1859,7 +1847,8 @@ impl M68k {
                     result
                 };
                 self.update_test_flags_long(result);
-                Some(if mode == 0b000 { 16 } else { 20 })
+                // ORI/ANDI/EORI long: Dn=16, memory=20+ea
+                Some(if mode == 0b000 { 16 } else { 20 + ea_cycles })
             }
             _ => None,
         }
@@ -1874,6 +1863,7 @@ impl M68k {
             return None;
         }
 
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         match size {
             0b00 => {
                 let imm = self.fetch_u16(memory) as u8;
@@ -1907,7 +1897,8 @@ impl M68k {
                     ArithOp::Add => self.update_add_flags_byte_with_extend(result, carry, overflow),
                     ArithOp::Sub => self.update_sub_flags_byte_with_extend(dst, imm, result),
                 }
-                Some(if mode == 0b000 { 8 } else { 12 })
+                // ADDI/SUBI byte: Dn=8, memory=12+ea
+                Some(if mode == 0b000 { 8 } else { 12 + ea_cycles })
             }
             0b01 => {
                 let imm = self.fetch_u16(memory);
@@ -1942,7 +1933,8 @@ impl M68k {
                     ArithOp::Add => self.update_add_flags_word_with_extend(result, carry, overflow),
                     ArithOp::Sub => self.update_sub_flags_word_with_extend(dst, imm, result),
                 }
-                Some(if mode == 0b000 { 8 } else { 12 })
+                // ADDI/SUBI word: Dn=8, memory=12+ea
+                Some(if mode == 0b000 { 8 } else { 12 + ea_cycles })
             }
             0b10 => {
                 let imm = self.fetch_u32(memory);
@@ -1975,7 +1967,8 @@ impl M68k {
                     ArithOp::Add => self.update_add_flags_long_with_extend(result, carry, overflow),
                     ArithOp::Sub => self.update_sub_flags_long_with_extend(dst, imm, result),
                 }
-                Some(if mode == 0b000 { 16 } else { 20 })
+                // ADDI/SUBI long: Dn=16, memory=20+ea
+                Some(if mode == 0b000 { 16 } else { 20 + ea_cycles })
             }
             _ => None,
         }
@@ -1991,21 +1984,22 @@ impl M68k {
             return None;
         }
 
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         match size {
             0b00 => {
                 self.write_ea_byte(mode, reg, 0, memory)?;
                 self.update_test_flags_byte(0);
-                Some(if mode == 0b000 { 4 } else { 8 })
+                Some(if mode == 0b000 { 4 } else { 8 + ea_cycles })
             }
             0b01 => {
                 self.write_ea_word(mode, reg, 0, memory)?;
                 self.update_test_flags_word(0);
-                Some(if mode == 0b000 { 4 } else { 8 })
+                Some(if mode == 0b000 { 4 } else { 8 + ea_cycles })
             }
             0b10 => {
                 self.write_ea_long(mode, reg, 0, memory)?;
                 self.update_test_flags_long(0);
-                Some(if mode == 0b000 { 6 } else { 12 })
+                Some(if mode == 0b000 { 6 } else { 12 + ea_cycles })
             }
             _ => None,
         }
@@ -2018,7 +2012,21 @@ impl M68k {
         let return_addr = self.pc;
         self.push_u32(memory, return_addr);
         self.pc = target;
-        Some(16)
+        // JSR timing per addressing mode
+        let cycles = match mode {
+            0b010 => 16,  // (An)
+            0b101 => 18,  // d(An)
+            0b110 => 22,  // d(An,Xn)
+            0b111 => match reg {
+                0b000 => 18,  // xxx.W
+                0b001 => 20,  // xxx.L
+                0b010 => 18,  // d(PC)
+                0b011 => 22,  // d(PC,Xn)
+                _ => 16,
+            },
+            _ => 16,
+        };
+        Some(cycles)
     }
 
     fn exec_jmp(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -2026,7 +2034,21 @@ impl M68k {
         let reg = (opcode & 0x7) as usize;
         let target = self.resolve_control_address(mode, reg, memory)?;
         self.pc = target;
-        Some(10)
+        // JMP timing per addressing mode
+        let cycles = match mode {
+            0b010 => 8,   // (An)
+            0b101 => 10,  // d(An)
+            0b110 => 14,  // d(An,Xn)
+            0b111 => match reg {
+                0b000 => 10,  // xxx.W
+                0b001 => 12,  // xxx.L
+                0b010 => 10,  // d(PC)
+                0b011 => 14,  // d(PC,Xn)
+                _ => 10,
+            },
+            _ => 8,
+        };
+        Some(cycles)
     }
 
     fn exec_link(&mut self, opcode: u16, memory: &mut MemoryMap) -> u32 {
@@ -2068,7 +2090,13 @@ impl M68k {
             return None;
         }
         self.write_ea_word(mode, reg, self.sr, memory)?;
-        Some(if mode == 0b000 { 6 } else { 8 })
+        // MC68000: MOVE from SR — Dn=6, mem=8+ea
+        if mode == 0b000 {
+            Some(6)
+        } else {
+            let ea_cycles = self.word_ea_calculation_cycles(mode, reg).unwrap_or(0);
+            Some(8 + ea_cycles)
+        }
     }
 
     fn exec_move_to_sr(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -2083,13 +2111,11 @@ impl M68k {
         if mode == 0b001 {
             return None;
         }
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         let value = self.read_ea_word(mode, reg, memory)?;
         self.write_sr(value);
-        Some(if mode == 0b000 || (mode == 0b111 && reg == 0b100) {
-            12
-        } else {
-            16
-        })
+        // MC68000: MOVE to SR = 12 + ea
+        Some(12 + ea_cycles)
     }
 
     fn exec_ori_to_ccr(&mut self, memory: &mut MemoryMap) -> u32 {
@@ -2147,13 +2173,11 @@ impl M68k {
         if mode == 0b001 {
             return None;
         }
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         let value = self.read_ea_word(mode, reg, memory)?;
         self.sr = (self.sr & !0x001F) | (value & 0x001F);
-        Some(if mode == 0b000 || (mode == 0b111 && reg == 0b100) {
-            12
-        } else {
-            16
-        })
+        // MC68000: MOVE to CCR = 12 + ea
+        Some(12 + ea_cycles)
     }
 
     fn exec_neg(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -2166,6 +2190,7 @@ impl M68k {
             return None;
         }
 
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         match size {
             0b00 => {
                 let (dst, addr) = if mode == 0b000 {
@@ -2182,7 +2207,7 @@ impl M68k {
                 }
                 self.update_sub_flags_byte_with_extend(0, dst, result);
                 self.set_flag(CCR_X, dst != 0);
-                Some(if mode == 0b000 { 4 } else { 8 })
+                Some(if mode == 0b000 { 4 } else { 8 + ea_cycles })
             }
             0b01 => {
                 let (dst, addr) = if mode == 0b000 {
@@ -2199,7 +2224,7 @@ impl M68k {
                 }
                 self.update_sub_flags_word_with_extend(0, dst, result);
                 self.set_flag(CCR_X, dst != 0);
-                Some(if mode == 0b000 { 4 } else { 8 })
+                Some(if mode == 0b000 { 4 } else { 8 + ea_cycles })
             }
             0b10 => {
                 let (dst, addr) = if mode == 0b000 {
@@ -2216,7 +2241,7 @@ impl M68k {
                 }
                 self.update_sub_flags_long_with_extend(0, dst, result);
                 self.set_flag(CCR_X, dst != 0);
-                Some(if mode == 0b000 { 6 } else { 12 })
+                Some(if mode == 0b000 { 6 } else { 12 + ea_cycles })
             }
             _ => None,
         }
@@ -2232,6 +2257,7 @@ impl M68k {
             return None;
         }
 
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         match size {
             0b00 => {
                 let (dst, addr) = if mode == 0b000 {
@@ -2247,7 +2273,7 @@ impl M68k {
                     memory.write_u8(addr.expect("memory mode must resolve address"), result);
                 }
                 self.update_test_flags_byte(result);
-                Some(if mode == 0b000 { 4 } else { 8 })
+                Some(if mode == 0b000 { 4 } else { 8 + ea_cycles })
             }
             0b01 => {
                 let (dst, addr) = if mode == 0b000 {
@@ -2263,7 +2289,7 @@ impl M68k {
                     memory.write_u16(addr.expect("memory mode must resolve address"), result);
                 }
                 self.update_test_flags_word(result);
-                Some(if mode == 0b000 { 4 } else { 8 })
+                Some(if mode == 0b000 { 4 } else { 8 + ea_cycles })
             }
             0b10 => {
                 let (dst, addr) = if mode == 0b000 {
@@ -2279,7 +2305,7 @@ impl M68k {
                     memory.write_u32(addr.expect("memory mode must resolve address"), result);
                 }
                 self.update_test_flags_long(result);
-                Some(if mode == 0b000 { 6 } else { 12 })
+                Some(if mode == 0b000 { 6 } else { 12 + ea_cycles })
             }
             _ => None,
         }
@@ -2295,6 +2321,7 @@ impl M68k {
             return None;
         }
 
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
         let x_in = if self.flag_set(CCR_X) { 1u32 } else { 0u32 };
         let prev_z = self.flag_set(CCR_Z);
         match size {
@@ -2319,7 +2346,7 @@ impl M68k {
                 self.set_flag(CCR_V, overflow);
                 self.set_flag(CCR_C, borrow);
                 self.set_flag(CCR_X, borrow);
-                Some(if mode == 0b000 { 4 } else { 8 })
+                Some(if mode == 0b000 { 4 } else { 8 + ea_cycles })
             }
             0b01 => {
                 let (dst, addr) = if mode == 0b000 {
@@ -2342,7 +2369,7 @@ impl M68k {
                 self.set_flag(CCR_V, overflow);
                 self.set_flag(CCR_C, borrow);
                 self.set_flag(CCR_X, borrow);
-                Some(if mode == 0b000 { 4 } else { 8 })
+                Some(if mode == 0b000 { 4 } else { 8 + ea_cycles })
             }
             0b10 => {
                 let (dst, addr) = if mode == 0b000 {
@@ -2365,7 +2392,7 @@ impl M68k {
                 self.set_flag(CCR_V, overflow);
                 self.set_flag(CCR_C, borrow);
                 self.set_flag(CCR_X, borrow);
-                Some(if mode == 0b000 { 6 } else { 12 })
+                Some(if mode == 0b000 { 6 } else { 12 + ea_cycles })
             }
             _ => None,
         }
@@ -2404,7 +2431,12 @@ impl M68k {
         self.set_flag(CCR_V, false);
         self.set_flag(CCR_C, borrow);
         self.set_flag(CCR_X, borrow);
-        Some(if mode == 0b000 { 6 } else { 8 })
+        if mode == 0b000 {
+            Some(6)
+        } else {
+            let ea_cycles = self.word_ea_calculation_cycles(mode, reg).unwrap_or(0);
+            Some(8 + ea_cycles)
+        }
     }
 
     fn exec_tas(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -2464,7 +2496,19 @@ impl M68k {
             _ => return None,
         };
         self.push_u32(memory, addr);
-        Some(if mode == 0b010 { 12 } else { 16 })
+        // PEA timing: (An)=12, d(An)=16, xxx.W=16, xxx.L=20, d(PC)=16
+        let cycles = match mode {
+            0b010 => 12,
+            0b101 => 16,
+            0b111 => match reg {
+                0b000 => 16,  // xxx.W
+                0b001 => 20,  // xxx.L
+                0b010 => 16,  // d(PC)
+                _ => 16,
+            },
+            _ => 16,
+        };
+        Some(cycles)
     }
 
     fn exec_ext_w(&mut self, opcode: u16) -> u32 {
@@ -2549,11 +2593,43 @@ impl M68k {
             }
         }
 
-        Some(if size_long {
-            12 + count * 4
+        // MOVEM timing: per-register cost is 4 (word) or 8 (long)
+        let per_reg = if size_long { 8 } else { 4 };
+        if mem_to_regs {
+            // mem to reg: 12 + n*per_reg (+ ea for non-postinc modes)
+            let base = 12 + count * per_reg;
+            let ea_extra = match mode {
+                0b011 => 0, // (An)+ has no extra EA cost
+                0b010 => 0, // (An) — no extension
+                0b101 => 8, // d(An)
+                0b110 => 10, // d(An,Xn)
+                0b111 => match reg {
+                    0b000 => 8,  // xxx.W
+                    0b001 => 12, // xxx.L
+                    0b010 => 8,  // d(PC)
+                    0b011 => 10, // d(PC,Xn)
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            Some(base + ea_extra)
         } else {
-            8 + count * 4
-        })
+            // reg to mem: 8 + n*per_reg (+ ea for non-predec modes)
+            let base = 8 + count * per_reg;
+            let ea_extra = match mode {
+                0b100 => 0, // -(An) has no extra EA cost
+                0b010 => 0, // (An) — no extension
+                0b101 => 8, // d(An)
+                0b110 => 10, // d(An,Xn)
+                0b111 => match reg {
+                    0b000 => 8,  // xxx.W
+                    0b001 => 12, // xxx.L
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            Some(base + ea_extra)
+        }
     }
 
     fn exec_shift_rotate(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -2568,6 +2644,7 @@ impl M68k {
                 return None;
             }
 
+            let ea_cycles = self.word_ea_calculation_cycles(mode, reg)?;
             let addr = self.resolve_data_alterable_address(mode, reg, 2, memory)?;
             let value = memory.read_u16(addr);
             let (result, carry_out, overflow) = match op {
@@ -2636,7 +2713,7 @@ impl M68k {
             self.set_flag(CCR_Z, result == 0);
             self.set_flag(CCR_V, overflow);
             self.set_flag(CCR_C, carry_out);
-            return Some(8);
+            return Some(8 + ea_cycles); // Memory shift/rotate: 8+ea
         }
 
         let dst = (opcode & 0x7) as usize;
@@ -2746,7 +2823,9 @@ impl M68k {
                 self.set_flag(CCR_X, carry_out);
             }
         }
-        Some(6 + shift_count * 2)
+        // Byte/Word: 6+2n, Long: 8+2n
+        let base = if size == 0b10 { 8 } else { 6 };
+        Some(base + shift_count * 2)
     }
 
     fn exec_movep(&mut self, opcode: u16, memory: &mut MemoryMap) -> Option<u32> {
@@ -2832,7 +2911,15 @@ impl M68k {
                 0b11 => self.d_regs[reg] |= mask,
                 _ => return None,
             }
-            return Some(if dynamic { 6 } else { 10 });
+            // MC68000: BTST Dn=6/10, BCHG/BCLR/BSET Dn=8/12
+            let base = if op == 0b00 {
+                // BTST
+                if dynamic { 6 } else { 10 }
+            } else {
+                // BCHG/BCLR/BSET
+                if dynamic { 8 } else { 12 }
+            };
+            return Some(base);
         }
 
         // Memory destinations are byte-sized and must be data alterable.
@@ -2855,7 +2942,14 @@ impl M68k {
         if op != 0b00 {
             memory.write_u8(addr, value);
         }
-        Some(if dynamic { 8 } else { 12 })
+        let ea_cycles = self.word_ea_calculation_cycles(mode, reg).unwrap_or(0);
+        // MC68000: BTST mem=4+ea/8+ea, BCHG/BCLR/BSET mem=8+ea/12+ea
+        let base = if op == 0b00 {
+            if dynamic { 4 } else { 8 }
+        } else {
+            if dynamic { 8 } else { 12 }
+        };
+        Some(base + ea_cycles)
     }
 
     fn movem_resolve_mem_source(
@@ -3437,6 +3531,37 @@ impl M68k {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    /// MC68000 MOVE destination base cycles (before adding source EA time).
+    /// For MOVE.L, memory destinations add 4 cycles vs MOVE.B/W; Dn stays at 4.
+    fn move_dest_base_cycles(dst_mode: u8, dst_reg: usize, is_long: bool) -> u32 {
+        let mem_extra = if is_long { 4 } else { 0 };
+        match dst_mode {
+            0b000 => 4,                       // Dn (same for all sizes)
+            0b010 => 8 + mem_extra,            // (An)
+            0b011 => 8 + mem_extra,            // (An)+
+            0b100 => 8 + mem_extra,            // -(An)
+            0b101 => 12 + mem_extra,           // d(An)
+            0b110 => 14 + mem_extra,           // d(An,Xn)
+            0b111 => match dst_reg {
+                0b000 => 12 + mem_extra,       // xxx.W
+                0b001 => 16 + mem_extra,       // xxx.L
+                _ => 8 + mem_extra,            // fallback
+            },
+            _ => 8 + mem_extra,                // fallback
+        }
+    }
+
+    /// MC68000 EA calculation time for long-sized source in MOVE.L.
+    /// Register direct is 0; all memory/immediate modes add 4 to the word EA time.
+    fn long_ea_calculation_cycles(&self, mode: u8, reg: usize) -> Option<u32> {
+        let base = self.word_ea_calculation_cycles(mode, reg)?;
+        if mode == 0b000 || mode == 0b001 {
+            Some(base) // register direct: 0 for both word and long
+        } else {
+            Some(base + 4)
         }
     }
 

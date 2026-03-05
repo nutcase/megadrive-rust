@@ -223,6 +223,13 @@ impl MemoryMap {
         cycles
     }
 
+    /// Returns true when any DMA operation is active (bus, fill, or copy).
+    pub fn dma_active(&self) -> bool {
+        self.active_bus_dma.is_some()
+            || !self.pending_bus_dma.is_empty()
+            || self.vdp.dma_busy()
+    }
+
     pub fn step_subsystems(&mut self, cpu_cycles: u32) {
         // Interleave subsystem progress in smaller time slices so Z80 audio
         // writes (especially YM2612 DAC streams) are reflected with better

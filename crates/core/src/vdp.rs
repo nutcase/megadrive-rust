@@ -30,12 +30,40 @@ const STATUS_BASE: u16 = 0x3400;
 const STATUS_HBLANK: u16 = 0x0004;
 const STATUS_VBLANK: u16 = 0x0008;
 const STATUS_ODD_FRAME: u16 = 0x0010;
+const STATUS_DMA_BUSY: u16 = 0x0002;
 const STATUS_SPRITE_COLLISION: u16 = 0x0020;
 const STATUS_SPRITE_OVERFLOW: u16 = 0x0040;
+
+/// Master clock cycles per byte for DMA Fill during active display.
+const DMA_FILL_CYCLES_PER_BYTE_ACTIVE: u64 = 4;
+/// Master clock cycles per byte for DMA Fill during blanking.
+const DMA_FILL_CYCLES_PER_BYTE_BLANK: u64 = 2;
+/// Master clock cycles per byte for DMA Copy during active display.
+const DMA_COPY_CYCLES_PER_BYTE_ACTIVE: u64 = 8;
+/// Master clock cycles per byte for DMA Copy during blanking.
+const DMA_COPY_CYCLES_PER_BYTE_BLANK: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 struct DmaFillState {
     remaining_words: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
+struct DmaFillActive {
+    fill_byte: u8,
+    fill_word: bool,
+    lane_no_xor: bool,
+    increment: u16,
+    remaining: usize,
+    cycle_carry: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
+struct DmaCopyActive {
+    source_addr: u16,
+    increment: u16,
+    remaining: usize,
+    cycle_carry: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
@@ -116,6 +144,8 @@ pub struct Vdp {
     access_mode: AccessMode,
     vram_read_buffer: u16,
     dma_fill_pending: Option<DmaFillState>,
+    dma_fill_active: Option<DmaFillActive>,
+    dma_copy_active: Option<DmaCopyActive>,
     dma_bus_pending: Option<BusDmaRequest>,
     dma_fill_ops: u64,
     dma_copy_ops: u64,
@@ -149,7 +179,7 @@ impl Vdp {
 
     pub fn with_video_standard(video_standard: VideoStandard) -> Self {
         let mut registers = [0u8; REG_COUNT];
-        registers[REG_MODE_SET_2] = 0x40; // Display enabled
+        registers[REG_MODE_SET_2] = 0x44; // Display enabled + Mode 5
         registers[REG_PLANE_A_NAMETABLE] = 0x30; // Plane A name table base: 0xC000
         registers[REG_SPRITE_TABLE] = 0x70; // Sprite attribute table base: 0xE000
         registers[REG_HSCROLL_TABLE] = 0x3C; // Horizontal scroll table base: 0xF000
@@ -186,6 +216,8 @@ impl Vdp {
             access_mode: AccessMode::default(),
             vram_read_buffer: 0,
             dma_fill_pending: None,
+            dma_fill_active: None,
+            dma_copy_active: None,
             dma_bus_pending: None,
             dma_fill_ops: 0,
             dma_copy_ops: 0,
@@ -274,6 +306,7 @@ impl Vdp {
             let end = self.frame_cycles + advance;
             self.process_scanline_events(start, end);
             self.frame_cycles = end;
+            self.step_dma(advance);
             remaining -= advance;
 
             if self.frame_cycles >= cycles_per_frame {
@@ -355,6 +388,14 @@ impl Vdp {
         self.dma_copy_ops
     }
 
+    /// Returns true when any DMA operation is in progress or pending.
+    pub fn dma_busy(&self) -> bool {
+        self.dma_fill_pending.is_some()
+            || self.dma_fill_active.is_some()
+            || self.dma_copy_active.is_some()
+            || self.dma_bus_pending.is_some()
+    }
+
     pub fn acknowledge_interrupt(&mut self, level: u8) {
         if level == 6 {
             self.v_interrupt_pending = false;
@@ -375,6 +416,9 @@ impl Vdp {
         }
         if self.interlace_mode_enabled() && (self.frame_count & 1) != 0 {
             status |= STATUS_ODD_FRAME;
+        }
+        if self.dma_busy() {
+            status |= STATUS_DMA_BUSY;
         }
         if self.sprite_collision {
             status |= STATUS_SPRITE_COLLISION;
@@ -682,7 +726,17 @@ impl Vdp {
                 self.write_data_value(value);
                 self.advance_access_addr();
             }
-            self.execute_dma_fill(fill.remaining_words, value);
+            let fill_byte = (value & 0x00FF) as u8;
+            let fill_word = std::env::var_os("MEGADRIVE_DEBUG_DMA_FILL_WORD").is_some();
+            let lane_no_xor = std::env::var_os("MEGADRIVE_DEBUG_DMA_FILL_LANE_NO_XOR").is_some();
+            self.dma_fill_active = Some(DmaFillActive {
+                fill_byte,
+                fill_word,
+                lane_no_xor,
+                increment: self.auto_increment(),
+                remaining: fill.remaining_words,
+                cycle_carry: 0,
+            });
             return;
         }
 
@@ -926,63 +980,126 @@ impl Vdp {
                     });
                 }
             }
-            // DMA copy: immediate VRAM-to-VRAM byte copy.
+            // DMA copy: gradual VRAM-to-VRAM byte copy.
             0b11 => {
                 if base_code == 0x01 && self.access_mode == AccessMode::VramWrite {
                     self.dma_copy_ops = self.dma_copy_ops.saturating_add(1);
-                    self.execute_dma_copy();
+                    self.dma_copy_active = Some(DmaCopyActive {
+                        source_addr: self.dma_source_addr(),
+                        increment: self.auto_increment(),
+                        remaining: self.dma_length(),
+                        cycle_carry: 0,
+                    });
                 }
             }
             _ => {}
         }
     }
 
-    fn execute_dma_fill(&mut self, words: usize, value: u16) {
-        let fill_byte = (value & 0x00FF) as u8;
-        let fill_word = std::env::var_os("MEGADRIVE_DEBUG_DMA_FILL_WORD").is_some();
-        let lane_no_xor = std::env::var_os("MEGADRIVE_DEBUG_DMA_FILL_LANE_NO_XOR").is_some();
-        let increment = self.auto_increment();
-        for _ in 0..words {
-            if fill_word {
-                let addr = self.access_addr as usize % VRAM_SIZE;
-                self.vram[addr] = fill_byte;
-                self.vram[(addr + 1) % VRAM_SIZE] = fill_byte;
+    /// Advance in-progress DMA fill/copy by the given number of master clock
+    /// cycles. Called from `step()` each time the frame cycle counter advances.
+    fn step_dma(&mut self, cycles: u64) {
+        let in_blank = self.vblank_active() || self.hblank_active();
+
+        // --- DMA Fill ---
+        if self.dma_fill_active.is_some() {
+            let rate = if in_blank {
+                DMA_FILL_CYCLES_PER_BYTE_BLANK
             } else {
-                // VRAM fill writes target the byte lane selected by A0.
-                let addr = if lane_no_xor {
-                    self.access_addr as usize
+                DMA_FILL_CYCLES_PER_BYTE_ACTIVE
+            };
+            let fill = self.dma_fill_active.as_mut().unwrap();
+            fill.cycle_carry += cycles;
+            while fill.cycle_carry >= rate && fill.remaining > 0 {
+                fill.cycle_carry -= rate;
+                if fill.fill_word {
+                    let addr = self.access_addr as usize % VRAM_SIZE;
+                    self.vram[addr] = fill.fill_byte;
+                    self.vram[(addr + 1) % VRAM_SIZE] = fill.fill_byte;
                 } else {
-                    self.access_addr as usize ^ 0x0001
-                } % VRAM_SIZE;
-                self.vram[addr] = fill_byte;
+                    let addr = if fill.lane_no_xor {
+                        self.access_addr as usize
+                    } else {
+                        self.access_addr as usize ^ 0x0001
+                    } % VRAM_SIZE;
+                    self.vram[addr] = fill.fill_byte;
+                }
+                self.access_addr = self.access_addr.wrapping_add(fill.increment);
+                fill.remaining -= 1;
             }
-            self.access_addr = self.access_addr.wrapping_add(increment);
+            if self.dma_fill_active.as_ref().unwrap().remaining == 0 {
+                self.dma_fill_active = None;
+                if self.frame_cycles == 0 {
+                    self.reset_line_state();
+                    self.capture_line_state(0);
+                }
+                self.clear_dma_length();
+            }
         }
-        if self.frame_cycles == 0 {
-            self.reset_line_state();
-            self.capture_line_state(0);
+
+        // --- DMA Copy ---
+        if self.dma_copy_active.is_some() {
+            let rate = if in_blank {
+                DMA_COPY_CYCLES_PER_BYTE_BLANK
+            } else {
+                DMA_COPY_CYCLES_PER_BYTE_ACTIVE
+            };
+            let copy = self.dma_copy_active.as_mut().unwrap();
+            copy.cycle_carry += cycles;
+            while copy.cycle_carry >= rate && copy.remaining > 0 {
+                copy.cycle_carry -= rate;
+                let byte = self.vram[copy.source_addr as usize % VRAM_SIZE];
+                self.vram[self.access_addr as usize % VRAM_SIZE] = byte;
+                copy.source_addr = copy.source_addr.wrapping_add(1);
+                self.access_addr = self.access_addr.wrapping_add(copy.increment);
+                copy.remaining -= 1;
+            }
+            if self.dma_copy_active.as_ref().unwrap().remaining == 0 {
+                let src = self.dma_copy_active.unwrap().source_addr;
+                self.dma_copy_active = None;
+                self.set_dma_source_addr(src);
+                if self.frame_cycles == 0 {
+                    self.reset_line_state();
+                    self.capture_line_state(0);
+                }
+                self.clear_dma_length();
+            }
         }
-        self.clear_dma_length();
     }
 
-    fn execute_dma_copy(&mut self) {
-        let length = self.dma_length();
-        let increment = self.auto_increment();
-        let mut src = self.dma_source_addr();
-
-        for _ in 0..length {
-            let byte = self.vram[src as usize % VRAM_SIZE];
-            self.vram[self.access_addr as usize % VRAM_SIZE] = byte;
-            src = src.wrapping_add(1);
-            self.access_addr = self.access_addr.wrapping_add(increment);
+    /// Complete any in-progress DMA fill or copy immediately. Useful for tests
+    /// that need deterministic results without stepping the VDP clock.
+    #[cfg(test)]
+    pub(crate) fn flush_pending_dma(&mut self) {
+        if let Some(fill) = self.dma_fill_active.take() {
+            for _ in 0..fill.remaining {
+                if fill.fill_word {
+                    let addr = self.access_addr as usize % VRAM_SIZE;
+                    self.vram[addr] = fill.fill_byte;
+                    self.vram[(addr + 1) % VRAM_SIZE] = fill.fill_byte;
+                } else {
+                    let addr = if fill.lane_no_xor {
+                        self.access_addr as usize
+                    } else {
+                        self.access_addr as usize ^ 0x0001
+                    } % VRAM_SIZE;
+                    self.vram[addr] = fill.fill_byte;
+                }
+                self.access_addr = self.access_addr.wrapping_add(fill.increment);
+            }
+            self.clear_dma_length();
         }
 
-        self.set_dma_source_addr(src);
-        if self.frame_cycles == 0 {
-            self.reset_line_state();
-            self.capture_line_state(0);
+        if let Some(mut copy) = self.dma_copy_active.take() {
+            for _ in 0..copy.remaining {
+                let byte = self.vram[copy.source_addr as usize % VRAM_SIZE];
+                self.vram[self.access_addr as usize % VRAM_SIZE] = byte;
+                copy.source_addr = copy.source_addr.wrapping_add(1);
+                self.access_addr = self.access_addr.wrapping_add(copy.increment);
+            }
+            self.set_dma_source_addr(copy.source_addr);
+            self.clear_dma_length();
         }
-        self.clear_dma_length();
     }
 
     #[cfg(test)]
@@ -1292,6 +1409,15 @@ impl Vdp {
     fn render_frame(&mut self) {
         self.sprite_collision = false;
         self.sprite_overflow = false;
+
+        // Mode 4 (SMS compatibility): active when Mode 5 bit is clear and
+        // H40 mode is not set (H40 is a Mode 5-only feature).
+        if !Self::mode5_enabled_from_regs(&self.registers)
+            && !Self::h40_mode_from_regs(&self.registers)
+        {
+            self.render_frame_mode4();
+            return;
+        }
 
         let disable_plane_a = std::env::var_os("MEGADRIVE_DEBUG_DISABLE_PLANE_A").is_some();
         let disable_plane_b = std::env::var_os("MEGADRIVE_DEBUG_DISABLE_PLANE_B").is_some();
@@ -2268,6 +2394,10 @@ impl Vdp {
         (regs[REG_MODE_SET_2] & 0x40) != 0
     }
 
+    fn mode5_enabled_from_regs(regs: &[u8; REG_COUNT]) -> bool {
+        (regs[REG_MODE_SET_2] & 0x04) != 0
+    }
+
     fn h40_mode_from_regs(regs: &[u8; REG_COUNT]) -> bool {
         (regs[12] & 0x01) != 0
     }
@@ -2293,6 +2423,210 @@ impl Vdp {
         let palette = ((bg >> 4) & 0x3) as usize;
         let color = (bg & 0x0F) as usize;
         palette * 16 + color
+    }
+
+    /// Convert a Mode 4 (SMS) CRAM byte to RGB888.
+    /// Format: --BBGGRR (2 bits per channel), value range 0-3 mapped to 0/85/170/255.
+    fn sms_cram_to_rgb888(cram_byte: u8) -> (u8, u8, u8) {
+        let r = (cram_byte & 0x03) * 85;
+        let g = ((cram_byte >> 2) & 0x03) * 85;
+        let b = ((cram_byte >> 4) & 0x03) * 85;
+        (r, g, b)
+    }
+
+    /// Decode a Mode 4 tile pixel from planar 4bpp data.
+    /// Returns the 4-bit color index for the given pixel column (0=leftmost).
+    fn sms_tile_pixel(vram: &[u8; VRAM_SIZE], tile_index: usize, row: usize, col: usize) -> u8 {
+        let tile_addr = (tile_index * 32) + (row * 4);
+        if tile_addr + 3 >= VRAM_SIZE {
+            return 0;
+        }
+        let bit = 7 - col;
+        let b0 = (vram[tile_addr] >> bit) & 1;
+        let b1 = (vram[tile_addr + 1] >> bit) & 1;
+        let b2 = (vram[tile_addr + 2] >> bit) & 1;
+        let b3 = (vram[tile_addr + 3] >> bit) & 1;
+        b0 | (b1 << 1) | (b2 << 2) | (b3 << 3)
+    }
+
+    /// Render a complete frame in Mode 4 (SMS compatibility mode).
+    /// Resolution: 256x192, centered in the 320x240 frame buffer.
+    fn render_frame_mode4(&mut self) {
+        const MODE4_WIDTH: usize = 256;
+        const MODE4_HEIGHT: usize = 192;
+        const BORDER_X: usize = (FRAME_WIDTH - MODE4_WIDTH) / 2;
+        const BORDER_Y: usize = (FRAME_HEIGHT - MODE4_HEIGHT) / 2;
+
+        let regs = self.registers;
+
+        // Backdrop color: palette 0, color 0 (CRAM index 0, low byte)
+        let backdrop_byte = self.cram[0] as u8;
+        let (bd_r, bd_g, bd_b) = Self::sms_cram_to_rgb888(backdrop_byte);
+
+        // Nametable base address: reg 2 bits 3-1 * 0x800
+        let nt_base = ((regs[2] as usize >> 1) & 0x07) * 0x800;
+
+        // SAT base address: reg 5 bits 6-1 * 0x100
+        let sat_base = ((regs[5] as usize >> 1) & 0x3F) * 0x100;
+
+        // Sprite tile base offset: reg 6 bit 2 -> add 256 to tile index
+        let sprite_tile_offset: usize = if (regs[6] & 0x04) != 0 { 256 } else { 0 };
+
+        // Sprite size: reg 1 bit 1 -> 8x16 mode
+        let sprites_8x16 = (regs[1] & 0x02) != 0;
+        let sprite_height: usize = if sprites_8x16 { 16 } else { 8 };
+
+        // Scroll values
+        let hscroll_val = regs[8] as usize;
+        let vscroll_val = regs[9] as usize;
+
+        // Reg 0 flags
+        let mask_left_column = (regs[0] & 0x20) != 0;
+        let lock_top_hscroll = (regs[0] & 0x40) != 0;
+
+        // Build sprite list: scan SAT Y table, stop at Y=0xD0 or 64 entries
+        struct SpriteEntry {
+            y: usize,
+            x: usize,
+            tile: usize,
+        }
+        let mut sprites: Vec<SpriteEntry> = Vec::with_capacity(64);
+        for i in 0..64 {
+            let y_byte = self.vram[(sat_base + i) % VRAM_SIZE];
+            if y_byte == 0xD0 {
+                break;
+            }
+            // Y position: sprite appears at line (y_byte + 1)
+            let y = y_byte as usize;
+            let xn_offset = sat_base + 0x80 + i * 2;
+            let x = self.vram[xn_offset % VRAM_SIZE] as usize;
+            let tile = self.vram[(xn_offset + 1) % VRAM_SIZE] as usize;
+            sprites.push(SpriteEntry { y, x, tile });
+        }
+
+        // Fill entire frame buffer with backdrop first
+        for i in 0..(FRAME_WIDTH * FRAME_HEIGHT) {
+            let off = i * 3;
+            self.frame_buffer[off] = bd_r;
+            self.frame_buffer[off + 1] = bd_g;
+            self.frame_buffer[off + 2] = bd_b;
+        }
+
+        // Render the 256x192 active area
+        for screen_y in 0..MODE4_HEIGHT {
+            // Collect sprites on this scanline (max 8)
+            let mut line_sprites: Vec<&SpriteEntry> = Vec::with_capacity(8);
+            for spr in &sprites {
+                // Sprite Y is +1 offset: y_byte=0 means line 1
+                let spr_top = spr.y.wrapping_add(1);
+                if screen_y >= spr_top && screen_y < spr_top + sprite_height {
+                    line_sprites.push(spr);
+                    if line_sprites.len() >= 8 {
+                        break;
+                    }
+                }
+            }
+
+            for screen_x in 0..MODE4_WIDTH {
+                // --- Background ---
+                // Determine effective scroll for this pixel
+                let eff_hscroll = if lock_top_hscroll && screen_y < 16 {
+                    0
+                } else {
+                    hscroll_val
+                };
+
+                let scrolled_x = (screen_x + MODE4_WIDTH - eff_hscroll) % MODE4_WIDTH;
+                let scrolled_y = (screen_y + vscroll_val) % (28 * 8); // 224 pixel wrap
+
+                let tile_col = scrolled_x / 8;
+                let tile_row = scrolled_y / 8;
+                let pixel_x_in_tile = scrolled_x % 8;
+                let pixel_y_in_tile = scrolled_y % 8;
+
+                let nt_addr = nt_base + (tile_row * 32 + tile_col) * 2;
+                let nt_lo = self.vram[nt_addr % VRAM_SIZE];
+                let nt_hi = self.vram[(nt_addr + 1) % VRAM_SIZE];
+                let nt_word = (nt_hi as u16) << 8 | (nt_lo as u16);
+
+                let bg_tile_index = (nt_word & 0x01FF) as usize;
+                let bg_hflip = (nt_word & 0x0200) != 0;
+                let bg_vflip = (nt_word & 0x0400) != 0;
+                let bg_palette = if (nt_word & 0x0800) != 0 { 16 } else { 0 };
+                let bg_priority = (nt_word & 0x1000) != 0;
+
+                let eff_px = if bg_hflip { 7 - pixel_x_in_tile } else { pixel_x_in_tile };
+                let eff_py = if bg_vflip { 7 - pixel_y_in_tile } else { pixel_y_in_tile };
+
+                let bg_color_idx = Self::sms_tile_pixel(&self.vram, bg_tile_index, eff_py, eff_px) as usize;
+                let bg_opaque = bg_color_idx != 0;
+
+                // --- Sprites ---
+                let mut spr_color_idx: usize = 0;
+                let mut spr_opaque = false;
+                for spr in &line_sprites {
+                    let spr_top = spr.y.wrapping_add(1);
+                    let spr_x = if mask_left_column {
+                        // Shift all sprites left by 8
+                        spr.x.wrapping_sub(8)
+                    } else {
+                        spr.x
+                    };
+                    if screen_x >= spr_x && screen_x < spr_x + 8 {
+                        let px = screen_x - spr_x;
+                        let py = screen_y - spr_top;
+                        let mut tile_idx = spr.tile + sprite_tile_offset;
+                        let tile_row_in_spr;
+                        if sprites_8x16 {
+                            tile_idx &= !1; // Force bit 0 to 0
+                            if py >= 8 {
+                                tile_idx += 1;
+                                tile_row_in_spr = py - 8;
+                            } else {
+                                tile_row_in_spr = py;
+                            }
+                        } else {
+                            tile_row_in_spr = py;
+                        }
+
+                        let c = Self::sms_tile_pixel(&self.vram, tile_idx, tile_row_in_spr, px) as usize;
+                        if c != 0 {
+                            spr_color_idx = c + 16; // Sprites always use palette 1
+                            spr_opaque = true;
+                            break;
+                        }
+                    }
+                }
+
+                // --- Priority compositing ---
+                let final_color_idx = if bg_priority && bg_opaque {
+                    bg_palette + bg_color_idx
+                } else if spr_opaque {
+                    spr_color_idx
+                } else if bg_opaque {
+                    bg_palette + bg_color_idx
+                } else {
+                    0 // backdrop
+                };
+
+                // Left column masking
+                let masked = mask_left_column && screen_x < 8;
+
+                let (r, g, b) = if masked {
+                    (bd_r, bd_g, bd_b)
+                } else {
+                    let cram_byte = self.cram[final_color_idx % CRAM_COLORS] as u8;
+                    Self::sms_cram_to_rgb888(cram_byte)
+                };
+
+                let fb_x = BORDER_X + screen_x;
+                let fb_y = BORDER_Y + screen_y;
+                let off = (fb_y * FRAME_WIDTH + fb_x) * 3;
+                self.frame_buffer[off] = r;
+                self.frame_buffer[off + 1] = g;
+                self.frame_buffer[off + 2] = b;
+            }
+        }
     }
 }
 
