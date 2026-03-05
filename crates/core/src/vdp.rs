@@ -1217,15 +1217,23 @@ impl Vdp {
         let vreg = regs[REG_WINDOW_VPOS];
         let hsplit = (((hreg & 0x1F) as usize) * 16).min(active_width);
         let vsplit = (((vreg & 0x1F) as usize) * 8).min(active_height);
-        let hactive = if (hreg & 0x80) != 0 {
-            x >= hsplit
-        } else {
-            x < hsplit
-        };
         let vactive = if (vreg & 0x80) != 0 {
             y >= vsplit
         } else {
             y < vsplit
+        };
+        // When an explicit vertical split is defined (vsplit > 0) and
+        // the line falls inside the vertical window region, the ENTIRE
+        // line uses the window plane (horizontal split is ignored).
+        // This matches real hardware behavior where vertical window
+        // takes priority over horizontal window.
+        if vsplit > 0 && vactive {
+            return true;
+        }
+        let hactive = if (hreg & 0x80) != 0 {
+            x >= hsplit
+        } else {
+            x < hsplit
         };
         hactive && vactive
     }
