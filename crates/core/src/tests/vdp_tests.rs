@@ -689,8 +689,10 @@ fn comix_title_roll_quirk_masks_lower_region_to_black() {
     vdp.write_control_port(0x8B00); // Full-screen h/v scroll mode.
     vdp.write_control_port(0x9011); // Plane size 64x64.
     vdp.write_control_port(0x8C89); // H40 + shadow/highlight bit set.
-    vdp.write_vsram_u16(0, 0x00B8); // Trigger value used by roll scene.
-    vdp.write_vsram_u16(1, 0x0000);
+    vdp.write_vsram_u16(0, 0x00B8);
+    // Plane B vscroll=128 so that screen line 150 maps to sample_y=278,
+    // which falls inside the nametable/HSCROLL overlap region (>=256).
+    vdp.write_vsram_u16(1, 0x0080);
     vdp.set_quirk_vscroll_swap_ab(true);
 
     // Tile 1: solid palette index 1 (red).
@@ -699,12 +701,13 @@ fn comix_title_roll_quirk_masks_lower_region_to_black() {
     }
     vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
 
-    // Fill Plane B map with tile 1 so clipping effect is easy to observe.
+    // Fill Plane B map with tile 1 (priority high) so clipping effect is
+    // easy to observe.  Priority bit keeps normal brightness in S/H mode.
     let plane_b_base = 0xE000usize;
     for row in 0..64usize {
         for col in 0..64usize {
             let addr = plane_b_base + (row * 64 + col) * 2;
-            vdp.write_vram_u8(addr as u16, 0x00);
+            vdp.write_vram_u8(addr as u16, 0x80);
             vdp.write_vram_u8((addr + 1) as u16, 0x01);
         }
     }
@@ -1413,12 +1416,15 @@ fn shadow_highlight_control_colors_affect_underlying_pixel() {
     vdp.write_vram_u8(sat + 7, 0x80);
 
     vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+    // Plane has no priority → shadowed in S/H mode.
+    // Shadow control on shadowed pixel → stays shadowed: level 4 → shadow = level 2 = 72.
     assert_eq!(&vdp.frame_buffer()[0..3], &[72, 0, 0]);
 
     // Switch to control color 14 (highlight).
     vdp.write_vram_u8(3 * 32, 0xE0);
     vdp.step(Vdp::CYCLES_PER_FRAME as u32);
-    assert_eq!(&vdp.frame_buffer()[0..3], &[216, 0, 0]);
+    // Highlight on shadowed pixel → restored to normal: level 4 = 144.
+    assert_eq!(&vdp.frame_buffer()[0..3], &[144, 0, 0]);
 }
 
 #[test]

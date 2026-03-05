@@ -520,21 +520,25 @@ impl Vdp {
             let line_cycles = line_end.saturating_sub(line_start).max(1);
             let hblank_start = line_start + self.hblank_start_cycle(line_cycles);
             if hblank_start > start && hblank_start <= end {
+                // Capture state for the current line at HBlank, BEFORE firing
+                // the H-INT.  By this point the previous line's H-INT handler
+                // has had a full scanline (~488 CPU cycles) to complete, so
+                // register changes (e.g. window position) are reflected.
+                let capture_line = if self.debug_line_latch_next {
+                    (line_idx as usize).saturating_add(1)
+                } else {
+                    line_idx as usize
+                };
+                if capture_line < FRAME_HEIGHT {
+                    self.capture_line_state(capture_line);
+                }
                 self.on_hblank_start(line_idx as usize);
             }
 
             if line_end > start && line_end <= end {
                 let next_line = line_idx + 1;
                 if next_line < total_lines {
-                    let next_line = next_line as usize;
-                    // Latch line state on scanline boundary; optional line+1 probe helps
-                    // diagnose transition-frame timing issues.
-                    if self.debug_line_latch_next {
-                        self.capture_line_state(next_line.saturating_add(1));
-                    } else {
-                        self.capture_line_state(next_line);
-                    }
-                    self.on_scanline_start(next_line);
+                    self.on_scanline_start(next_line as usize);
                 }
             }
         }
@@ -1246,14 +1250,35 @@ impl Vdp {
             && regs[11] == 0x03
     }
 
-    fn comix_title_roll_active(regs: &[u8; REG_COUNT], vsram: &[u16; VSRAM_WORDS]) -> bool {
+    fn comix_title_roll_active(regs: &[u8; REG_COUNT], _vsram: &[u16; VSRAM_WORDS]) -> bool {
         regs[REG_PLANE_B_NAMETABLE] == 0x07
             && (regs[REG_MODE_SET_2] & 0x40) != 0
             && regs[REG_HSCROLL_TABLE] == 0x3C
             && regs[REG_PLANE_SIZE] == 0x11
             && regs[11] == 0x00
             && (regs[12] & 0x08) != 0
-            && (vsram[0] & 0x07FF) == 0x00B8
+    }
+
+    /// For the plane B nametable, compute the first pixel row whose nametable
+    /// entries overlap with the HSCROLL table in VRAM.  Returns `None` if there
+    /// is no overlap.
+    fn plane_b_hscroll_overlap_pixel_row(regs: &[u8; REG_COUNT]) -> Option<usize> {
+        let plane_b_base = Self::plane_b_nametable_base_from_regs(regs);
+        let hscroll_base = Self::hscroll_table_base_from_regs(regs);
+        let (plane_width_tiles, plane_height_tiles) =
+            Self::plane_tile_dimensions_from_regs(regs);
+        if plane_width_tiles == 0 {
+            return None;
+        }
+        let row_bytes = plane_width_tiles * 2;
+        let plane_size_bytes = row_bytes * plane_height_tiles;
+        let plane_end = plane_b_base + plane_size_bytes;
+        if hscroll_base >= plane_b_base && hscroll_base < plane_end {
+            let overlap_tile_row = (hscroll_base - plane_b_base) / row_bytes;
+            Some(overlap_tile_row * 8)
+        } else {
+            None
+        }
     }
 
     fn render_frame(&mut self) {
@@ -1381,10 +1406,15 @@ impl Vdp {
             let comix_title_roll = self.quirk_vscroll_swap_ab
                 && Self::comix_title_roll_active(&regs, &vsram)
                 && std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_ROLL_FIX").is_none();
-            let comix_roll_black_clip_start = (vsram[0] as usize)
-                .min(0x07FF)
-                .saturating_sub(64)
-                .min(line_active_height);
+            // Suppress plane B pixels whose nametable entries fall inside the
+            // HSCROLL table region.  This is computed from the actual register
+            // values each line (independent of comix_title_roll_active) so that
+            // mid-frame register changes from H-INT don't create gaps.
+            let comix_roll_overlap_limit = if self.quirk_vscroll_swap_ab {
+                Self::plane_b_hscroll_overlap_pixel_row(&regs)
+            } else {
+                None
+            };
             let swap_vscroll_ab = debug_swap_vscroll_ab
                 || (self.quirk_vscroll_swap_ab && Self::comix_pretitle_vscroll_swap_active(&regs));
             let comix_b_bias_offset = std::env::var("MEGADRIVE_DEBUG_COMIX_BIAS_Y")
@@ -1452,20 +1482,26 @@ impl Vdp {
                             .rem_euclid(plane_height_px as isize)
                             as usize;
                     }
-                    self.sample_plane_pixel(
-                        vram,
-                        plane_b_base,
-                        (x + plane_width_px - b_hscroll) % plane_width_px,
-                        sample_y,
-                        plane_width_tiles,
-                        plane_height_tiles,
-                        plane_b_uses_64x32_paged,
-                        true,
-                        plane_paged_layout_b,
-                        plane_paged_xmajor_b,
-                        interlace_mode_2,
-                        interlace_field,
-                    )
+                    if comix_roll_overlap_limit
+                        .map_or(false, |limit| sample_y >= limit)
+                    {
+                        None
+                    } else {
+                        self.sample_plane_pixel(
+                            vram,
+                            plane_b_base,
+                            (x + plane_width_px - b_hscroll) % plane_width_px,
+                            sample_y,
+                            plane_width_tiles,
+                            plane_height_tiles,
+                            plane_b_uses_64x32_paged,
+                            true,
+                            plane_paged_layout_b,
+                            plane_paged_xmajor_b,
+                            interlace_mode_2,
+                            interlace_field,
+                        )
+                    }
                 };
                 if plane_b.is_some() {
                     line_b_opaque = line_b_opaque.saturating_add(1);
@@ -1510,9 +1546,6 @@ impl Vdp {
                 let front_plane = if disable_plane_a { None } else { front_plane };
 
                 let mut composed = self.compose_plane_samples(front_plane, plane_b);
-                if comix_title_roll && y >= comix_roll_black_clip_start {
-                    composed = None;
-                }
                 if bottom_bg_mask && y >= line_active_height.saturating_sub(32) {
                     composed = None;
                 }
@@ -1522,17 +1555,31 @@ impl Vdp {
                 let color = cram[color_index % CRAM_COLORS];
                 let (r, g, b) = md_color_to_rgb888(color);
 
+                // Shadow/Highlight mode: low-priority plane pixels are shadowed,
+                // high-priority plane pixels are at normal brightness.
+                let line_sh = Self::shadow_highlight_mode_from_regs(&regs);
+                let (r, g, b) = if line_sh
+                    && !composed.map(|s| s.priority_high).unwrap_or(false)
+                {
+                    (shadow_channel(r), shadow_channel(g), shadow_channel(b))
+                } else {
+                    (r, g, b)
+                };
+
                 let out = row + x * 3;
                 self.frame_buffer[out] = r;
                 self.frame_buffer[out + 1] = g;
                 self.frame_buffer[out + 2] = b;
 
                 let meta_index = y * FRAME_WIDTH + x;
+                // Encode: bit 0 = opaque, bit 1 = priority_high, bits 2..7 = color_index
+                let ci = (color_index as u8) & 0x3F;
                 if let Some(sample) = composed {
-                    plane_meta[meta_index] =
-                        (sample.opaque as u8) | ((sample.priority_high as u8) << 1);
+                    plane_meta[meta_index] = (sample.opaque as u8)
+                        | ((sample.priority_high as u8) << 1)
+                        | (ci << 2);
                 } else {
-                    plane_meta[meta_index] = 0;
+                    plane_meta[meta_index] = ci << 2;
                 }
             }
             if comix_title_roll && !disable_comix_roll_sparse_mask {
@@ -1858,21 +1905,35 @@ impl Vdp {
                                         self.sprite_collision = true;
                                         continue;
                                     }
+                                    // Use stored plane color index for correct S/H
+                                    // brightness without compounding errors.
+                                    let plane_ci = ((meta >> 2) & 0x3F) as usize;
+                                    let plane_color =
+                                        self.line_cram[dy][plane_ci % CRAM_COLORS];
+                                    let (pr, pg, pb) = md_color_to_rgb888(plane_color);
                                     let out = meta_index * 3;
                                     if pixel == 15 {
-                                        self.frame_buffer[out] =
-                                            shadow_channel(self.frame_buffer[out]);
-                                        self.frame_buffer[out + 1] =
-                                            shadow_channel(self.frame_buffer[out + 1]);
-                                        self.frame_buffer[out + 2] =
-                                            shadow_channel(self.frame_buffer[out + 2]);
+                                        // Shadow control: always shadow.
+                                        self.frame_buffer[out] = shadow_channel(pr);
+                                        self.frame_buffer[out + 1] = shadow_channel(pg);
+                                        self.frame_buffer[out + 2] = shadow_channel(pb);
                                     } else {
-                                        self.frame_buffer[out] =
-                                            highlight_channel(self.frame_buffer[out]);
-                                        self.frame_buffer[out + 1] =
-                                            highlight_channel(self.frame_buffer[out + 1]);
-                                        self.frame_buffer[out + 2] =
-                                            highlight_channel(self.frame_buffer[out + 2]);
+                                        // Highlight control: shadow→normal,
+                                        // normal→highlight.
+                                        if !plane_priority_high {
+                                            // Was shadowed → restore to normal.
+                                            self.frame_buffer[out] = pr;
+                                            self.frame_buffer[out + 1] = pg;
+                                            self.frame_buffer[out + 2] = pb;
+                                        } else {
+                                            // Was normal → highlight.
+                                            self.frame_buffer[out] =
+                                                highlight_channel(pr);
+                                            self.frame_buffer[out + 1] =
+                                                highlight_channel(pg);
+                                            self.frame_buffer[out + 2] =
+                                                highlight_channel(pb);
+                                        }
                                     }
                                     if !control_no_occupy {
                                         sprite_filled[meta_index] = true;
@@ -1883,6 +1944,31 @@ impl Vdp {
                                 let color_index = palette_line * 16 + pixel as usize;
                                 let color = self.line_cram[dy][color_index % CRAM_COLORS];
                                 let (r, g, b) = md_color_to_rgb888(color);
+                                // S/H mode: high-priority sprite → normal,
+                                // low-priority sprite → shadow.
+                                // Both sprite & plane high priority → highlight.
+                                let (r, g, b) = if line_shadow_highlight {
+                                    if sprite_priority_high
+                                        && plane_opaque
+                                        && plane_priority_high
+                                    {
+                                        (
+                                            highlight_channel(r),
+                                            highlight_channel(g),
+                                            highlight_channel(b),
+                                        )
+                                    } else if sprite_priority_high {
+                                        (r, g, b)
+                                    } else {
+                                        (
+                                            shadow_channel(r),
+                                            shadow_channel(g),
+                                            shadow_channel(b),
+                                        )
+                                    }
+                                } else {
+                                    (r, g, b)
+                                };
                                 let out = meta_index * 3;
                                 if sprite_filled[meta_index] {
                                     self.sprite_collision = true;
@@ -2078,20 +2164,31 @@ impl Vdp {
                         self.sprite_collision = true;
                         continue;
                     }
+                    // Use stored plane color index for correct S/H brightness.
+                    let plane_ci = ((meta >> 2) & 0x3F) as usize;
+                    let plane_color =
+                        self.line_cram[dy_index][plane_ci % CRAM_COLORS];
+                    let (pr, pg, pb) = md_color_to_rgb888(plane_color);
                     let out = meta_index * 3;
                     if pixel == 15 {
-                        // Shadow control color.
-                        self.frame_buffer[out] = shadow_channel(self.frame_buffer[out]);
-                        self.frame_buffer[out + 1] = shadow_channel(self.frame_buffer[out + 1]);
-                        self.frame_buffer[out + 2] = shadow_channel(self.frame_buffer[out + 2]);
+                        // Shadow control: always shadow.
+                        self.frame_buffer[out] = shadow_channel(pr);
+                        self.frame_buffer[out + 1] = shadow_channel(pg);
+                        self.frame_buffer[out + 2] = shadow_channel(pb);
                     } else {
-                        // Highlight control color.
-                        self.frame_buffer[out] = highlight_channel(self.frame_buffer[out]);
-                        self.frame_buffer[out + 1] = highlight_channel(self.frame_buffer[out + 1]);
-                        self.frame_buffer[out + 2] = highlight_channel(self.frame_buffer[out + 2]);
+                        // Highlight control: shadow→normal, normal→highlight.
+                        if !plane_priority_high {
+                            // Was shadowed → restore to normal.
+                            self.frame_buffer[out] = pr;
+                            self.frame_buffer[out + 1] = pg;
+                            self.frame_buffer[out + 2] = pb;
+                        } else {
+                            // Was normal → highlight.
+                            self.frame_buffer[out] = highlight_channel(pr);
+                            self.frame_buffer[out + 1] = highlight_channel(pg);
+                            self.frame_buffer[out + 2] = highlight_channel(pb);
+                        }
                     }
-                    // Diagnostic mode can disable control-pixel occupancy to validate
-                    // shadow/highlight ordering against real games.
                     if !control_no_occupy {
                         sprite_filled[meta_index] = true;
                     }
@@ -2101,6 +2198,19 @@ impl Vdp {
                 let color_index = palette_line * 16 + pixel as usize;
                 let color = self.line_cram[dy_index][color_index % CRAM_COLORS];
                 let (r, g, b) = md_color_to_rgb888(color);
+                // S/H mode: high-priority sprite → normal,
+                // low-priority → shadow, both high → highlight.
+                let (r, g, b) = if line_shadow_highlight {
+                    if sprite_priority_high && plane_opaque && plane_priority_high {
+                        (highlight_channel(r), highlight_channel(g), highlight_channel(b))
+                    } else if sprite_priority_high {
+                        (r, g, b)
+                    } else {
+                        (shadow_channel(r), shadow_channel(g), shadow_channel(b))
+                    }
+                } else {
+                    (r, g, b)
+                };
                 let out = meta_index * 3;
                 if sprite_filled[meta_index] {
                     self.sprite_collision = true;

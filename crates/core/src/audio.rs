@@ -488,7 +488,7 @@ impl Ym2612 {
         let base = Self::MASTER_CLOCK_HZ as f32 / (144.0 * 1_048_576.0);
         let octave_scale = 2f32.powi(block as i32 - 1);
         let freq = (fnum.max(1) as f32) * octave_scale * base;
-        freq.clamp(5.0, 14_000.0)
+        freq.clamp(5.0, 100_000.0)
     }
 
     fn channel_base_frequency_hz(channel: &YmChannel) -> f32 {
@@ -496,7 +496,7 @@ impl Ym2612 {
     }
 
     fn block_fnum_keycode(block: u8, fnum: u16) -> u8 {
-        ((block & 0x07) << 2) | (((fnum >> 8) & 0x03) as u8)
+        ((block & 0x07) << 2) | (((fnum >> 9) & 0x03) as u8)
     }
 
     fn channel_keycode(channel: &YmChannel) -> u8 {
@@ -572,8 +572,10 @@ impl Ym2612 {
     }
 
     fn detune_ratio(detune: u8) -> f32 {
-        // Approximate YM2612 DT steps in semitones.
-        const DETUNE_SEMITONES: [f32; 8] = [0.0, 0.015, 0.03, 0.045, -0.045, -0.03, -0.015, 0.0];
+        // Approximate YM2612 DT1 steps in semitones.
+        // Real hardware varies with keycode (up to ~1.1 semitones at DT=3).
+        // Using mid-range keycode approximation for each DT level.
+        const DETUNE_SEMITONES: [f32; 8] = [0.0, 0.2, 0.5, 0.8, -0.8, -0.5, -0.2, 0.0];
         let semitones = DETUNE_SEMITONES[(detune & 0x07) as usize];
         2f32.powf(semitones / 12.0)
     }
@@ -586,7 +588,8 @@ impl Ym2612 {
 
     fn channel_ams_depth(ams: u8) -> f32 {
         // Output amplitude modulation depth.
-        const AMS_DEPTH: [f32; 4] = [0.0, 0.06, 0.12, 0.24];
+        // Real YM2612 AMS: 0dB, 1.4dB, 5.9dB, 11.8dB → linear ratio.
+        const AMS_DEPTH: [f32; 4] = [0.0, 0.148, 0.493, 0.743];
         AMS_DEPTH[(ams & 0x03) as usize]
     }
 
