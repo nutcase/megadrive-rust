@@ -2666,13 +2666,13 @@ fn md_color_to_rgb888(color: u16) -> (u8, u8, u8) {
     (r * 36, g * 36, b * 36)
 }
 
-fn shadow_channel(channel: u8) -> u8 {
+pub(crate) fn shadow_channel(channel: u8) -> u8 {
     // S/H mode uses a 4-bit DAC: shadow output = L (vs normal 2L).
     // This is exactly half the normal brightness.
     channel >> 1
 }
 
-fn highlight_channel(channel: u8) -> u8 {
+pub(crate) fn highlight_channel(channel: u8) -> u8 {
     // S/H mode highlight output = 2L+1 (vs normal 2L).
     // One DAC step (252/14 = 18) above normal brightness.
     (channel as u16 + 18).min(255) as u8

@@ -1713,3 +1713,135 @@ fn complete_bus_dma_updates_source_and_clears_length_registers() {
     assert_eq!(vdp.register(22), 0x1A);
     assert_eq!(vdp.register(23) & 0x7F, 0x09);
 }
+
+#[test]
+fn shadow_highlight_dac_accuracy() {
+    // Verify shadow_channel and highlight_channel match the 4-bit DAC model.
+    // Normal level L maps to L*36 (0-252).
+    // Shadow = channel >> 1 (4-bit DAC output L vs normal 2L).
+    // Highlight = channel + 18, clamped to 255 (4-bit DAC output 2L+1 vs normal 2L).
+    use crate::vdp::{shadow_channel, highlight_channel};
+    for level in 0..=7u8 {
+        let normal = level as u16 * 36;
+        let expected_shadow = normal / 2;
+        let expected_highlight = (normal + 18).min(255);
+        assert_eq!(
+            shadow_channel(normal as u8) as u16,
+            expected_shadow,
+            "shadow of level {} (normal={})",
+            level,
+            normal
+        );
+        assert_eq!(
+            highlight_channel(normal as u8) as u16,
+            expected_highlight,
+            "highlight of level {} (normal={})",
+            level,
+            normal
+        );
+    }
+}
+
+#[test]
+fn shadow_highlight_transparent_plane_a_priority_prevents_shadow() {
+    // On real VDP, a transparent plane A tile with priority=true still
+    // prevents shadowing of the underlying plane B pixel.  The S/H
+    // brightness is the OR of both planes' raw priority bits.
+    let mut vdp = Vdp::new();
+    let plane_a_base = 0xC000u16; // reg 2 = 0x30
+    // Set plane B nametable to 0xE000 (reg 4 = 0x07).
+    vdp.write_control_port(0x8407);
+
+    // Enable S/H mode (reg 12 bit 3) + H40.
+    vdp.write_control_port(0x8C89);
+
+    // Use tile 2 for plane B to avoid overlap with tile 0 data.
+    // Plane A at (0,0): tile 0 with priority=true.
+    // Tile 0 data is all zeros → transparent.
+    vdp.vram[0..32].fill(0); // ensure tile 0 is all transparent
+    vdp.write_vram_u8(plane_a_base, 0x80); // priority bit set
+    vdp.write_vram_u8(plane_a_base + 1, 0x00); // tile index 0
+
+    // Plane B at (0,0): tile 2 with priority=false, opaque pixel.
+    vdp.write_vram_u8(0xE000, 0x00);
+    vdp.write_vram_u8(0xE001, 0x02); // tile index 2
+    // Tile 2 pixel data: color index 1 for first row.
+    let tile2_addr = 2 * 32;
+    vdp.write_vram_u8(tile2_addr, 0x11);
+    vdp.write_vram_u8(tile2_addr + 1, 0x11);
+    vdp.write_vram_u8(tile2_addr + 2, 0x11);
+    vdp.write_vram_u8(tile2_addr + 3, 0x11);
+    vdp.write_cram_u16(1, encode_md_color(3, 0, 0)); // level 3 red = 108
+
+    vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+    // Plane A is transparent but has priority → pixel should be NORMAL
+    // brightness (not shadowed).  Level 3 = 108.
+    assert_eq!(
+        &vdp.frame_buffer()[0..3],
+        &[108, 0, 0],
+        "transparent plane A with priority should prevent shadow on plane B"
+    );
+
+    // Now remove plane A priority → pixel should be shadowed.
+    vdp.write_vram_u8(plane_a_base, 0x00); // priority bit clear
+    vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+    // Shadow of 108 = 108 >> 1 = 54.
+    assert_eq!(
+        &vdp.frame_buffer()[0..3],
+        &[54, 0, 0],
+        "without plane A priority, plane B should be shadowed"
+    );
+}
+
+#[test]
+fn shadow_highlight_control_sprite_does_not_occupy_sprite_layer() {
+    // S/H control sprites (palette 3, color 14/15) should be transparent
+    // to the sprite layer — a subsequent normal sprite must still render
+    // at the same pixel position.
+    let mut vdp = Vdp::new();
+    let sat = 0xE000u16;
+
+    // Enable S/H mode + H40.
+    vdp.write_control_port(0x8C89);
+
+    // Plane A at (0,0): tile 1, no priority, opaque (color index 1).
+    vdp.write_vram_u8(0xC000, 0x00);
+    vdp.write_vram_u8(0xC001, 0x01); // tile 1
+    vdp.write_vram_u8(32, 0x11); // tile 1 pixel data: color 1
+    vdp.write_cram_u16(1, encode_md_color(3, 0, 0)); // level 3 red = 108
+
+    // Sprite 0: highlight control (palette 3, color 14) at position (0,0).
+    // Tile 4 first pixel = 14 (0xE).
+    vdp.write_vram_u8(4 * 32, 0xE0);
+    vdp.write_vram_u8(sat, 0x00);
+    vdp.write_vram_u8(sat + 1, 0x80); // y=128 → screen y=0
+    vdp.write_vram_u8(sat + 2, 0x00); // 1x1 size
+    vdp.write_vram_u8(sat + 3, 0x01); // link → sprite 1
+    vdp.write_vram_u8(sat + 4, 0x60); // palette 3, no priority
+    vdp.write_vram_u8(sat + 5, 0x04); // tile 4
+    vdp.write_vram_u8(sat + 6, 0x00);
+    vdp.write_vram_u8(sat + 7, 0x80); // x=128 → screen x=0
+
+    // Sprite 1: normal high-priority sprite (green, palette 0 color 2).
+    // Tile 5 first pixel = 2.
+    vdp.write_vram_u8(5 * 32, 0x20);
+    vdp.write_cram_u16(2, encode_md_color(0, 5, 0)); // green level 5 = 180
+    vdp.write_vram_u8(sat + 8, 0x00);
+    vdp.write_vram_u8(sat + 9, 0x80); // y=128
+    vdp.write_vram_u8(sat + 10, 0x00);
+    vdp.write_vram_u8(sat + 11, 0x00); // link=0 → end
+    vdp.write_vram_u8(sat + 12, 0x80); // high priority, palette 0
+    vdp.write_vram_u8(sat + 13, 0x05); // tile 5
+    vdp.write_vram_u8(sat + 14, 0x00);
+    vdp.write_vram_u8(sat + 15, 0x80); // x=128
+
+    vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+    // Sprite 1 (normal, high-priority) should render because the
+    // highlight control sprite does NOT occupy the sprite layer.
+    // High-priority sprite in S/H mode → normal brightness = green 180.
+    assert_eq!(
+        &vdp.frame_buffer()[0..3],
+        &[0, 180, 0],
+        "normal sprite should render over S/H control sprite"
+    );
+}
