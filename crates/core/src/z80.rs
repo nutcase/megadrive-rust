@@ -3,6 +3,7 @@ use crate::cartridge::Cartridge;
 use crate::input::IoBus;
 use crate::vdp::Vdp;
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 const FLAG_S: u8 = 0x80;
 const FLAG_Z: u8 = 0x40;
@@ -14,7 +15,16 @@ const FLAG_N: u8 = 0x02;
 const FLAG_C: u8 = 0x01;
 const M68K_CLOCK_HZ: u64 = 7_670_454;
 const Z80_CLOCK_HZ: u64 = 3_579_545;
-const AUDIO_IO_WAIT_CYCLES: u16 = 8;
+fn audio_io_wait_cycles() -> u16 {
+    static WAIT_CYCLES: OnceLock<u16> = OnceLock::new();
+    *WAIT_CYCLES.get_or_init(|| {
+        std::env::var("MEGADRIVE_AUDIO_IO_WAIT_CYCLES")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(2)
+            .min(32)
+    })
+}
 const IO_VERSION_ADDR: u32 = 0xA10000;
 const IO_PORT1_DATA_ADDR: u32 = 0xA10002;
 const IO_PORT2_DATA_ADDR: u32 = 0xA10004;
@@ -29,7 +39,7 @@ struct Z80Bus<'a> {
     io: &'a mut IoBus,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct Z80 {
     bus_requested: bool,
     bus_granted: bool,
@@ -1191,7 +1201,7 @@ impl Z80 {
                 let port_low = self.fetch_u8(bus);
                 let port = ((self.a as u16) << 8) | port_low as u16;
                 self.write_port(port, self.a, bus);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 11
             }
             0xDB => {
@@ -1199,7 +1209,7 @@ impl Z80 {
                 let port_low = self.fetch_u8(bus);
                 let port = ((self.a as u16) << 8) | port_low as u16;
                 self.a = self.read_port(port, bus);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 11
             }
             0xF3 => {
@@ -1269,13 +1279,13 @@ impl Z80 {
                 let value = self.read_port(self.bc(), bus);
                 self.b = value;
                 self.update_szp_preserve_c(value);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x41 => {
                 // OUT (C),B
                 self.write_port(self.bc(), self.b, bus);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x44 | 0x4C | 0x54 | 0x5C | 0x64 | 0x6C | 0x74 | 0x7C => {
@@ -1307,13 +1317,13 @@ impl Z80 {
                 let value = self.read_port(self.bc(), bus);
                 self.c = value;
                 self.update_szp_preserve_c(value);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x49 => {
                 // OUT (C),C
                 self.write_port(self.bc(), self.c, bus);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x42 => {
@@ -1329,13 +1339,13 @@ impl Z80 {
                 let value = self.read_port(self.bc(), bus);
                 self.d = value;
                 self.update_szp_preserve_c(value);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x51 => {
                 // OUT (C),D
                 self.write_port(self.bc(), self.d, bus);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x53 => {
@@ -1358,13 +1368,13 @@ impl Z80 {
                 let value = self.read_port(self.bc(), bus);
                 self.e = value;
                 self.update_szp_preserve_c(value);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x59 => {
                 // OUT (C),E
                 self.write_port(self.bc(), self.e, bus);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x62 => {
@@ -1389,13 +1399,13 @@ impl Z80 {
                 let value = self.read_port(self.bc(), bus);
                 self.h = value;
                 self.update_szp_preserve_c(value);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x61 => {
                 // OUT (C),H
                 self.write_port(self.bc(), self.h, bus);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x68 => {
@@ -1403,13 +1413,13 @@ impl Z80 {
                 let value = self.read_port(self.bc(), bus);
                 self.l = value;
                 self.update_szp_preserve_c(value);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x69 => {
                 // OUT (C),L
                 self.write_port(self.bc(), self.l, bus);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x67 => {
@@ -1451,13 +1461,13 @@ impl Z80 {
                 // IN (C) - updates flags only
                 let value = self.read_port(self.bc(), bus);
                 self.update_szp_preserve_c(value);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x71 => {
                 // OUT (C),0 (undocumented NMOS behavior)
                 self.write_port(self.bc(), 0x00, bus);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x78 => {
@@ -1465,13 +1475,13 @@ impl Z80 {
                 let value = self.read_port(self.bc(), bus);
                 self.a = value;
                 self.update_szp_preserve_c(value);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x79 => {
                 // OUT (C),A
                 self.write_port(self.bc(), self.a, bus);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 12
             }
             0x43 => {
@@ -1557,7 +1567,7 @@ impl Z80 {
                 self.b = self.b.wrapping_sub(1);
                 self.set_hl(self.hl().wrapping_add(1));
                 self.update_block_in_flags(value, 1);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 16
             }
             0xA3 => {
@@ -1567,7 +1577,7 @@ impl Z80 {
                 self.b = self.b.wrapping_sub(1);
                 self.set_hl(self.hl().wrapping_add(1));
                 self.update_block_out_flags(value, 1);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 16
             }
             0xA8 => {
@@ -1587,7 +1597,7 @@ impl Z80 {
                 self.b = self.b.wrapping_sub(1);
                 self.set_hl(self.hl().wrapping_sub(1));
                 self.update_block_in_flags(value, -1);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 16
             }
             0xAB => {
@@ -1597,7 +1607,7 @@ impl Z80 {
                 self.b = self.b.wrapping_sub(1);
                 self.set_hl(self.hl().wrapping_sub(1));
                 self.update_block_out_flags(value, -1);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 16
             }
             0xA1 => {
@@ -1642,7 +1652,7 @@ impl Z80 {
                 self.b = self.b.wrapping_sub(1);
                 self.set_hl(self.hl().wrapping_add(1));
                 self.update_block_in_flags(value, 1);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 if self.b != 0 {
                     self.pc = self.pc.wrapping_sub(2);
                     21
@@ -1657,7 +1667,7 @@ impl Z80 {
                 self.b = self.b.wrapping_sub(1);
                 self.set_hl(self.hl().wrapping_add(1));
                 self.update_block_out_flags(value, 1);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 if self.b != 0 {
                     self.pc = self.pc.wrapping_sub(2);
                     21
@@ -1687,7 +1697,7 @@ impl Z80 {
                 self.b = self.b.wrapping_sub(1);
                 self.set_hl(self.hl().wrapping_sub(1));
                 self.update_block_in_flags(value, -1);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 if self.b != 0 {
                     self.pc = self.pc.wrapping_sub(2);
                     21
@@ -1702,7 +1712,7 @@ impl Z80 {
                 self.b = self.b.wrapping_sub(1);
                 self.set_hl(self.hl().wrapping_sub(1));
                 self.update_block_out_flags(value, -1);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
                 if self.b != 0 {
                     self.pc = self.pc.wrapping_sub(2);
                     21
@@ -2153,12 +2163,12 @@ impl Z80 {
             }
             0x4000..=0x5FFF => {
                 bus.audio.write_ym2612_from_z80((addr & 0x03) as u8, value);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
             }
             0x6000..=0x60FF => self.write_bank_register(value),
             0x7F11 => {
                 bus.audio.write_psg_from_z80(value);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
             }
             0x8000..=0xFFFF => self.write_68k_window(addr, value, bus),
             _ => {}
@@ -2178,9 +2188,15 @@ impl Z80 {
     fn write_port(&mut self, port: u16, value: u8, bus: &mut Z80Bus<'_>) {
         match port as u8 {
             // YM2612 address/data ports (low-byte decode).
-            0x40..=0x43 => bus.audio.write_ym2612_from_z80((port as u8) & 0x03, value),
+            0x40..=0x43 => {
+                bus.audio.write_ym2612_from_z80((port as u8) & 0x03, value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
+            }
             // PSG data port
-            0x7F => bus.audio.write_psg_from_z80(value),
+            0x7F => {
+                bus.audio.write_psg_from_z80(value);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
+            }
             _ => {}
         }
     }
@@ -2196,12 +2212,27 @@ impl Z80 {
         (self.bank_address & 0x00FF_8000) | offset
     }
 
+    fn decode_68k_vdp_local_addr(addr: u32) -> Option<u32> {
+        if (0xC00000..=0xDFFFFF).contains(&addr) {
+            Some(0xC00000 | (addr & 0x1F))
+        } else {
+            None
+        }
+    }
+
+    fn is_68k_psg_addr(addr: u32) -> bool {
+        let Some(local) = Self::decode_68k_vdp_local_addr(addr) else {
+            return false;
+        };
+        matches!(local, 0xC00011 | 0xC00013 | 0xC00015 | 0xC00017)
+    }
+
     fn read_68k_window(&self, z80_addr: u16, bus: &mut Z80Bus<'_>) -> u8 {
         let addr = self.resolve_68k_window_addr(z80_addr);
         match addr {
             0x000000..=0x3FFFFF => bus.cartridge.read_u8(addr),
             0xA04000..=0xA04003 => bus.audio.read_ym2612((addr - 0xA04000) as u8),
-            0xC00000..=0xC0001F => Self::read_vdp_port_byte(addr, bus),
+            0xC00000..=0xDFFFFF => Self::read_vdp_port_byte(addr, bus),
             x if x == IO_VERSION_ADDR || x == IO_VERSION_ADDR + 1 => bus.io.read_version(),
             x if x == IO_PORT1_DATA_ADDR || x == IO_PORT1_DATA_ADDR + 1 => bus.io.read_port1_data(),
             x if x == IO_PORT2_DATA_ADDR || x == IO_PORT2_DATA_ADDR + 1 => bus.io.read_port2_data(),
@@ -2213,14 +2244,17 @@ impl Z80 {
     }
 
     fn read_vdp_port_byte(addr: u32, bus: &mut Z80Bus<'_>) -> u8 {
-        let aligned = addr & !1;
+        let Some(local) = Self::decode_68k_vdp_local_addr(addr) else {
+            return 0xFF;
+        };
+        let aligned = local & !1;
         let word = match aligned {
             0xC00000 | 0xC00002 => bus.vdp.read_data_port(),
             0xC00004 | 0xC00006 => bus.vdp.read_control_port(),
             0xC00008 | 0xC0000A => bus.vdp.read_hv_counter(),
             _ => return 0xFF,
         };
-        if (addr & 1) == 0 {
+        if (local & 1) == 0 {
             (word >> 8) as u8
         } else {
             word as u8
@@ -2233,7 +2267,7 @@ impl Z80 {
             0xA04000..=0xA04003 => {
                 bus.audio
                     .write_ym2612_from_z80((addr - 0xA04000) as u8, value);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
             }
             x if x == IO_PORT1_DATA_ADDR || x == IO_PORT1_DATA_ADDR + 1 => {
                 bus.io.write_port1_data(value)
@@ -2247,11 +2281,11 @@ impl Z80 {
             x if x == IO_PORT2_CTRL_ADDR || x == IO_PORT2_CTRL_ADDR + 1 => {
                 bus.io.write_port2_ctrl(value)
             }
-            0xC00011 => {
+            x if Self::is_68k_psg_addr(x) => {
                 bus.audio.write_psg_from_z80(value);
-                self.io_wait_cycles = self.io_wait_cycles.saturating_add(AUDIO_IO_WAIT_CYCLES);
+                self.io_wait_cycles = self.io_wait_cycles.saturating_add(audio_io_wait_cycles());
             }
-            0xC00000..=0xC0001F => self.write_vdp_port_byte(addr, value, bus),
+            0xC00000..=0xDFFFFF => self.write_vdp_port_byte(addr, value, bus),
             0xFF0000..=0xFFFFFF => {
                 bus.work_ram[(addr - 0xFF0000) as usize] = value;
             }
@@ -2260,14 +2294,17 @@ impl Z80 {
     }
 
     fn write_vdp_port_byte(&mut self, addr: u32, value: u8, bus: &mut Z80Bus<'_>) {
-        let aligned = addr & !1;
+        let Some(local) = Self::decode_68k_vdp_local_addr(addr) else {
+            return;
+        };
+        let aligned = local & !1;
         let immediate_byte_commit =
             std::env::var_os("MEGADRIVE_DEBUG_VDP_BYTE_IMMEDIATE").is_some();
-        let low_byte_write = (addr & 1) != 0;
+        let low_byte_write = (local & 1) != 0;
         let next = match aligned {
             0xC00000 | 0xC00002 => {
                 let current = self.vdp_data_write_latch;
-                let next = if (addr & 1) == 0 {
+                let next = if (local & 1) == 0 {
                     ((value as u16) << 8) | (current & 0x00FF)
                 } else {
                     (current & 0xFF00) | value as u16
@@ -2277,7 +2314,7 @@ impl Z80 {
             }
             0xC00004 | 0xC00006 => {
                 let current = self.vdp_control_write_latch;
-                let next = if (addr & 1) == 0 {
+                let next = if (local & 1) == 0 {
                     ((value as u16) << 8) | (current & 0x00FF)
                 } else {
                     (current & 0xFF00) | value as u16
@@ -2327,7 +2364,7 @@ impl Z80 {
             0x000000..=0x3FFFFF => bus.cartridge.read_u8(addr),
             0xA00000..=0xA01FFF => self.ram[(addr as usize - 0xA00000) & 0x1FFF],
             0xA04000..=0xA04003 => bus.audio.read_ym2612((addr - 0xA04000) as u8),
-            0xC00000..=0xC0001F => Self::read_vdp_port_byte(addr, bus),
+            0xC00000..=0xDFFFFF => Self::read_vdp_port_byte(addr, bus),
             x if x == IO_VERSION_ADDR || x == IO_VERSION_ADDR + 1 => bus.io.read_version(),
             x if x == IO_PORT1_DATA_ADDR || x == IO_PORT1_DATA_ADDR + 1 => bus.io.read_port1_data(),
             x if x == IO_PORT2_DATA_ADDR || x == IO_PORT2_DATA_ADDR + 1 => bus.io.read_port2_data(),
@@ -5468,6 +5505,44 @@ mod tests {
 
         z80.step(160, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
         assert_eq!(audio.psg().last_data(), 0x9A);
+    }
+
+    #[test]
+    fn bank_window_can_write_psg_through_68k_bus_mirror_addresses() {
+        let mut z80 = Z80::new();
+        let mut audio = AudioBus::new();
+        let cart = dummy_cart();
+        let mut work_ram = [0u8; 0x10000];
+        let mut vdp = Vdp::new();
+        let mut io = IoBus::new();
+        z80.write_reset_byte(0x01);
+        z80.bank_address = 0x00C0_0000;
+
+        // ld a,0x9B ; ld (0x8013),a ; halt
+        z80.write_ram_u8(0x0000, 0x3E);
+        z80.write_ram_u8(0x0001, 0x9B);
+        z80.write_ram_u8(0x0002, 0x32);
+        z80.write_ram_u8(0x0003, 0x13);
+        z80.write_ram_u8(0x0004, 0x80);
+        z80.write_ram_u8(0x0005, 0x76);
+
+        z80.step(160, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(audio.psg().last_data(), 0x9B);
+
+        // Same via Dxxxxx mirror region.
+        z80 = Z80::new();
+        audio = AudioBus::new();
+        z80.write_reset_byte(0x01);
+        z80.bank_address = 0x00D0_0000;
+        z80.write_ram_u8(0x0000, 0x3E);
+        z80.write_ram_u8(0x0001, 0x9C);
+        z80.write_ram_u8(0x0002, 0x32);
+        z80.write_ram_u8(0x0003, 0x11);
+        z80.write_ram_u8(0x0004, 0x80);
+        z80.write_ram_u8(0x0005, 0x76);
+
+        z80.step(160, &mut audio, &cart, &mut work_ram, &mut vdp, &mut io);
+        assert_eq!(audio.psg().last_data(), 0x9C);
     }
 
     #[test]

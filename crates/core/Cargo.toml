@@ -8,3 +8,4 @@ name = "megadrive_core"
 path = "src/lib.rs"
 
 [dependencies]
+bincode = { version = "2", features = ["derive"] }

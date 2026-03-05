@@ -33,19 +33,19 @@ const STATUS_ODD_FRAME: u16 = 0x0010;
 const STATUS_SPRITE_COLLISION: u16 = 0x0020;
 const STATUS_SPRITE_OVERFLOW: u16 = 0x0040;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 struct DmaFillState {
     remaining_words: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub(crate) enum DmaTarget {
     Vram,
     Cram,
     Vsram,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub(crate) struct BusDmaRequest {
     pub source_addr: u32,
     pub dest_addr: u16,
@@ -54,7 +54,7 @@ pub(crate) struct BusDmaRequest {
     pub target: DmaTarget,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, bincode::Encode, bincode::Decode)]
 enum AccessMode {
     VramRead,
     #[default]
@@ -66,14 +66,14 @@ enum AccessMode {
     Unsupported,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 struct PlaneSample {
     color_index: usize,
     opaque: bool,
     priority_high: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub enum VideoStandard {
     Ntsc,
     Pal,
@@ -88,7 +88,7 @@ impl VideoStandard {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct Vdp {
     video_standard: VideoStandard,
     frame_cycles: u64,
@@ -153,8 +153,8 @@ impl Vdp {
         registers[REG_PLANE_A_NAMETABLE] = 0x30; // Plane A name table base: 0xC000
         registers[REG_SPRITE_TABLE] = 0x70; // Sprite attribute table base: 0xE000
         registers[REG_HSCROLL_TABLE] = 0x3C; // Horizontal scroll table base: 0xF000
-                                             // Window off by default.
-                                             // Keep window disabled by default.
+        // Window off by default.
+        // Keep window disabled by default.
         registers[REG_WINDOW_HPOS] = 0x00;
         registers[REG_WINDOW_VPOS] = 0x00;
         registers[REG_AUTO_INCREMENT] = 2; // Word access by default
@@ -233,6 +233,12 @@ impl Vdp {
 
     pub fn set_quirk_comix_pretitle_plane_b_bias(&mut self, enabled: bool) {
         self.quirk_comix_pretitle_plane_b_bias = enabled;
+    }
+
+    pub fn refresh_runtime_debug_config_from_env(&mut self) {
+        self.line_vram_latch_enabled =
+            std::env::var_os("MEGADRIVE_DEBUG_LINE_VRAM_LATCH").is_some();
+        self.debug_line_latch_next = std::env::var_os("MEGADRIVE_DEBUG_LINE_LATCH_NEXT").is_some();
     }
 
     #[cfg(test)]
@@ -577,15 +583,25 @@ impl Vdp {
     }
 
     fn on_scanline_start(&mut self, line: usize) {
+        let active_height = self.active_display_height();
         // V-INT condition is latched on VBlank entry; IRQ output is gated by
         // the current enable bit (register #1 bit 5).
-        if line == self.active_display_height() {
+        if line == active_height {
             self.v_interrupt_pending = true;
         }
+
+        // Keep the H-INT counter reloaded throughout VBlank. This avoids
+        // carrying partial countdown state across frames.
+        if line >= active_height {
+            self.h_interrupt_armed = false;
+            self.h_interrupt_counter = self.registers[REG_H_INTERRUPT_COUNTER];
+            return;
+        }
+
         if self.h_interrupt_counter == 0 {
             // H-INT condition is latched by line counter timing; IRQ output is
             // gated by the current enable bit (register #0 bit 4).
-            self.h_interrupt_armed = line < self.active_display_height();
+            self.h_interrupt_armed = true;
             self.h_interrupt_counter = self.registers[REG_H_INTERRUPT_COUNTER];
         } else {
             self.h_interrupt_armed = false;
@@ -838,11 +854,7 @@ impl Vdp {
     fn dma_length(&self) -> usize {
         let len = ((self.registers[REG_DMA_LENGTH_HIGH] as usize) << 8)
             | self.registers[REG_DMA_LENGTH_LOW] as usize;
-        if len == 0 {
-            0x10000
-        } else {
-            len
-        }
+        if len == 0 { 0x10000 } else { len }
     }
 
     fn clear_dma_length(&mut self) {
@@ -1369,6 +1381,10 @@ impl Vdp {
             let comix_title_roll = self.quirk_vscroll_swap_ab
                 && Self::comix_title_roll_active(&regs, &vsram)
                 && std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_ROLL_FIX").is_none();
+            let comix_roll_black_clip_start = (vsram[0] as usize)
+                .min(0x07FF)
+                .saturating_sub(64)
+                .min(line_active_height);
             let swap_vscroll_ab = debug_swap_vscroll_ab
                 || (self.quirk_vscroll_swap_ab && Self::comix_pretitle_vscroll_swap_active(&regs));
             let comix_b_bias_offset = std::env::var("MEGADRIVE_DEBUG_COMIX_BIAS_Y")
@@ -1494,6 +1510,9 @@ impl Vdp {
                 let front_plane = if disable_plane_a { None } else { front_plane };
 
                 let mut composed = self.compose_plane_samples(front_plane, plane_b);
+                if comix_title_roll && y >= comix_roll_black_clip_start {
+                    composed = None;
+                }
                 if bottom_bg_mask && y >= line_active_height.saturating_sub(32) {
                     composed = None;
                 }

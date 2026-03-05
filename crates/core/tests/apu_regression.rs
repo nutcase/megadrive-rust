@@ -52,6 +52,18 @@ fn ym2612_status_reports_busy_after_address_write() {
 }
 
 #[test]
+fn ym2612_z80_data_write_is_not_dropped_while_busy() {
+    let mut audio = AudioBus::new();
+
+    audio.write_ym2612_from_z80(0, 0x22);
+    // Keep BUSY asserted and immediately write data from Z80 side.
+    assert_eq!(audio.read_ym2612(0) & 0x80, 0x80);
+    audio.write_ym2612_from_z80(1, 0x0F);
+
+    assert_eq!(audio.ym2612().register(0, 0x22), 0x0F);
+}
+
+#[test]
 fn ym2612_timer_a_sets_status_bit0_when_enabled() {
     let mut audio = AudioBus::new();
     // Timer A = 1023 => shortest period in this model.
@@ -171,6 +183,9 @@ fn generates_silence_samples_without_psg_writes() {
 #[test]
 fn generates_nonzero_samples_after_psg_write() {
     let mut audio = AudioBus::new();
+    // Use a normal tone period (>1) so the PSG toggles between polarities.
+    audio.write_psg(0x80);
+    audio.write_psg(0x02);
     audio.write_psg(0x90); // low attenuation -> larger amplitude
     audio.step(2_000);
 
@@ -211,6 +226,102 @@ fn ym2612_dac_outputs_pcm_when_enabled() {
     assert!(!samples.is_empty());
     assert!(audio.ym2612().dac_enabled());
     assert!(samples.iter().all(|&s| s > 0));
+}
+
+#[test]
+fn ym2612_dac_averages_subsample_write_timing() {
+    let mut audio = AudioBus::new();
+    audio.write_ym2612_from_z80(0, 0x2B);
+    audio.write_ym2612_from_z80(1, 0x80);
+    audio.step_z80_cycles(1);
+
+    // Two different DAC levels inside one host sample interval.
+    audio.write_ym2612_from_z80(0, 0x2A);
+    audio.write_ym2612_from_z80(1, 0x00);
+    audio.step_z80_cycles(2);
+    audio.write_ym2612_from_z80(0, 0x2A);
+    audio.write_ym2612_from_z80(1, 0xFF);
+    audio.step_z80_cycles(2);
+
+    // Exactly one 44.1kHz output frame worth of 68k time.
+    audio.step(174);
+    let samples = audio.drain_samples(2);
+    assert_eq!(samples.len(), 2);
+    // Without timing-aware DAC accumulation this would be near +8128.
+    assert!(samples[0].abs() < 7000, "left={}", samples[0]);
+    assert!(samples[1].abs() < 7000, "right={}", samples[1]);
+}
+
+#[test]
+fn ym2612_dac_write_applies_after_elapsed_z80_slice() {
+    let mut audio = AudioBus::new();
+    audio.write_ym2612_from_z80(0, 0x2B);
+    audio.write_ym2612_from_z80(1, 0x80);
+    audio.step_z80_cycles(1);
+
+    // Write max DAC value, but do not advance Z80 yet.
+    audio.write_ym2612_from_z80(0, 0x2A);
+    audio.write_ym2612_from_z80(1, 0xFF);
+    // One output sample before any elapsed Z80 time should still be near silence.
+    audio.step(174);
+    let before = audio.drain_samples(2);
+    assert_eq!(before.len(), 2);
+    assert!(before[0].abs() < 64, "left_before={}", before[0]);
+    assert!(before[1].abs() < 64, "right_before={}", before[1]);
+
+    // First elapsed slice latches pending value; second slice accumulates it.
+    audio.step_z80_cycles(4);
+    audio.step_z80_cycles(4);
+    audio.step(174);
+    let after = audio.drain_samples(2);
+    assert_eq!(after.len(), 2);
+    assert!(after[0] > 1000, "left_after={}", after[0]);
+    assert!(after[1] > 1000, "right_after={}", after[1]);
+}
+
+#[test]
+fn ym2612_dac_write_contributes_within_elapsed_z80_slice() {
+    let mut audio = AudioBus::new();
+    audio.write_ym2612(0, 0x2B);
+    audio.write_ym2612(1, 0x80);
+    audio.write_ym2612(0, 0x2A);
+    audio.write_ym2612(1, 0x80);
+
+    // Clear any initial buffered output.
+    audio.step(174);
+    let _ = audio.drain_samples(2);
+
+    // Z80-side DAC data write should contribute to this elapsed slice.
+    audio.write_ym2612_from_z80(0, 0x2A);
+    audio.write_ym2612_from_z80(1, 0xFF);
+    audio.step_z80_cycles(8);
+    audio.step(174);
+    let samples = audio.drain_samples(2);
+    assert_eq!(samples.len(), 2);
+    assert!(samples[0] > 500, "left={}", samples[0]);
+    assert!(samples[1] > 500, "right={}", samples[1]);
+}
+
+#[test]
+fn ym2612_dac_pending_write_order_preserved_with_enable_toggle() {
+    let mut audio = AudioBus::new();
+    // Prime DAC output with a negative sample while DAC is disabled.
+    audio.write_ym2612(0, 0x2A);
+    audio.write_ym2612(1, 0x00);
+
+    // Same Z80 slice: write new output first, then enable DAC.
+    audio.write_ym2612_from_z80(0, 0x2A);
+    audio.write_ym2612_from_z80(1, 0xFF);
+    audio.write_ym2612_from_z80(0, 0x2B);
+    audio.write_ym2612_from_z80(1, 0x80);
+    audio.step_z80_cycles(16);
+    audio.step(174);
+
+    let samples = audio.drain_samples(2);
+    assert_eq!(samples.len(), 2);
+    // If ordering is reversed internally, stale negative DAC output leaks first.
+    assert!(samples[0] > 0, "left={}", samples[0]);
+    assert!(samples[1] > 0, "right={}", samples[1]);
 }
 
 #[test]
@@ -307,12 +418,12 @@ fn ym2612_key_on_bit_mapping_matches_operator_order() {
     audio.write_ym2612(0, 0xA4);
     audio.write_ym2612(1, 0x22);
 
-    // b5 only => OP3 only.
+    // b5 only => OP2 only.
     audio.write_ym2612(0, 0x28);
     audio.write_ym2612(1, 0x20);
 
-    assert!(audio.ym2612().channel_operator_key_on(0, 2)); // OP3
-    assert!(!audio.ym2612().channel_operator_key_on(0, 1)); // OP2
+    assert!(audio.ym2612().channel_operator_key_on(0, 1)); // OP2
+    assert!(!audio.ym2612().channel_operator_key_on(0, 2)); // OP3
     assert!(!audio.ym2612().channel_operator_key_on(0, 0)); // OP1
     assert!(!audio.ym2612().channel_operator_key_on(0, 3)); // OP4
 }
@@ -422,16 +533,16 @@ fn ym2612_channel3_mode_11_does_not_enable_csm_autokey() {
 }
 
 #[test]
-fn ym2612_channel3_special_mode_applies_a8_ae_frequencies_to_ops2_to_4() {
+fn ym2612_channel3_special_mode_uses_ym3438_slot_mapping() {
     let mut audio = AudioBus::new();
-    // CH3 base pitch via A2/A6 (used by OP1 in special mode).
+    // CH3 base pitch via A2/A6 (used by OP4 in special mode).
     audio.write_ym2612(0, 0xA2);
     audio.write_ym2612(1, 0x00);
     audio.write_ym2612(0, 0xA6);
     audio.write_ym2612(1, 0x22);
 
     // CH3 special frequencies:
-    // OP2 <- A8/AC, OP3 <- A9/AD, OP4 <- AA/AE.
+    // OP3 <- A8/AC, OP1 <- A9/AD, OP2 <- AA/AE.
     // Choose clearly different values so mapping mistakes are visible.
     audio.write_ym2612(0, 0xA8);
     audio.write_ym2612(1, 0x80);
@@ -462,20 +573,26 @@ fn ym2612_channel3_special_mode_applies_a8_ae_frequencies_to_ops2_to_4() {
     let special_op3 = audio.ym2612().channel_operator_frequency_hz_debug(2, 2);
     let special_op4 = audio.ym2612().channel_operator_frequency_hz_debug(2, 3);
 
-    // OP1 keeps base A2/A6 frequency in special mode.
-    assert!((special_op1 / normal_op1 - 1.0).abs() < 0.01);
-    // OP2-4 should now diverge from base frequency and from each other.
+    // OP4 keeps base A2/A6 frequency in special mode.
+    assert!((special_op4 / normal_op4 - 1.0).abs() < 0.01);
+    // OP1-3 should now diverge from base frequency and from each other.
+    assert!((special_op1 / normal_op1 - 1.0).abs() > 0.20);
     assert!((special_op2 / normal_op2 - 1.0).abs() > 0.20);
     assert!((special_op3 / normal_op3 - 1.0).abs() > 0.20);
-    assert!((special_op4 / normal_op4 - 1.0).abs() > 0.20);
-    assert!(special_op2 < special_op3);
-    assert!(special_op3 < special_op4);
+    assert!(special_op3 < special_op1);
+    assert!(special_op1 < special_op2);
 
     // Disabling special mode returns all operators to base pitch.
     audio.write_ym2612(0, 0x27);
     audio.write_ym2612(1, 0x00);
+    let restored_op1 = audio.ym2612().channel_operator_frequency_hz_debug(2, 0);
     let restored_op2 = audio.ym2612().channel_operator_frequency_hz_debug(2, 1);
+    let restored_op3 = audio.ym2612().channel_operator_frequency_hz_debug(2, 2);
+    let restored_op4 = audio.ym2612().channel_operator_frequency_hz_debug(2, 3);
+    assert!((restored_op1 / normal_op1 - 1.0).abs() < 0.01);
     assert!((restored_op2 / normal_op2 - 1.0).abs() < 0.01);
+    assert!((restored_op3 / normal_op3 - 1.0).abs() < 0.01);
+    assert!((restored_op4 / normal_op4 - 1.0).abs() < 0.01);
 }
 
 #[test]
@@ -664,18 +781,21 @@ fn ym_carrier_total_level_can_mute_channel_output() {
 }
 
 #[test]
-fn psg_period_zero_uses_1024_divider_frequency() {
+fn psg_period_zero_matches_period_one_frequency_on_integrated_psg() {
     let mut audio = AudioBus::new();
-    // Tone 0 period = 0x000.
+    // Tone 0 period = 0x000 (low nibble + high bits).
     audio.write_psg(0x80);
     audio.write_psg(0x00);
+    let f0 = audio.psg().tone_frequency_hz_debug(0);
 
-    assert_eq!(audio.psg().tone_period(0), 0x000);
-    let expected = 3_579_545.0 / (32.0 * 1024.0);
-    let got = audio.psg().tone_frequency_hz_debug(0);
+    // Tone 0 period = 0x001.
+    audio.write_psg(0x81);
+    audio.write_psg(0x00);
+    assert_eq!(audio.psg().tone_period(0), 0x001);
+    let f1 = audio.psg().tone_frequency_hz_debug(0);
     assert!(
-        (got - expected).abs() < 0.01,
-        "expected {expected}, got {got}"
+        (f0 - f1).abs() < 0.01,
+        "period=0 should match period=1 frequency: f0={f0}, f1={f1}"
     );
 }
 
@@ -825,7 +945,7 @@ fn ym_feedback_setting_changes_waveform_after_key_on_restart() {
 }
 
 #[test]
-fn ym_alg1_op3_does_not_directly_drive_o4_when_op2_is_muted() {
+fn ym_alg1_op3_directly_contributes_to_o4_path() {
     fn configure_base(audio: &mut AudioBus) {
         // CH1 pitch.
         audio.write_ym2612(0, 0xA0);
@@ -854,7 +974,7 @@ fn ym_alg1_op3_does_not_directly_drive_o4_when_op2_is_muted() {
     slow.write_ym2612(1, 0x01);
     // Key on OP3+OP4 only.
     slow.write_ym2612(0, 0x28);
-    slow.write_ym2612(1, 0xA0);
+    slow.write_ym2612(1, 0xC0);
     slow.step(8_000);
     let samples_slow = slow.drain_samples(256);
 
@@ -864,15 +984,15 @@ fn ym_alg1_op3_does_not_directly_drive_o4_when_op2_is_muted() {
     fast.write_ym2612(0, 0x34); // CH1 OP3 DT/MUL
     fast.write_ym2612(1, 0x0F);
     fast.write_ym2612(0, 0x28);
-    fast.write_ym2612(1, 0xA0);
+    fast.write_ym2612(1, 0xC0);
     fast.step(8_000);
     let samples_fast = fast.drain_samples(256);
 
-    assert_eq!(samples_slow, samples_fast);
+    assert_ne!(samples_slow, samples_fast);
 }
 
 #[test]
-fn ym_alg2_op3_does_not_directly_drive_o4_when_op2_is_muted() {
+fn ym_alg2_op3_directly_contributes_to_o4_path() {
     fn configure_base(audio: &mut AudioBus) {
         // CH1 pitch.
         audio.write_ym2612(0, 0xA0);
@@ -901,7 +1021,7 @@ fn ym_alg2_op3_does_not_directly_drive_o4_when_op2_is_muted() {
     slow.write_ym2612(1, 0x01);
     // Key on OP1+OP3+OP4.
     slow.write_ym2612(0, 0x28);
-    slow.write_ym2612(1, 0xB0);
+    slow.write_ym2612(1, 0xD0);
     slow.step(8_000);
     let samples_slow = slow.drain_samples(256);
 
@@ -911,11 +1031,11 @@ fn ym_alg2_op3_does_not_directly_drive_o4_when_op2_is_muted() {
     fast.write_ym2612(0, 0x34); // CH1 OP3 DT/MUL
     fast.write_ym2612(1, 0x0F);
     fast.write_ym2612(0, 0x28);
-    fast.write_ym2612(1, 0xB0);
+    fast.write_ym2612(1, 0xD0);
     fast.step(8_000);
     let samples_fast = fast.drain_samples(256);
 
-    assert_eq!(samples_slow, samples_fast);
+    assert_ne!(samples_slow, samples_fast);
 }
 
 #[test]
@@ -1062,7 +1182,9 @@ fn ym_ssg_eg_hold_reaches_floor_even_with_high_sustain_level() {
     let hold_ssg_samples = hold_ssg.drain_samples(hold_ssg.pending_samples());
     let hold_ssg_tail_peak = tail_peak(&hold_ssg_samples, 512);
 
-    assert!(no_ssg_env > 0.6, "no_ssg_env={no_ssg_env}");
+    // KS=0 still contributes a small rate boost (keycode >> 3) per Nuked
+    // OPN2, so SR=0 slowly decays.  Envelope should remain audible though.
+    assert!(no_ssg_env > 0.3, "no_ssg_env={no_ssg_env}");
     assert!(
         no_ssg_tail_peak > 128,
         "expected audible tail without SSG-EG hold, got peak={no_ssg_tail_peak}"

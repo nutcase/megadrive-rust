@@ -13,7 +13,7 @@ use egui_ui::gl_game::GlGameRenderer;
 use megadrive_core::{Button, Cartridge, ControllerType, Emulator, FRAME_HEIGHT, FRAME_WIDTH};
 use sdl2::audio::AudioSpecDesired;
 use sdl2::event::Event;
-use sdl2::keyboard::{Keycode, Mod};
+use sdl2::keyboard::{Keycode, Mod, Scancode};
 
 const SCALE: u32 = 3;
 const PANEL_WIDTH_DEFAULT: f32 = 420.0;
@@ -56,7 +56,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("Controller 1 : {}", controller_type_label(pad1_type));
     println!("Controller 2 : {}", controller_type_label(pad2_type));
     println!("Cheat panel  : Tab");
-    println!("State hotkey : Ctrl+0..9 save / 0..9 load");
+    println!("State hotkey : Ctrl/Cmd+0..9 save(file+session) / 0..9 load(file+session)");
     if boot_frames > 0 {
         fast_forward_boot_frames(&mut emulator, boot_frames);
         println!("Boot skip    : {} frames", boot_frames);
@@ -277,6 +277,9 @@ fn run_window_loop(
 
     let mut game_renderer = GlGameRenderer::new();
     let cheat_path = cheat_file_path(rom_path);
+    let state_dir = state_dir_path();
+    println!("Cheat file    : {}", cheat_path.display());
+    println!("State dir     : {}", state_dir.display());
     let mut cheat_ui = CheatToolUi::new();
     let mut prev_panel_visible = false;
     let mut state_slots: [Option<Emulator>; 10] = std::array::from_fn(|_| None);
@@ -326,15 +329,29 @@ fn run_window_loop(
                     cheat_ui.panel_visible = !cheat_ui.panel_visible;
                 }
                 Event::KeyDown {
-                    keycode: Some(key),
+                    keycode,
+                    scancode,
                     keymod,
                     repeat: false,
                     ..
                 } => {
-                    if let Some(slot) = state_slot_from_keycode(key) {
-                        if keymod_has_ctrl(keymod) {
+                    if let Some(slot) = state_slot_from_input(keycode, scancode) {
+                        let state_path = state_slot_path(rom_path, slot);
+                        if keymod_has_state_save_modifier(keymod) {
                             state_slots[slot] = Some(emulator.clone());
-                            println!("Saved state slot {}", slot);
+                            match emulator.save_state_to_file(&state_path) {
+                                Ok(()) => println!(
+                                    "Saved state slot {} -> {}",
+                                    slot,
+                                    state_path.display()
+                                ),
+                                Err(err) => eprintln!(
+                                    "failed to save state slot {} to {}: {}",
+                                    slot,
+                                    state_path.display(),
+                                    err
+                                ),
+                            }
                             continue;
                         }
                         if !egui_wants_keyboard {
@@ -342,27 +359,59 @@ fn run_window_loop(
                                 *emulator = saved.clone();
                                 emulator.set_audio_output_sample_rate_hz(output_sample_rate_hz);
                                 audio_queue.clear();
-                                println!("Loaded state slot {}", slot);
+                                println!("Loaded state slot {} (session)", slot);
                             } else {
-                                println!("State slot {} is empty", slot);
+                                if state_path.exists() {
+                                    match emulator.load_state_from_file(&state_path) {
+                                        Ok(()) => {
+                                            state_slots[slot] = Some(emulator.clone());
+                                            emulator.set_audio_output_sample_rate_hz(
+                                                output_sample_rate_hz,
+                                            );
+                                            audio_queue.clear();
+                                            println!(
+                                                "Loaded state slot {} <- {}",
+                                                slot,
+                                                state_path.display()
+                                            );
+                                        }
+                                        Err(err) => eprintln!(
+                                            "failed to load state slot {} from {}: {}",
+                                            slot,
+                                            state_path.display(),
+                                            err
+                                        ),
+                                    }
+                                } else {
+                                    println!("State slot {} is empty", slot);
+                                }
                             }
                             continue;
+                        } else {
+                            println!(
+                                "State load hotkey blocked while UI text input is focused (slot {})",
+                                slot
+                            );
                         }
                     }
                     if !egui_wants_keyboard {
-                        if let Some((player, button)) = map_keycode_to_player_button(key) {
-                            set_button_state(emulator, player, button, true);
+                        if let Some(key) = keycode {
+                            if let Some((player, button)) = map_keycode_to_player_button(key) {
+                                set_button_state(emulator, player, button, true);
+                            }
                         }
                     }
                 }
                 Event::KeyUp {
-                    keycode: Some(key),
+                    keycode,
                     repeat: false,
                     ..
                 } => {
                     if !egui_wants_keyboard {
-                        if let Some((player, button)) = map_keycode_to_player_button(key) {
-                            set_button_state(emulator, player, button, false);
+                        if let Some(key) = keycode {
+                            if let Some((player, button)) = map_keycode_to_player_button(key) {
+                                set_button_state(emulator, player, button, false);
+                            }
                         }
                     }
                 }
@@ -559,6 +608,12 @@ fn map_keycode_to_player_button(key: Keycode) -> Option<(u8, Button)> {
     }
 }
 
+fn state_slot_from_input(keycode: Option<Keycode>, scancode: Option<Scancode>) -> Option<usize> {
+    keycode
+        .and_then(state_slot_from_keycode)
+        .or_else(|| scancode.and_then(state_slot_from_scancode))
+}
+
 fn state_slot_from_keycode(key: Keycode) -> Option<usize> {
     match key {
         Keycode::Num0 | Keycode::Kp0 => Some(0),
@@ -575,17 +630,68 @@ fn state_slot_from_keycode(key: Keycode) -> Option<usize> {
     }
 }
 
-fn keymod_has_ctrl(keymod: Mod) -> bool {
-    keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD)
+fn state_slot_from_scancode(key: Scancode) -> Option<usize> {
+    match key {
+        Scancode::Num0 | Scancode::Kp0 => Some(0),
+        Scancode::Num1 | Scancode::Kp1 => Some(1),
+        Scancode::Num2 | Scancode::Kp2 => Some(2),
+        Scancode::Num3 | Scancode::Kp3 => Some(3),
+        Scancode::Num4 | Scancode::Kp4 => Some(4),
+        Scancode::Num5 | Scancode::Kp5 => Some(5),
+        Scancode::Num6 | Scancode::Kp6 => Some(6),
+        Scancode::Num7 | Scancode::Kp7 => Some(7),
+        Scancode::Num8 | Scancode::Kp8 => Some(8),
+        Scancode::Num9 | Scancode::Kp9 => Some(9),
+        _ => None,
+    }
+}
+
+fn keymod_has_state_save_modifier(keymod: Mod) -> bool {
+    keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD | Mod::LGUIMOD | Mod::RGUIMOD)
+}
+
+fn state_slot_path(rom_path: &str, slot: usize) -> PathBuf {
+    let stem = rom_stem(rom_path);
+    state_dir_path().join(format!("{stem}.slot{slot}.mdst"))
+}
+
+fn state_dir_path() -> PathBuf {
+    std::env::var_os("MEGADRIVE_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_state_dir)
+}
+
+fn default_state_dir() -> PathBuf {
+    let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workspace_root = candidate.canonicalize().unwrap_or(candidate);
+    workspace_root.join("states")
 }
 
 fn cheat_file_path(rom_path: &str) -> PathBuf {
-    let stem = Path::new(rom_path)
+    let stem = rom_stem(rom_path);
+
+    let cheat_dir = std::env::var_os("MEGADRIVE_CHEAT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_cheat_dir);
+
+    cheat_dir.join(format!("{stem}.json"))
+}
+
+fn rom_stem(rom_path: &str) -> String {
+    Path::new(rom_path)
         .file_stem()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
-        .unwrap_or("game");
-    PathBuf::from("cheats").join(format!("{stem}.json"))
+        .unwrap_or("game")
+        .to_string()
+}
+
+fn default_cheat_dir() -> PathBuf {
+    // Use workspace-root `cheats/` by default so save/load location is stable
+    // regardless of the process current working directory.
+    let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workspace_root = candidate.canonicalize().unwrap_or(candidate);
+    workspace_root.join("cheats")
 }
 
 fn filter_event_for_ascii_text_input(event: &Event) -> Option<Event> {
@@ -608,5 +714,33 @@ fn filter_event_for_ascii_text_input(event: &Event) -> Option<Event> {
             }
         }
         _ => Some(event.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{keymod_has_state_save_modifier, state_slot_from_input, state_slot_path};
+    use sdl2::keyboard::{Keycode, Mod, Scancode};
+
+    #[test]
+    fn state_slot_detects_keycode_and_scancode() {
+        assert_eq!(state_slot_from_input(Some(Keycode::Num3), None), Some(3));
+        assert_eq!(state_slot_from_input(None, Some(Scancode::Num7)), Some(7));
+        assert_eq!(state_slot_from_input(Some(Keycode::Kp9), None), Some(9));
+    }
+
+    #[test]
+    fn state_save_modifier_accepts_ctrl_and_cmd() {
+        assert!(keymod_has_state_save_modifier(Mod::LCTRLMOD));
+        assert!(keymod_has_state_save_modifier(Mod::RGUIMOD));
+        assert!(!keymod_has_state_save_modifier(Mod::NOMOD));
+    }
+
+    #[test]
+    fn state_slot_path_uses_slot_suffix() {
+        let path = state_slot_path("roms/Sonic The Hedgehog 3.md", 4);
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        assert!(name.ends_with(".slot4.mdst"));
+        assert!(name.starts_with("Sonic The Hedgehog 3"));
     }
 }

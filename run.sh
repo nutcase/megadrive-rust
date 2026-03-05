@@ -33,4 +33,8 @@ fi
 : "${MEGADRIVE_BOOT_FRAMES:=0}"
 export MEGADRIVE_BOOT_FRAMES
 
+# Keep cheat save/load path stable regardless of current working directory.
+: "${MEGADRIVE_CHEAT_DIR:=$SCRIPT_DIR/cheats}"
+export MEGADRIVE_CHEAT_DIR
+
 exec cargo run --release --manifest-path "$SCRIPT_DIR/Cargo.toml" -p megadrive-cli --bin "$BIN_NAME" -- "$ROM_PATH" "$@"

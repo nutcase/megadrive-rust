@@ -1,7 +1,7 @@
 const TH_BIT: u8 = 0x40;
 const SIX_BUTTON_TIMEOUT_CPU_CYCLES: u32 = 12_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub enum Button {
     Up,
     Down,
@@ -17,13 +17,13 @@ pub enum Button {
     Mode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub enum ControllerType {
     ThreeButton,
     SixButton,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, bincode::Encode, bincode::Decode)]
 struct PadState {
     up: bool,
     down: bool,
@@ -58,7 +58,7 @@ impl PadState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bincode::Encode, bincode::Decode)]
 struct PadProtocolState {
     controller_type: ControllerType,
     th_high: bool,
@@ -116,7 +116,7 @@ impl PadProtocolState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct IoBus {
     version: u8,
     pad1: PadState,

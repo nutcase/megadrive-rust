@@ -219,11 +219,15 @@ impl CheatSearchUi {
                 if ui.button("Save").clicked() {
                     if let Err(err) = self.manager.save_to_file(path) {
                         eprintln!("failed to save cheats to {}: {err}", path.display());
+                    } else {
+                        eprintln!("saved cheats to {}", path.display());
                     }
                 }
                 if path.exists() && ui.button("Load").clicked() {
                     if let Err(err) = self.manager.load_from_file(path) {
                         eprintln!("failed to load cheats from {}: {err}", path.display());
+                    } else {
+                        eprintln!("loaded cheats from {}", path.display());
                     }
                 }
             }

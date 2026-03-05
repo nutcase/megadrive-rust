@@ -20,17 +20,20 @@ const Z80_BUSREQ_ADDR: u32 = 0xA11100;
 const Z80_RESET_ADDR: u32 = 0xA11200;
 const TMSS_ADDR_START: u32 = 0xA14000;
 const TMSS_ADDR_END: u32 = 0xA14003;
-const PSG_ADDR: u32 = 0xC00011;
+const SRAM_CTRL_ADDR_EVEN: u32 = 0xA130F0;
+const SRAM_CTRL_ADDR_ODD: u32 = 0xA130F1;
+const VDP_MIRROR_START: u32 = 0xC00000;
+const VDP_MIRROR_END: u32 = 0xDFFFFF;
 const DMA_BUS_WAIT_CYCLES_PER_WORD: u32 = 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 enum VdpPort {
     Data,
     Control,
     HvCounter,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub enum DmaTraceTarget {
     Vram,
     Cram,
@@ -47,7 +50,7 @@ impl From<DmaTarget> for DmaTraceTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub struct DmaTraceEntry {
     pub target: DmaTraceTarget,
     pub source_addr: u32,
@@ -58,7 +61,7 @@ pub struct DmaTraceEntry {
     pub last_word: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 struct ActiveBusDma {
     target: DmaTarget,
     source_addr: u32,
@@ -88,7 +91,7 @@ impl ActiveBusDma {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct MemoryMap {
     cartridge: Cartridge,
     work_ram: [u8; 0x10000],
@@ -103,6 +106,8 @@ pub struct MemoryMap {
     tmss: [u8; 4],
     z80: Z80,
     audio: AudioBus,
+    save_ram_enabled: bool,
+    save_ram_write_protect: bool,
     dma_trace: VecDeque<DmaTraceEntry>,
     pending_bus_dma: VecDeque<BusDmaRequest>,
     active_bus_dma: Option<ActiveBusDma>,
@@ -120,17 +125,10 @@ impl MemoryMap {
         let region = cartridge.header().region.as_str();
         let io_version = io_version_from_region(region);
         let video_standard = video_standard_from_region(region);
-        let mut vdp = Vdp::with_video_standard(video_standard);
-        if sonic3_compat_quirks_enabled(&cartridge) {
-            vdp.set_quirk_plane_a_64x32_paged(true);
-        }
-        if comix_zone_compat_quirks_enabled(&cartridge) {
-            vdp.set_quirk_vscroll_swap_ab(true);
-        }
-        Self {
+        let mut memory = Self {
             cartridge,
             work_ram: [0; 0x10000],
-            vdp,
+            vdp: Vdp::with_video_standard(video_standard),
             vdp_data_write_latch: 0,
             vdp_control_write_latch: 0,
             vdp_data_byte_writes: 0,
@@ -141,12 +139,16 @@ impl MemoryMap {
             tmss: [0; 4],
             z80: Z80::new(),
             audio: AudioBus::new(),
+            save_ram_enabled: true,
+            save_ram_write_protect: false,
             dma_trace: VecDeque::with_capacity(128),
             pending_bus_dma: VecDeque::with_capacity(8),
             active_bus_dma: None,
             active_bus_dma_cycle_carry: 0,
             dma_wait_cycles: 0,
-        }
+        };
+        memory.apply_cartridge_compat_quirks();
+        memory
     }
 
     pub fn cartridge(&self) -> &Cartridge {
@@ -222,16 +224,24 @@ impl MemoryMap {
     }
 
     pub fn step_subsystems(&mut self, cpu_cycles: u32) {
-        self.z80.step(
-            cpu_cycles,
-            &mut self.audio,
-            &self.cartridge,
-            &mut self.work_ram,
-            &mut self.vdp,
-            &mut self.io,
-        );
-        self.io.step(cpu_cycles);
-        self.audio.step(cpu_cycles);
+        // Interleave subsystem progress in smaller time slices so Z80 audio
+        // writes (especially YM2612 DAC streams) are reflected with better
+        // temporal fidelity during long 68k instructions.
+        let mut remaining = cpu_cycles;
+        while remaining > 0 {
+            let slice = remaining.min(4);
+            self.z80.step(
+                slice,
+                &mut self.audio,
+                &self.cartridge,
+                &mut self.work_ram,
+                &mut self.vdp,
+                &mut self.io,
+            );
+            self.io.step(slice);
+            self.audio.step(slice);
+            remaining -= slice;
+        }
     }
 
     pub fn step_vdp(&mut self, cpu_cycles: u32) -> bool {
@@ -314,6 +324,11 @@ impl MemoryMap {
 
     pub fn frame_count(&self) -> u64 {
         self.vdp.frame_count()
+    }
+
+    pub fn refresh_runtime_after_state_load(&mut self) {
+        self.apply_cartridge_compat_quirks();
+        self.vdp.refresh_runtime_debug_config_from_env();
     }
 
     pub fn work_ram(&self) -> &[u8] {
@@ -461,7 +476,19 @@ impl MemoryMap {
 
     fn read_u8_mapped(&mut self, addr: u32) -> u8 {
         match addr {
-            0x000000..=0x3FFFFF => self.cartridge.read_u8(addr),
+            SRAM_CTRL_ADDR_EVEN => 0x00,
+            SRAM_CTRL_ADDR_ODD => {
+                (self.save_ram_enabled as u8) | ((self.save_ram_write_protect as u8) << 1)
+            }
+            0x000000..=0x3FFFFF => {
+                if self.save_ram_enabled
+                    && let Some(value) = self.cartridge.read_save_ram_u8(addr)
+                {
+                    value
+                } else {
+                    self.cartridge.read_u8(addr)
+                }
+            }
             WORK_RAM_START..=WORK_RAM_END => self.work_ram[(addr - WORK_RAM_START) as usize],
             IO_VERSION_ADDR => self.io.read_version(),
             x if x == IO_VERSION_ADDR + 1 => self.io.read_version(),
@@ -496,6 +523,19 @@ impl MemoryMap {
 
     fn write_u8_mapped(&mut self, addr: u32, value: u8) {
         match addr {
+            SRAM_CTRL_ADDR_EVEN => {}
+            SRAM_CTRL_ADDR_ODD => {
+                self.save_ram_enabled = (value & 0x01) != 0;
+                self.save_ram_write_protect = (value & 0x02) != 0;
+            }
+            0x000000..=0x3FFFFF => {
+                if self.save_ram_enabled
+                    && !self.save_ram_write_protect
+                    && self.cartridge.write_save_ram_u8(addr, value)
+                {
+                    return;
+                }
+            }
             WORK_RAM_START..=WORK_RAM_END => {
                 self.work_ram[(addr - WORK_RAM_START) as usize] = value;
             }
@@ -524,7 +564,7 @@ impl MemoryMap {
                     self.z80.write_ram_u8((addr - Z80_RAM_START) as u16, value);
                 }
             }
-            PSG_ADDR => self.audio.write_psg(value),
+            x if is_psg_write_addr(x) => self.audio.write_psg(value),
             _ => {}
         }
     }
@@ -542,6 +582,13 @@ impl MemoryMap {
                 target: request.target,
             });
         }
+    }
+
+    fn apply_cartridge_compat_quirks(&mut self) {
+        let sonic3 = sonic3_compat_quirks_enabled(&self.cartridge);
+        let comix = comix_zone_compat_quirks_enabled(&self.cartridge);
+        self.vdp.set_quirk_plane_a_64x32_paged(sonic3);
+        self.vdp.set_quirk_vscroll_swap_ab(comix);
     }
 }
 
@@ -621,13 +668,29 @@ fn video_standard_from_region(region: &str) -> VideoStandard {
 }
 
 fn decode_vdp_port(addr: u32) -> Option<VdpPort> {
-    let aligned = addr & !1;
+    let local = decode_vdp_local_addr(addr)?;
+    let aligned = local & !1;
     match aligned {
         0xC00000 | 0xC00002 => Some(VdpPort::Data),
         0xC00004 | 0xC00006 => Some(VdpPort::Control),
         0xC00008 | 0xC0000A => Some(VdpPort::HvCounter),
         _ => None,
     }
+}
+
+fn decode_vdp_local_addr(addr: u32) -> Option<u32> {
+    if (VDP_MIRROR_START..=VDP_MIRROR_END).contains(&addr) {
+        Some(0xC00000 | (addr & 0x1F))
+    } else {
+        None
+    }
+}
+
+fn is_psg_write_addr(addr: u32) -> bool {
+    let Some(local) = decode_vdp_local_addr(addr) else {
+        return false;
+    };
+    matches!(local, 0xC00011 | 0xC00013 | 0xC00015 | 0xC00017)
 }
 
 #[cfg(test)]
@@ -881,6 +944,36 @@ mod tests {
     }
 
     #[test]
+    fn routes_psg_mirror_addresses() {
+        let cart = Cartridge::from_bytes(vec![0; 0x200]).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        memory.write_u8(0xC00013, 0x91);
+        assert_eq!(memory.audio().psg().last_data(), 0x91);
+        memory.write_u8(0xD00011, 0x92);
+        assert_eq!(memory.audio().psg().last_data(), 0x92);
+        memory.write_u8(0xD00017, 0x93);
+        assert_eq!(memory.audio().psg().last_data(), 0x93);
+    }
+
+    #[test]
+    fn routes_vdp_port_mirror_addresses() {
+        let cart = Cartridge::from_bytes(vec![0; 0x200]).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        // Register #15 (auto-increment) via mirrored control port.
+        memory.write_u16(0xD00004, 0x8F02);
+        assert_eq!(memory.vdp().register(15), 0x02);
+
+        // Data port write via mirrored data address.
+        memory.write_u16(0xD00004, 0x4000);
+        memory.write_u16(0xD00004, 0x0000);
+        memory.write_u16(0xD00000, 0xABCD);
+        assert_eq!(memory.vdp().read_vram_u8(0), 0xAB);
+        assert_eq!(memory.vdp().read_vram_u8(1), 0xCD);
+    }
+
+    #[test]
     fn routes_tmss_register_reads_and_writes() {
         let cart = Cartridge::from_bytes(vec![0; 0x200]).expect("valid cart");
         let mut memory = MemoryMap::new(cart);
@@ -892,6 +985,38 @@ mod tests {
 
         memory.write_u16(0xA14000, 0x4D44); // "MD"
         assert_eq!(memory.read_u16(0xA14000), 0x4D44);
+    }
+
+    #[test]
+    fn maps_cartridge_save_ram_and_control_register() {
+        let mut rom = vec![0u8; 0x400];
+        rom[0x201] = 0x7A; // ROM value used when save RAM is disabled.
+        rom[0x1B0..0x1B2].copy_from_slice(b"RA");
+        rom[0x1B4..0x1B8].copy_from_slice(&0x0000_0201u32.to_be_bytes());
+        rom[0x1B8..0x1BC].copy_from_slice(&0x0000_020Fu32.to_be_bytes());
+        let cart = Cartridge::from_bytes(rom).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        // Save RAM is enabled by default and starts erased.
+        assert_eq!(memory.read_u8(0x000201), 0xFF);
+        memory.write_u8(0x000201, 0x12);
+        assert_eq!(memory.read_u8(0x000201), 0x12);
+        // Odd-lane SRAM returns open bus on even addresses in-range.
+        assert_eq!(memory.read_u8(0x000202), 0xFF);
+
+        // Disabling save RAM falls back to ROM reads.
+        memory.write_u16(0xA130F0, 0x0000);
+        assert_eq!(memory.read_u8(0x000201), 0x7A);
+
+        // Re-enable save RAM and verify persisted value remains.
+        memory.write_u16(0xA130F0, 0x0001);
+        assert_eq!(memory.read_u8(0x000201), 0x12);
+
+        // Write-protect blocks writes.
+        memory.write_u16(0xA130F0, 0x0003);
+        assert_eq!(memory.read_u16(0xA130F0), 0x0003);
+        memory.write_u8(0x000201, 0x34);
+        assert_eq!(memory.read_u8(0x000201), 0x12);
     }
 
     #[test]

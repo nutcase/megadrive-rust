@@ -12,7 +12,7 @@ const SR_SUPERVISOR: u16 = 0x2000;
 const SR_VALID_MASK_68000: u16 =
     SR_TRACE | SR_SUPERVISOR | SR_INT_MASK | CCR_X | CCR_N | CCR_Z | CCR_V | CCR_C;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct M68k {
     d_regs: [u32; 8],
     a_regs: [u32; 8],

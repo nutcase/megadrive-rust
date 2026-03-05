@@ -58,7 +58,8 @@ Notes:
   - Toggle cheat panel (egui frontend): `Tab`
 
 ## Cheat UI
-- Cheat files are saved to `cheats/<ROM_NAME>.json`.
+- Cheat files are saved to `<workspace>/cheats/<ROM_NAME>.json` by default.
+- You can override the directory with `MEGADRIVE_CHEAT_DIR=/path/to/cheats`.
 - You can edit WRAM directly from the Hex Viewer.
 - Cheat Search narrows candidates via snapshots and can add candidates directly as active cheats.
 
@@ -90,6 +91,19 @@ cargo test -q -p megadrive-core
 cargo test -q -p megadrive-cli
 cargo check -q
 ```
+
+## Accuracy Regression Guard
+Use the profile snapshot checker before and after VDP/APU work to reduce regressions:
+
+```bash
+# Verify current output against checked-in baselines
+./verify_accuracy.sh
+
+# Re-generate baselines intentionally after validated improvements
+./verify_accuracy.sh --update
+```
+
+Current baselines are stored in `tests/opcode_profile/*.snapshot`.
 
 ## Known Limitations
 - Instruction/timing/bus arbitration coverage is still in progress, so game-specific rendering or audio differences may remain.

@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::error::Error;
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
 
 use megadrive_core::ControllerType;
+use megadrive_core::Emulator;
 use megadrive_core::cartridge::Cartridge;
 use megadrive_core::cpu::M68k;
 use megadrive_core::input::Button;
@@ -20,8 +24,15 @@ struct InputEvent {
 struct CliArgs {
     rom_path: String,
     steps: usize,
+    state_path: Option<String>,
     snapshot_path: Option<String>,
     verify_snapshot_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct YmTraceReg {
+    bank: usize,
+    reg: u8,
 }
 
 fn main() {
@@ -35,6 +46,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let cli = parse_cli_args(env::args().skip(1))?;
     let rom_path = cli.rom_path;
     let steps = cli.steps;
+    let state_path = cli.state_path;
     let snapshot_path = cli.snapshot_path;
     let verify_snapshot_path = cli.verify_snapshot_path;
     let stop_on_unknown = env::var("STOP_ON_UNKNOWN").is_ok();
@@ -50,11 +62,27 @@ fn run() -> Result<(), Box<dyn Error>> {
         .map(|value| parse_addr_list(&value))
         .unwrap_or_default();
     let watch_trace = env::var("WATCH_TRACE").is_ok();
+    let trace_input = env::var("TRACE_INPUT").is_ok();
     let trace_vdp_r1 = env::var("TRACE_VDP_R1").is_ok();
+    let trace_psg = env::var("TRACE_PSG").is_ok();
+    let trace_ym_regs = env::var("TRACE_YM_REGS")
+        .ok()
+        .map(|value| parse_ym_trace_regs(&value))
+        .unwrap_or_default();
+    let trace_ym_frame_range = env::var("TRACE_YM_FRAME_RANGE")
+        .ok()
+        .and_then(|value| parse_frame_range(&value));
+    let trace_ym_limit = env::var("TRACE_YM_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1024);
     let hold_start = env::var("HOLD_START").is_ok();
     let hold_a = env::var("HOLD_A").is_ok();
+    let trace_dac = env::var("TRACE_DAC").is_ok();
     let force_b094 = env::var("FORCE_B094").is_ok();
     let force_b094_sticky = env::var("FORCE_B094_STICKY").is_ok();
+    let force_psg_mute = env::var("FORCE_PSG_MUTE").is_ok();
+    let force_ym_dac_off = env::var("FORCE_YM_DAC_OFF").is_ok();
     let dump_line_state = env::var("DUMP_LINE_STATE").is_ok();
     let dump_plane_state = env::var("DUMP_PLANE_STATE").is_ok();
     let dump_sprite_state = env::var("DUMP_SPRITE_STATE").is_ok();
@@ -72,6 +100,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         .map(|value| parse_frame_list(&value))
         .unwrap_or_default();
     let dump_frame_prefix = env::var("DUMP_FRAME_PREFIX").ok();
+    let dump_audio_wav = env::var("DUMP_AUDIO_WAV").ok();
     let mut dumped_frames = BTreeSet::new();
     let mut input_events = env::var("INPUT_SCRIPT")
         .ok()
@@ -82,7 +111,19 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let rom = std::fs::read(&rom_path)?;
     let cart = Cartridge::from_bytes(rom)?;
-    let mut memory = MemoryMap::new(cart);
+    let (mut cpu, mut memory) = if let Some(path) = state_path.as_deref() {
+        let mut emulator = Emulator::new(cart);
+        emulator
+            .load_state_from_file(Path::new(path))
+            .map_err(|e| format!("failed to load state from {path}: {e}"))?;
+        println!("Loaded state    : {}", Path::new(path).display());
+        emulator.into_parts()
+    } else {
+        let mut memory = MemoryMap::new(cart);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut memory);
+        (cpu, memory)
+    };
     if let Some(controller_type) = env::var("MEGADRIVE_PAD1")
         .ok()
         .and_then(|value| parse_controller_type(&value))
@@ -95,14 +136,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     {
         memory.set_controller_type(2, controller_type);
     }
-    let mut cpu = M68k::new();
     if hold_start {
         memory.set_button_pressed(Button::Start, true);
     }
     if hold_a {
         memory.set_button_pressed(Button::A, true);
     }
-    cpu.reset(&mut memory);
     if force_b094 {
         memory.write_u32(0xFFFF_B094, 0x0000_50B2);
     }
@@ -112,9 +151,36 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut watch_write_histogram: BTreeMap<u32, BTreeMap<u32, u64>> = BTreeMap::new();
     let mut trace: VecDeque<(usize, u32, u16, u32)> = VecDeque::new();
     let mut last_r1 = memory.vdp().register(1);
+    let mut last_dac = memory.audio().ym2612().register(0, 0x2A);
+    let mut dac_change_count: u64 = 0;
+    let mut dac_min = last_dac;
+    let mut dac_max = last_dac;
+    let mut dac_seen = [false; 256];
+    dac_seen[last_dac as usize] = true;
+    let mut psg_tone0_low_period_active_steps: u64 = 0;
+    let mut psg_tone1_low_period_active_steps: u64 = 0;
+    let mut psg_tone2_low_period_active_steps: u64 = 0;
+    let mut psg_noise_tone3_low_period_steps: u64 = 0;
     let mut r1_trace_lines = 0usize;
+    let mut dac_trace_lines = 0usize;
+    let mut psg_trace_lines = 0usize;
+    let mut ym_trace_lines = 0usize;
     let mut watch_trace_lines = 0usize;
     let mut steps_executed = 0usize;
+    let mut last_psg_state = [
+        memory.audio().psg().tone_period(0),
+        memory.audio().psg().tone_period(1),
+        memory.audio().psg().tone_period(2),
+        memory.audio().psg().attenuation(0) as u16,
+        memory.audio().psg().attenuation(1) as u16,
+        memory.audio().psg().attenuation(2) as u16,
+        memory.audio().psg().attenuation(3) as u16,
+        memory.audio().psg().noise_control() as u16,
+    ];
+    let mut last_ym_trace_values = trace_ym_regs
+        .iter()
+        .map(|entry| memory.audio().ym2612().register(entry.bank, entry.reg))
+        .collect::<Vec<u8>>();
 
     for step_idx in 0..steps {
         steps_executed = step_idx + 1;
@@ -127,12 +193,33 @@ fn run() -> Result<(), Box<dyn Error>> {
             } else {
                 memory.set_button_pressed(event.button, event.pressed);
             }
+            if trace_input {
+                println!(
+                    "input event     : frame={} player=P{} button={:?} pressed={}",
+                    memory.frame_count(),
+                    event.player,
+                    event.button,
+                    event.pressed
+                );
+            }
             next_input_event += 1;
         }
 
         let pc_before = cpu.pc();
         if force_b094_sticky {
             memory.write_u32(0xFFFF_B094, 0x0000_50B2);
+        }
+        if force_psg_mute {
+            // Mute PSG channels/noise regardless of game writes (debug aid).
+            memory.write_u8(0x00C00011, 0x9F);
+            memory.write_u8(0x00C00011, 0xBF);
+            memory.write_u8(0x00C00011, 0xDF);
+            memory.write_u8(0x00C00011, 0xFF);
+        }
+        if force_ym_dac_off {
+            // Keep YM DAC disabled to isolate FM/PSG path during debugging.
+            memory.write_u8(0x00A04000, 0x2B);
+            memory.write_u8(0x00A04001, 0x00);
         }
         let unknown_before = cpu.unknown_opcode_total();
         let opcode_before = read_opcode_at_pc(&memory, pc_before);
@@ -175,6 +262,97 @@ fn run() -> Result<(), Box<dyn Error>> {
                 break;
             }
         }
+        let dac_now = memory.audio().ym2612().register(0, 0x2A);
+        if dac_now != last_dac {
+            dac_change_count = dac_change_count.saturating_add(1);
+            dac_min = dac_min.min(dac_now);
+            dac_max = dac_max.max(dac_now);
+            if trace_dac && dac_trace_lines < 256 {
+                println!(
+                    "dac change      : step={} frame={} value={:02X}",
+                    step_idx + 1,
+                    memory.frame_count(),
+                    dac_now
+                );
+                dac_trace_lines += 1;
+            }
+            last_dac = dac_now;
+        }
+        dac_seen[dac_now as usize] = true;
+        if !trace_ym_regs.is_empty() && ym_trace_lines < trace_ym_limit {
+            let frame = memory.frame_count();
+            let ym_in_trace_range = trace_ym_frame_range
+                .map(|(start, end)| frame >= start && frame <= end)
+                .unwrap_or(true);
+            for (idx, entry) in trace_ym_regs.iter().enumerate() {
+                let now = memory.audio().ym2612().register(entry.bank, entry.reg);
+                let prev = last_ym_trace_values[idx];
+                if now != prev {
+                    if ym_in_trace_range && ym_trace_lines < trace_ym_limit {
+                        println!(
+                            "ym reg change   : step={} frame={} bank={} reg={:02X} {:02X}->{:02X}",
+                            step_idx + 1,
+                            frame,
+                            entry.bank,
+                            entry.reg,
+                            prev,
+                            now
+                        );
+                        ym_trace_lines += 1;
+                    }
+                    last_ym_trace_values[idx] = now;
+                }
+                if ym_trace_lines >= trace_ym_limit {
+                    break;
+                }
+            }
+        }
+        let psg = memory.audio().psg();
+        let p0 = psg.tone_period(0) & 0x03FF;
+        let p1 = psg.tone_period(1) & 0x03FF;
+        let p2 = psg.tone_period(2) & 0x03FF;
+        if trace_psg && psg_trace_lines < 512 {
+            let current_state = [
+                psg.tone_period(0),
+                psg.tone_period(1),
+                psg.tone_period(2),
+                psg.attenuation(0) as u16,
+                psg.attenuation(1) as u16,
+                psg.attenuation(2) as u16,
+                psg.attenuation(3) as u16,
+                psg.noise_control() as u16,
+            ];
+            if current_state != last_psg_state {
+                println!(
+                    "psg change      : step={} frame={} p0={:03X} p1={:03X} p2={:03X} a0={:X} a1={:X} a2={:X} an={:X} nc={:X} last={:02X}",
+                    step_idx + 1,
+                    memory.frame_count(),
+                    current_state[0],
+                    current_state[1],
+                    current_state[2],
+                    current_state[3],
+                    current_state[4],
+                    current_state[5],
+                    current_state[6],
+                    current_state[7],
+                    psg.last_data(),
+                );
+                psg_trace_lines += 1;
+                last_psg_state = current_state;
+            }
+        }
+        if p0 <= 1 && psg.attenuation(0) < 0x0F {
+            psg_tone0_low_period_active_steps = psg_tone0_low_period_active_steps.saturating_add(1);
+        }
+        if p1 <= 1 && psg.attenuation(1) < 0x0F {
+            psg_tone1_low_period_active_steps = psg_tone1_low_period_active_steps.saturating_add(1);
+        }
+        if p2 <= 1 && psg.attenuation(2) < 0x0F {
+            psg_tone2_low_period_active_steps = psg_tone2_low_period_active_steps.saturating_add(1);
+        }
+        if (psg.noise_control() & 0x03) == 0x03 && p2 <= 1 && psg.attenuation(3) < 0x0F {
+            psg_noise_tone3_low_period_steps = psg_noise_tone3_low_period_steps.saturating_add(1);
+        }
         if !watch_addrs.is_empty() {
             for (idx, &addr) in watch_addrs.iter().enumerate() {
                 let after = memory.read_u8(addr);
@@ -200,9 +378,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         if trace_vdp_r1 {
             let r1 = memory.vdp().register(1);
             if r1 != last_r1 && r1_trace_lines < 128 {
+                let [v, h] = memory.vdp().read_hv_counter().to_be_bytes();
                 println!(
-                    "r1 change step {}: pc=0x{:08X} {:02X}->{:02X}",
+                    "r1 change step {}: frame={} v={:02X} h={:02X} pc=0x{:08X} {:02X}->{:02X}",
                     step_idx + 1,
+                    memory.frame_count(),
+                    v,
+                    h,
                     cpu.pc(),
                     last_r1,
                     r1
@@ -294,9 +476,29 @@ fn run() -> Result<(), Box<dyn Error>> {
         memory.audio().psg_writes_from_z80()
     );
     println!(
+        "psg regs        : p0={:03X} p1={:03X} p2={:03X} a0={:X} a1={:X} a2={:X} an={:X} nc={:X} last={:02X}",
+        memory.audio().psg().tone_period(0),
+        memory.audio().psg().tone_period(1),
+        memory.audio().psg().tone_period(2),
+        memory.audio().psg().attenuation(0),
+        memory.audio().psg().attenuation(1),
+        memory.audio().psg().attenuation(2),
+        memory.audio().psg().attenuation(3),
+        memory.audio().psg().noise_control(),
+        memory.audio().psg().last_data(),
+    );
+    println!(
+        "psg low-period  : ch0={} ch1={} ch2={} noise(tone3)={}",
+        psg_tone0_low_period_active_steps,
+        psg_tone1_low_period_active_steps,
+        psg_tone2_low_period_active_steps,
+        psg_noise_tone3_low_period_steps
+    );
+    println!(
         "ym active ch    : {}",
         memory.audio().ym2612().active_channels()
     );
+    print_ym_channel_snapshot(&memory);
     println!(
         "ym regs         : 24={:02X} 25={:02X} 26={:02X} 27={:02X} 2A={:02X} 2B={:02X}",
         memory.audio().ym2612().register(0, 0x24),
@@ -306,16 +508,46 @@ fn run() -> Result<(), Box<dyn Error>> {
         memory.audio().ym2612().register(0, 0x2A),
         memory.audio().ym2612().register(0, 0x2B)
     );
+    println!(
+        "ym dac stats    : changes={} unique={} min={:02X} max={:02X}",
+        dac_change_count,
+        dac_seen.iter().filter(|seen| **seen).count(),
+        dac_min,
+        dac_max
+    );
     let audio_channels = memory.audio().output_channels().max(1) as usize;
+    let audio_sample_rate_hz = memory.audio().output_sample_rate_hz();
     let pending_audio = memory.pending_audio_samples();
     let pending_audio_frames = pending_audio / audio_channels;
     let probe_frames = 4096usize;
     let probe_samples = probe_frames * audio_channels;
-    let stale_audio = pending_audio.saturating_sub(probe_samples);
-    if stale_audio > 0 {
-        let _ = memory.drain_audio_samples(stale_audio);
-    }
-    let audio_probe = memory.drain_audio_samples(probe_samples);
+    let audio_probe = if let Some(path) = dump_audio_wav.as_deref() {
+        let audio_all = memory.drain_audio_samples(pending_audio);
+        write_wav_i16(
+            path,
+            audio_sample_rate_hz,
+            audio_channels as u16,
+            &audio_all,
+        )?;
+        println!(
+            "audio dump path : {} ({} frames @ {} Hz, {} ch)",
+            path,
+            audio_all.len() / audio_channels,
+            audio_sample_rate_hz,
+            audio_channels
+        );
+        if audio_all.len() <= probe_samples {
+            audio_all
+        } else {
+            audio_all[audio_all.len() - probe_samples..].to_vec()
+        }
+    } else {
+        let stale_audio = pending_audio.saturating_sub(probe_samples);
+        if stale_audio > 0 {
+            let _ = memory.drain_audio_samples(stale_audio);
+        }
+        memory.drain_audio_samples(probe_samples)
+    };
     let audio_nonzero = audio_probe.iter().filter(|&&sample| sample != 0).count();
     let audio_peak = audio_probe
         .iter()
@@ -515,6 +747,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Box<dyn Error>> {
     let mut rom_path: Option<String> = None;
     let mut steps: Option<usize> = None;
+    let mut state_path: Option<String> = None;
     let mut snapshot_path: Option<String> = None;
     let mut verify_snapshot_path: Option<String> = None;
     let mut iter = args.into_iter();
@@ -534,6 +767,12 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Box
                     .ok_or_else(|| "missing value for --snapshot".to_string())?;
                 snapshot_path = Some(value);
             }
+            "--state" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "missing value for --state".to_string())?;
+                state_path = Some(value);
+            }
             "--verify-snapshot" => {
                 let value = iter
                     .next()
@@ -542,7 +781,7 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Box
             }
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: cargo run -p megadrive-cli --bin opcode_profile -- <rom-path> [steps]\n       cargo run -p megadrive-cli --bin opcode_profile -- <rom-path> --steps <n> [--snapshot <path>] [--verify-snapshot <path>]"
+                    "usage: cargo run -p megadrive-cli --bin opcode_profile -- <rom-path> [steps]\n       cargo run -p megadrive-cli --bin opcode_profile -- <rom-path> --steps <n> [--state <path>] [--snapshot <path>] [--verify-snapshot <path>]"
                 );
                 std::process::exit(0);
             }
@@ -571,6 +810,7 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Box
     Ok(CliArgs {
         rom_path,
         steps: steps.unwrap_or(2_000_000),
+        state_path,
         snapshot_path,
         verify_snapshot_path,
     })
@@ -623,11 +863,42 @@ fn build_unknown_snapshot_text(
             .join(",")
     }
 
-    let mut lines = Vec::with_capacity(16);
-    lines.push("version=1".to_string());
-    lines.push(format!("rom={rom_path}"));
+    let mut lines = Vec::with_capacity(32);
+    let rom_label = Path::new(rom_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(rom_path);
+    lines.push("version=2".to_string());
+    lines.push(format!("rom={rom_label}"));
     lines.push(format!("steps={steps}"));
     lines.push(format!("steps_executed={steps_executed}"));
+    lines.push(format!("frames={}", memory.frame_count()));
+    lines.push(format!(
+        "frame_hash_final={:016X}",
+        framebuffer_hash(memory.frame_buffer())
+    ));
+    lines.push(format!(
+        "frame_colors={}",
+        framebuffer_unique_colors(memory.frame_buffer())
+    ));
+    lines.push(format!("ym_writes={}", memory.audio().ym_write_count()));
+    lines.push(format!(
+        "ym_dac_writes={}",
+        memory.audio().ym_dac_write_count()
+    ));
+    lines.push(format!("psg_writes={}", memory.audio().psg_write_count()));
+    lines.push(format!(
+        "ym_active_channels={}",
+        memory.audio().ym2612().active_channels()
+    ));
+    lines.push(format!("vdp_r0={:02X}", memory.vdp().register(0)));
+    lines.push(format!("vdp_r1={:02X}", memory.vdp().register(1)));
+    lines.push(format!("vdp_r11={:02X}", memory.vdp().register(11)));
+    lines.push(format!("vdp_r12={:02X}", memory.vdp().register(12)));
+    lines.push(format!("vdp_r13={:02X}", memory.vdp().register(13)));
+    lines.push(format!("vdp_r16={:02X}", memory.vdp().register(16)));
+    lines.push(format!("vdp_dma_fill_ops={}", memory.vdp().dma_fill_ops()));
+    lines.push(format!("vdp_dma_copy_ops={}", memory.vdp().dma_copy_ops()));
     lines.push(format!("m68k_unknown_total={}", cpu.unknown_opcode_total()));
     lines.push(format!(
         "m68k_unknown_hist={}",
@@ -1211,6 +1482,40 @@ fn print_dma_trace(memory: &MemoryMap, limit: usize) {
     }
 }
 
+fn print_ym_channel_snapshot(memory: &MemoryMap) {
+    let ym = memory.audio().ym2612();
+    println!("ym channels     : ch  freq_hz alg fb ams/fms key(op1..4)");
+    for ch in 0..6 {
+        let freq = ym.channel_frequency_hz_debug(ch);
+        let (alg, fb) = ym.channel_algorithm_feedback(ch);
+        let (ams, fms) = ym.channel_ams_fms(ch);
+        let key1 = if ym.channel_operator_key_on(ch, 0) {
+            '1'
+        } else {
+            '-'
+        };
+        let key2 = if ym.channel_operator_key_on(ch, 1) {
+            '1'
+        } else {
+            '-'
+        };
+        let key3 = if ym.channel_operator_key_on(ch, 2) {
+            '1'
+        } else {
+            '-'
+        };
+        let key4 = if ym.channel_operator_key_on(ch, 3) {
+            '1'
+        } else {
+            '-'
+        };
+        println!(
+            "                  {:>2} {:>8.2} {:>3} {:>2} {:>2}/{:>2} {}{}{}{}",
+            ch, freq, alg, fb, ams, fms, key1, key2, key3, key4
+        );
+    }
+}
+
 fn print_ram_snapshot(memory: &mut MemoryMap) {
     let f62a = memory.read_u8(0xFFFF_F62A);
     let f614 = memory.read_u8(0xFFFF_F614);
@@ -1268,6 +1573,66 @@ fn parse_frame_list(value: &str) -> BTreeSet<u64> {
         }
     }
     out
+}
+
+fn parse_frame_range(value: &str) -> Option<(u64, u64)> {
+    let token = value.trim();
+    if token.is_empty() {
+        return None;
+    }
+    if let Some((left, right)) = token.split_once('-') {
+        let start = left.trim().parse::<u64>().ok()?;
+        let end = right.trim().parse::<u64>().ok()?;
+        if start <= end {
+            Some((start, end))
+        } else {
+            Some((end, start))
+        }
+    } else {
+        let frame = token.parse::<u64>().ok()?;
+        Some((frame, frame))
+    }
+}
+
+fn parse_ym_trace_regs(value: &str) -> Vec<YmTraceReg> {
+    let mut entries = BTreeSet::new();
+    for token in value.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let (bank_part, reg_part) = if let Some((bank, reg)) = token.split_once(':') {
+            (Some(bank.trim()), reg.trim())
+        } else {
+            (None, token)
+        };
+        let bank = bank_part
+            .and_then(parse_u32_value)
+            .map(|value| (value as usize) & 1)
+            .unwrap_or(0);
+        let Some(reg_u8) = parse_reg_u8_value(reg_part) else {
+            continue;
+        };
+        entries.insert(YmTraceReg {
+            bank,
+            reg: reg_u8,
+        });
+    }
+    entries.into_iter().collect()
+}
+
+fn parse_reg_u8_value(value: &str) -> Option<u8> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+        return parse_u32_value(trimmed).map(|parsed| (parsed & 0xFF) as u8);
+    }
+    if let Ok(parsed_hex) = u8::from_str_radix(trimmed, 16) {
+        return Some(parsed_hex);
+    }
+    parse_u32_value(trimmed).map(|parsed| (parsed & 0xFF) as u8)
 }
 
 #[cfg(test)]
@@ -1358,6 +1723,23 @@ mod tests {
     fn parse_frame_list_ignores_invalid_tokens() {
         let frames = super::parse_frame_list("2,foo,9-bar,7");
         assert_eq!(frames.into_iter().collect::<Vec<u64>>(), vec![2, 7]);
+    }
+
+    #[test]
+    fn parse_frame_range_accepts_single_and_swapped_range() {
+        assert_eq!(super::parse_frame_range("42"), Some((42, 42)));
+        assert_eq!(super::parse_frame_range("100-120"), Some((100, 120)));
+        assert_eq!(super::parse_frame_range("120-100"), Some((100, 120)));
+    }
+
+    #[test]
+    fn parse_ym_trace_regs_accepts_bank_prefix_and_hex() {
+        let regs = super::parse_ym_trace_regs("28,0:2A,1:B6,1:0xB5");
+        let pairs = regs
+            .into_iter()
+            .map(|entry| (entry.bank, entry.reg))
+            .collect::<Vec<(usize, u8)>>();
+        assert_eq!(pairs, vec![(0, 0x28), (0, 0x2A), (1, 0xB5), (1, 0xB6)]);
     }
 }
 
@@ -1460,5 +1842,37 @@ fn dump_frame_ppm(path: &str, rgb: &[u8]) -> Result<(), Box<dyn Error>> {
         megadrive_core::FRAME_HEIGHT
     )?;
     file.write_all(rgb)?;
+    Ok(())
+}
+
+fn write_wav_i16(
+    path: &str,
+    sample_rate_hz: u32,
+    channels: u16,
+    samples: &[i16],
+) -> Result<(), Box<dyn Error>> {
+    let mut file = File::create(path)?;
+    let bytes_per_sample = std::mem::size_of::<i16>() as u16;
+    let block_align = channels.saturating_mul(bytes_per_sample);
+    let byte_rate = sample_rate_hz.saturating_mul(block_align as u32);
+    let data_len = (samples.len() * std::mem::size_of::<i16>()) as u32;
+    let riff_len = 36u32.saturating_add(data_len);
+
+    file.write_all(b"RIFF")?;
+    file.write_all(&riff_len.to_le_bytes())?;
+    file.write_all(b"WAVE")?;
+    file.write_all(b"fmt ")?;
+    file.write_all(&16u32.to_le_bytes())?; // PCM fmt chunk size
+    file.write_all(&1u16.to_le_bytes())?; // PCM format
+    file.write_all(&channels.to_le_bytes())?;
+    file.write_all(&sample_rate_hz.to_le_bytes())?;
+    file.write_all(&byte_rate.to_le_bytes())?;
+    file.write_all(&block_align.to_le_bytes())?;
+    file.write_all(&(bytes_per_sample * 8).to_le_bytes())?; // bits per sample
+    file.write_all(b"data")?;
+    file.write_all(&data_len.to_le_bytes())?;
+    for sample in samples {
+        file.write_all(&sample.to_le_bytes())?;
+    }
     Ok(())
 }

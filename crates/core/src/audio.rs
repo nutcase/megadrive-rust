@@ -1,6 +1,6 @@
 use std::f32::consts::TAU;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 enum YmEnvelopePhase {
     Off,
     Attack,
@@ -9,7 +9,7 @@ enum YmEnvelopePhase {
     Release,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bincode::Encode, bincode::Decode)]
 struct YmOperator {
     detune: u8,
     mul: u8,
@@ -58,7 +58,7 @@ impl Default for YmOperator {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bincode::Encode, bincode::Decode)]
 struct YmChannel {
     fnum: u16,
     block: u8,
@@ -95,7 +95,7 @@ impl Default for YmChannel {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct Ym2612 {
     addr_port0: u8,
     addr_port1: u8,
@@ -112,6 +112,8 @@ pub struct Ym2612 {
     timer_b_elapsed_ym_cycles: u64,
     dac_enabled: bool,
     dac_output: i16,
+    dac_enabled_pending: Option<bool>,
+    dac_output_pending: Option<i16>,
     lfo_enabled: bool,
     lfo_rate: u8,
     lfo_phase: f32,
@@ -136,6 +138,8 @@ impl Default for Ym2612 {
             timer_b_elapsed_ym_cycles: 0,
             dac_enabled: false,
             dac_output: 0,
+            dac_enabled_pending: None,
+            dac_output_pending: None,
             lfo_enabled: false,
             lfo_rate: 0,
             lfo_phase: 0.0,
@@ -144,7 +148,7 @@ impl Default for Ym2612 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 enum YmOperatorParam {
     Mul,
     Tl,
@@ -155,18 +159,42 @@ enum YmOperatorParam {
     SsgEg,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YmAlgorithmBus {
+    M2,
+    C1,
+    C2,
+    Mem,
+    Out,
+}
+
 impl Ym2612 {
-    // YM2612 BUSY stays asserted for 32 YM clocks after each port write.
-    const BUSY_DURATION_YM_CYCLES: u64 = 32;
+    // YM2612 BUSY stays asserted for roughly 32 master clocks after a write.
+    // Converting directly from master-clock cycles matches observed software
+    // pacing better than using OPN internal divider cycles.
+    const BUSY_DURATION_MASTER_CYCLES: u64 = 32;
     const MASTER_CLOCK_HZ: u64 = 7_670_454;
     const Z80_CLOCK_HZ: u64 = 3_579_545;
     const YM2612_DIVIDER: u64 = 7;
-    const BUSY_DURATION_Z80_CYCLES: u32 =
-        ((Self::BUSY_DURATION_YM_CYCLES * Self::Z80_CLOCK_HZ * Self::YM2612_DIVIDER
-            + (Self::MASTER_CLOCK_HZ - 1))
-            / Self::MASTER_CLOCK_HZ) as u32;
+    const BUSY_DURATION_Z80_CYCLES: u32 = ((Self::BUSY_DURATION_MASTER_CYCLES * Self::Z80_CLOCK_HZ
+        + (Self::MASTER_CLOCK_HZ - 1))
+        / Self::MASTER_CLOCK_HZ) as u32;
+    // YM2612 DAC raw 8-bit data maps to a signed range centered at 0x80.
+    // Keep output in a moderate range relative to FM mix to avoid clipping.
+    const DAC_OUTPUT_SHIFT: i16 = 6;
+    // DAC pending output stores a 1-bit ordering tag in bit0.
+    // Actual DAC output values are multiples of 64, so bit0 is unused.
+    const DAC_PENDING_ORDER_MASK: i16 = 0x0001;
 
     fn write_port(&mut self, port: u8, value: u8) {
+        self.write_port_internal(port, value, false);
+    }
+
+    fn write_port_from_z80(&mut self, port: u8, value: u8) {
+        self.write_port_internal(port, value, true);
+    }
+
+    fn write_port_internal(&mut self, port: u8, value: u8, from_z80: bool) {
         match port & 0x03 {
             0 => {
                 self.addr_port0 = value;
@@ -175,7 +203,7 @@ impl Ym2612 {
             1 => {
                 let reg = self.addr_port0;
                 self.regs[0][reg as usize] = value;
-                self.apply_write(0, reg, value);
+                self.apply_write(0, reg, value, from_z80);
                 self.writes += 1;
                 self.arm_busy();
             }
@@ -186,7 +214,7 @@ impl Ym2612 {
             3 => {
                 let reg = self.addr_port1;
                 self.regs[1][reg as usize] = value;
-                self.apply_write(1, reg, value);
+                self.apply_write(1, reg, value, from_z80);
                 self.writes += 1;
                 self.arm_busy();
             }
@@ -198,7 +226,7 @@ impl Ym2612 {
         self.busy_z80_cycles = Self::BUSY_DURATION_Z80_CYCLES;
     }
 
-    fn apply_write(&mut self, bank: usize, reg: u8, value: u8) {
+    fn apply_write(&mut self, bank: usize, reg: u8, value: u8, from_z80: bool) {
         if let Some(channel) = self.decode_fnum_low_channel(bank, reg) {
             self.channels[channel].fnum = (self.channels[channel].fnum & 0x0700) | value as u16;
         } else if let Some(channel) = self.decode_fnum_high_channel(bank, reg) {
@@ -318,6 +346,8 @@ impl Ym2612 {
                             op.key_on = next_key_on;
                         }
                         if reset_feedback {
+                            // `feedback_sample` keeps OP1 feedback history and
+                            // `feedback_sample_prev` keeps YM MEM delayed bus.
                             self.channels[channel].feedback_sample = 0.0;
                             self.channels[channel].feedback_sample_prev = 0.0;
                         }
@@ -325,11 +355,23 @@ impl Ym2612 {
                 }
                 0x2A => {
                     let centered = value as i16 - 0x80;
-                    self.dac_output = centered << 8;
+                    let output = centered << Self::DAC_OUTPUT_SHIFT;
+                    if from_z80 {
+                        let output_after_enable = self.dac_enabled_pending.is_some();
+                        self.dac_output_pending =
+                            Some(Self::encode_pending_dac_output(output, output_after_enable));
+                    } else {
+                        self.dac_output = output;
+                    }
                     self.dac_data_writes += 1;
                 }
                 0x2B => {
-                    self.dac_enabled = (value & 0x80) != 0;
+                    let enabled = (value & 0x80) != 0;
+                    if from_z80 {
+                        self.dac_enabled_pending = Some(enabled);
+                    } else {
+                        self.set_dac_enabled(enabled);
+                    }
                 }
                 _ => {}
             }
@@ -381,11 +423,11 @@ impl Ym2612 {
     }
 
     fn keyon_slot_mask_targets_operator(slot_mask: u8, op_index: usize) -> bool {
-        // YM2612 key-on bits: b4=OP1, b5=OP3, b6=OP2, b7=OP4.
+        // YM2612 key-on bits: b4=OP1, b5=OP2, b6=OP3, b7=OP4.
         match op_index.min(3) {
             0 => (slot_mask & 0b0001) != 0, // OP1 (b4)
-            1 => (slot_mask & 0b0100) != 0, // OP2 (b6)
-            2 => (slot_mask & 0b0010) != 0, // OP3 (b5)
+            1 => (slot_mask & 0b0010) != 0, // OP2 (b5)
+            2 => (slot_mask & 0b0100) != 0, // OP3 (b6)
             _ => (slot_mask & 0b1000) != 0, // OP4 (b7)
         }
     }
@@ -471,8 +513,12 @@ impl Ym2612 {
         operator_index: usize,
         channel3_special_mode: bool,
     ) -> f32 {
-        if channel3_special_mode && operator_index > 0 {
-            let slot = (operator_index - 1).min(2);
+        // YM2612 CH3 special mode follows the internal slot schedule used by
+        // ym3438/Nuked core:
+        // OP1 <- A9/AD, OP2 <- AA/AE, OP3 <- A8/AC, OP4 <- normal A2/A6.
+        if channel3_special_mode
+            && let Some(slot) = Self::channel3_special_slot_for_operator(operator_index)
+        {
             Self::fnum_block_frequency_hz(channel.special_fnum[slot], channel.special_block[slot])
         } else {
             Self::channel_base_frequency_hz(channel)
@@ -484,20 +530,31 @@ impl Ym2612 {
         operator_index: usize,
         channel3_special_mode: bool,
     ) -> u8 {
-        if channel3_special_mode && operator_index > 0 {
-            let slot = (operator_index - 1).min(2);
+        if channel3_special_mode
+            && let Some(slot) = Self::channel3_special_slot_for_operator(operator_index)
+        {
             Self::block_fnum_keycode(channel.special_block[slot], channel.special_fnum[slot])
         } else {
             Self::channel_keycode(channel)
         }
     }
 
+    fn channel3_special_slot_for_operator(operator_index: usize) -> Option<usize> {
+        match operator_index.min(3) {
+            0 => Some(1), // OP1 <- A9/AD
+            1 => Some(2), // OP2 <- AA/AE
+            2 => Some(0), // OP3 <- A8/AC
+            _ => None,    // OP4 uses channel FNUM/BLOCK (A2/A6)
+        }
+    }
+
     fn key_scale_rate_boost(keycode: u8, key_scale: u8) -> u8 {
+        // Nuked OPN2: rks = kc >> (ks ^ 0x03)
         match key_scale & 0x03 {
-            0 => 0,
-            1 => keycode >> 3,
-            2 => keycode >> 2,
-            _ => keycode >> 1,
+            0 => keycode >> 3,
+            1 => keycode >> 2,
+            2 => keycode >> 1,
+            _ => keycode,
         }
     }
 
@@ -535,7 +592,12 @@ impl Ym2612 {
 
     fn channel_fms_depth(fms: u8) -> f32 {
         // Frequency modulation sensitivity.
-        const FMS_DEPTH: [f32; 8] = [0.0, 0.0015, 0.003, 0.006, 0.012, 0.024, 0.036, 0.05];
+        // Values are derived from YM2612 PMS steps (±0.034, ±0.067, ±0.10,
+        // ±0.14, ±0.20, ±0.40, ±0.80 semitones) converted to linear ratio
+        // via `2^(semitones/12)-1`.
+        const FMS_DEPTH: [f32; 8] = [
+            0.0, 0.001965, 0.003877, 0.005793, 0.008118, 0.011619, 0.023374, 0.047294,
+        ];
         FMS_DEPTH[(fms & 0x07) as usize]
     }
 
@@ -549,46 +611,48 @@ impl Ym2612 {
 
     fn attack_rate_to_step(rate: u8, sample_rate_hz: f32) -> f32 {
         if rate == 0 {
-            if sample_rate_hz <= 0.0 {
-                return 0.0;
-            }
-            // AR=0 is extremely slow on YM2612, not instant full level.
-            return (1.0 / (12.0 * sample_rate_hz)).clamp(0.0, 1.0);
+            // AR=0 on real YM2612 means the envelope does not advance at all.
+            return 0.0;
         }
         // Envelope time approximation table (seconds to near-full level).
-        // Indexed by AR [0..31].
+        // Calibrated against real YM2612 timing: AR=31 completes in ~1ms,
+        // lower rates scale roughly logarithmically.
         const ATTACK_SECONDS: [f32; 32] = [
-            0.0, 1.200, 1.050, 0.920, 0.810, 0.710, 0.620, 0.540, 0.470, 0.410, 0.360, 0.315,
-            0.275, 0.240, 0.210, 0.184, 0.160, 0.140, 0.122, 0.106, 0.092, 0.080, 0.070, 0.060,
-            0.052, 0.045, 0.039, 0.033, 0.028, 0.023, 0.018, 0.014,
+            0.0, 0.100, 0.088, 0.077, 0.068, 0.060, 0.052, 0.046, 0.040, 0.035, 0.030, 0.026,
+            0.023, 0.020, 0.017, 0.015, 0.013, 0.0115, 0.010, 0.0087, 0.0076, 0.0066, 0.0057,
+            0.0050, 0.0043, 0.0037, 0.0032, 0.0027, 0.0023, 0.0019, 0.0015, 0.001,
         ];
         Self::rate_table_step(rate, sample_rate_hz, &ATTACK_SECONDS)
     }
 
     fn decay_rate_to_step(rate: u8, sample_rate_hz: f32) -> f32 {
-        // Approximate seconds for full-scale decay.
+        // Linear decay time (seconds) calibrated against real YM2612 EG at
+        // 53.3kHz.  Each 4 rate steps halves the time.  Rate 31 (internal
+        // rate 62) completes in ~3.5ms.
         const DECAY_SECONDS: [f32; 32] = [
-            0.0, 7.500, 6.600, 5.800, 5.100, 4.500, 3.960, 3.480, 3.060, 2.690, 2.360, 2.070,
-            1.820, 1.590, 1.390, 1.220, 1.060, 0.920, 0.800, 0.700, 0.610, 0.530, 0.460, 0.400,
-            0.350, 0.305, 0.265, 0.230, 0.200, 0.175, 0.152, 0.132,
+            0.0, 0.634, 0.534, 0.449, 0.378, 0.318, 0.267, 0.225, 0.189, 0.159, 0.134, 0.112,
+            0.094, 0.080, 0.067, 0.056, 0.047, 0.040, 0.033, 0.028, 0.024, 0.020, 0.017, 0.014,
+            0.012, 0.010, 0.0084, 0.007, 0.0059, 0.005, 0.0042, 0.0035,
         ];
         Self::rate_table_step(rate, sample_rate_hz, &DECAY_SECONDS)
     }
 
     fn sustain_rate_to_step(rate: u8, sample_rate_hz: f32) -> f32 {
-        // SR is often gentler than DR in music patches.
+        // Sustain rate uses the same EG mechanism as decay on real hardware.
         const SUSTAIN_SECONDS: [f32; 32] = [
-            0.0, 10.000, 8.800, 7.750, 6.820, 6.000, 5.280, 4.640, 4.080, 3.590, 3.160, 2.780,
-            2.440, 2.140, 1.880, 1.650, 1.440, 1.260, 1.100, 0.960, 0.840, 0.730, 0.640, 0.560,
-            0.490, 0.430, 0.375, 0.328, 0.286, 0.250, 0.218, 0.190,
+            0.0, 0.824, 0.694, 0.583, 0.491, 0.413, 0.347, 0.293, 0.246, 0.207, 0.174, 0.146,
+            0.122, 0.104, 0.087, 0.073, 0.061, 0.052, 0.043, 0.036, 0.031, 0.026, 0.022, 0.018,
+            0.016, 0.013, 0.011, 0.009, 0.0077, 0.0065, 0.0055, 0.0046,
         ];
         Self::rate_table_step(rate, sample_rate_hz, &SUSTAIN_SECONDS)
     }
 
     fn release_rate_to_step(rate: u8, sample_rate_hz: f32) -> f32 {
+        // Release rate is 4-bit; internal rate ≈ 4*RR+1.  Each 4 internal
+        // rate steps halves the time.  RR=15 (internal ~61) ≈ 3ms.
         const RELEASE_SECONDS: [f32; 16] = [
-            2.400, 2.000, 1.650, 1.350, 1.100, 0.900, 0.740, 0.600, 0.490, 0.400, 0.320, 0.260,
-            0.200, 0.150, 0.100, 0.0075,
+            10.0, 6.0, 3.5, 2.0, 1.2, 0.7, 0.42, 0.25, 0.15, 0.09, 0.053, 0.032, 0.019, 0.011,
+            0.006, 0.003,
         ];
         let rate = rate.min(15) as usize;
         let seconds = RELEASE_SECONDS[rate];
@@ -844,13 +908,96 @@ impl Ym2612 {
             Self::channel_operator_keycode(channel, 2, channel3_special_mode),
             Self::channel_operator_keycode(channel, 3, channel3_special_mode),
         ];
+        let alg = channel.algorithm & 0x07;
+        let (connect1, connect2, connect3, mem_restore_to, special_alg5) = match alg {
+            0 => (
+                Some(YmAlgorithmBus::C1),
+                Some(YmAlgorithmBus::Mem),
+                Some(YmAlgorithmBus::C2),
+                Some(YmAlgorithmBus::M2),
+                false,
+            ),
+            1 => (
+                Some(YmAlgorithmBus::Mem),
+                Some(YmAlgorithmBus::Mem),
+                Some(YmAlgorithmBus::C2),
+                Some(YmAlgorithmBus::M2),
+                false,
+            ),
+            2 => (
+                Some(YmAlgorithmBus::C2),
+                Some(YmAlgorithmBus::Mem),
+                Some(YmAlgorithmBus::C2),
+                Some(YmAlgorithmBus::M2),
+                false,
+            ),
+            3 => (
+                Some(YmAlgorithmBus::C1),
+                Some(YmAlgorithmBus::Mem),
+                Some(YmAlgorithmBus::C2),
+                Some(YmAlgorithmBus::C2),
+                false,
+            ),
+            4 => (
+                Some(YmAlgorithmBus::C1),
+                Some(YmAlgorithmBus::Out),
+                Some(YmAlgorithmBus::C2),
+                Some(YmAlgorithmBus::Mem),
+                false,
+            ),
+            5 => (
+                None,
+                Some(YmAlgorithmBus::Out),
+                Some(YmAlgorithmBus::Out),
+                Some(YmAlgorithmBus::M2),
+                true,
+            ),
+            6 => (
+                Some(YmAlgorithmBus::C1),
+                Some(YmAlgorithmBus::Out),
+                Some(YmAlgorithmBus::Out),
+                Some(YmAlgorithmBus::Mem),
+                false,
+            ),
+            _ => (
+                Some(YmAlgorithmBus::Out),
+                Some(YmAlgorithmBus::Out),
+                Some(YmAlgorithmBus::Out),
+                Some(YmAlgorithmBus::Mem),
+                false,
+            ),
+        };
+        let mut m2_bus = 0.0f32;
+        let mut c1_bus = 0.0f32;
+        let mut c2_bus = 0.0f32;
+        let mut mem_bus = 0.0f32;
+        let mut out_bus = 0.0f32;
+        if let Some(destination) = mem_restore_to {
+            Self::route_algorithm_bus(
+                destination,
+                channel.feedback_sample_prev,
+                &mut m2_bus,
+                &mut c1_bus,
+                &mut c2_bus,
+                &mut mem_bus,
+                &mut out_bus,
+            );
+        }
         // FM phase modulation depth (radians) for internal operator routing.
-        // This keeps timbre rich without driving every patch into metallic noise.
-        let op_mod_index = 4.5f32;
-        // YM2612 feedback level approximation (self-modulation on OP1).
-        const FEEDBACK_PHASE_RADIANS: [f32; 8] = [0.0, 0.08, 0.16, 0.32, 0.64, 1.2, 2.0, 3.2];
-        let fb_phase_mod = ((channel.feedback_sample + channel.feedback_sample_prev) * 0.5)
-            * FEEDBACK_PHASE_RADIANS[channel.feedback.min(7) as usize];
+        // Real YM2612: 14-bit operator output added to 10-bit phase (1024=2π).
+        // Max modulation = ~4096/1024 * 2π = 8π radians.
+        let op_mod_index = 8.0 * std::f32::consts::PI;
+        // YM2612 feedback level (self-modulation on OP1).
+        // Standard OPN values: FB=1→π/16 .. FB=7→4π (peak radians).
+        // Code applies to the sum of two samples (±2.0 peak), so table
+        // stores half the documented peak: [0, π/32, π/16, .., 2π].
+        const FEEDBACK_PHASE_RADIANS: [f32; 8] =
+            [0.0, 0.098, 0.196, 0.393, 0.785, 1.571, 3.1416, 6.2832];
+        // OPN feedback uses OP1's last two outputs. `operators[0].last_output`
+        // stores n-1 and `feedback_sample` tracks n-2.
+        let op1_prev = channel.operators[0].last_output;
+        let fb_phase_mod =
+            (op1_prev + channel.feedback_sample) * FEEDBACK_PHASE_RADIANS[channel.feedback.min(7) as usize];
         let o1 = Self::advance_operator_sample(
             &mut channel.operators[0],
             op_freqs[0],
@@ -860,256 +1007,93 @@ impl Ym2612 {
             lfo_am,
             am_depth,
         );
-        channel.feedback_sample_prev = channel.feedback_sample;
-        channel.feedback_sample = o1;
-        let alg = channel.algorithm & 0x07;
+        channel.feedback_sample = op1_prev;
+        if special_alg5 {
+            mem_bus += o1;
+            c1_bus += o1;
+            c2_bus += o1;
+        } else if let Some(destination) = connect1 {
+            Self::route_algorithm_bus(
+                destination,
+                o1,
+                &mut m2_bus,
+                &mut c1_bus,
+                &mut c2_bus,
+                &mut mem_bus,
+                &mut out_bus,
+            );
+        }
+        // YM internal slot order is OP1 -> OP3 -> OP2 -> OP4.
+        let o3 = Self::advance_operator_sample(
+            &mut channel.operators[2],
+            op_freqs[2],
+            sample_rate_hz,
+            m2_bus * op_mod_index,
+            op_keycodes[2],
+            lfo_am,
+            am_depth,
+        );
+        if let Some(destination) = connect3 {
+            Self::route_algorithm_bus(
+                destination,
+                o3,
+                &mut m2_bus,
+                &mut c1_bus,
+                &mut c2_bus,
+                &mut mem_bus,
+                &mut out_bus,
+            );
+        }
+        let o2 = Self::advance_operator_sample(
+            &mut channel.operators[1],
+            op_freqs[1],
+            sample_rate_hz,
+            c1_bus * op_mod_index,
+            op_keycodes[1],
+            lfo_am,
+            am_depth,
+        );
+        if let Some(destination) = connect2 {
+            Self::route_algorithm_bus(
+                destination,
+                o2,
+                &mut m2_bus,
+                &mut c1_bus,
+                &mut c2_bus,
+                &mut mem_bus,
+                &mut out_bus,
+            );
+        }
+        let o4 = Self::advance_operator_sample(
+            &mut channel.operators[3],
+            op_freqs[3],
+            sample_rate_hz,
+            c2_bus * op_mod_index,
+            op_keycodes[3],
+            lfo_am,
+            am_depth,
+        );
+        out_bus += o4;
+        channel.feedback_sample_prev = mem_bus;
+        out_bus
+    }
 
-        let (o2, o3, o4, out) = match alg {
-            0 => {
-                let o3 = Self::advance_operator_sample(
-                    &mut channel.operators[2],
-                    op_freqs[2],
-                    sample_rate_hz,
-                    o1 * op_mod_index,
-                    op_keycodes[2],
-                    lfo_am,
-                    am_depth,
-                );
-                let o2 = Self::advance_operator_sample(
-                    &mut channel.operators[1],
-                    op_freqs[1],
-                    sample_rate_hz,
-                    o3 * op_mod_index,
-                    op_keycodes[1],
-                    lfo_am,
-                    am_depth,
-                );
-                let o4 = Self::advance_operator_sample(
-                    &mut channel.operators[3],
-                    op_freqs[3],
-                    sample_rate_hz,
-                    o2 * op_mod_index,
-                    op_keycodes[3],
-                    lfo_am,
-                    am_depth,
-                );
-                (o2, o3, o4, o4)
-            }
-            1 => {
-                let o3 = Self::advance_operator_sample(
-                    &mut channel.operators[2],
-                    op_freqs[2],
-                    sample_rate_hz,
-                    0.0,
-                    op_keycodes[2],
-                    lfo_am,
-                    am_depth,
-                );
-                let o2 = Self::advance_operator_sample(
-                    &mut channel.operators[1],
-                    op_freqs[1],
-                    sample_rate_hz,
-                    (o1 + o3) * (op_mod_index * 0.5),
-                    op_keycodes[1],
-                    lfo_am,
-                    am_depth,
-                );
-                let o4 = Self::advance_operator_sample(
-                    &mut channel.operators[3],
-                    op_freqs[3],
-                    sample_rate_hz,
-                    o2 * op_mod_index,
-                    op_keycodes[3],
-                    lfo_am,
-                    am_depth,
-                );
-                (o2, o3, o4, o4)
-            }
-            2 => {
-                let o3 = Self::advance_operator_sample(
-                    &mut channel.operators[2],
-                    op_freqs[2],
-                    sample_rate_hz,
-                    0.0,
-                    op_keycodes[2],
-                    lfo_am,
-                    am_depth,
-                );
-                let o2 = Self::advance_operator_sample(
-                    &mut channel.operators[1],
-                    op_freqs[1],
-                    sample_rate_hz,
-                    o3 * op_mod_index,
-                    op_keycodes[1],
-                    lfo_am,
-                    am_depth,
-                );
-                let o4 = Self::advance_operator_sample(
-                    &mut channel.operators[3],
-                    op_freqs[3],
-                    sample_rate_hz,
-                    (o1 + o2) * (op_mod_index * 0.5),
-                    op_keycodes[3],
-                    lfo_am,
-                    am_depth,
-                );
-                (o2, o3, o4, o4)
-            }
-            3 => {
-                let o3 = Self::advance_operator_sample(
-                    &mut channel.operators[2],
-                    op_freqs[2],
-                    sample_rate_hz,
-                    o1 * op_mod_index,
-                    op_keycodes[2],
-                    lfo_am,
-                    am_depth,
-                );
-                let o2 = Self::advance_operator_sample(
-                    &mut channel.operators[1],
-                    op_freqs[1],
-                    sample_rate_hz,
-                    0.0,
-                    op_keycodes[1],
-                    lfo_am,
-                    am_depth,
-                );
-                let o4 = Self::advance_operator_sample(
-                    &mut channel.operators[3],
-                    op_freqs[3],
-                    sample_rate_hz,
-                    (o2 + o3) * (op_mod_index * 0.5),
-                    op_keycodes[3],
-                    lfo_am,
-                    am_depth,
-                );
-                (o2, o3, o4, o4)
-            }
-            4 => {
-                let o2 = Self::advance_operator_sample(
-                    &mut channel.operators[1],
-                    op_freqs[1],
-                    sample_rate_hz,
-                    o1 * op_mod_index,
-                    op_keycodes[1],
-                    lfo_am,
-                    am_depth,
-                );
-                let o3 = Self::advance_operator_sample(
-                    &mut channel.operators[2],
-                    op_freqs[2],
-                    sample_rate_hz,
-                    0.0,
-                    op_keycodes[2],
-                    lfo_am,
-                    am_depth,
-                );
-                let o4 = Self::advance_operator_sample(
-                    &mut channel.operators[3],
-                    op_freqs[3],
-                    sample_rate_hz,
-                    o3 * op_mod_index,
-                    op_keycodes[3],
-                    lfo_am,
-                    am_depth,
-                );
-                (o2, o3, o4, (o2 + o4) * 0.5)
-            }
-            5 => {
-                let o2 = Self::advance_operator_sample(
-                    &mut channel.operators[1],
-                    op_freqs[1],
-                    sample_rate_hz,
-                    o1 * op_mod_index,
-                    op_keycodes[1],
-                    lfo_am,
-                    am_depth,
-                );
-                let o3 = Self::advance_operator_sample(
-                    &mut channel.operators[2],
-                    op_freqs[2],
-                    sample_rate_hz,
-                    o1 * op_mod_index,
-                    op_keycodes[2],
-                    lfo_am,
-                    am_depth,
-                );
-                let o4 = Self::advance_operator_sample(
-                    &mut channel.operators[3],
-                    op_freqs[3],
-                    sample_rate_hz,
-                    o1 * op_mod_index,
-                    op_keycodes[3],
-                    lfo_am,
-                    am_depth,
-                );
-                (o2, o3, o4, (o2 + o3 + o4) / 3.0)
-            }
-            6 => {
-                let o2 = Self::advance_operator_sample(
-                    &mut channel.operators[1],
-                    op_freqs[1],
-                    sample_rate_hz,
-                    o1 * op_mod_index,
-                    op_keycodes[1],
-                    lfo_am,
-                    am_depth,
-                );
-                let o3 = Self::advance_operator_sample(
-                    &mut channel.operators[2],
-                    op_freqs[2],
-                    sample_rate_hz,
-                    0.0,
-                    op_keycodes[2],
-                    lfo_am,
-                    am_depth,
-                );
-                let o4 = Self::advance_operator_sample(
-                    &mut channel.operators[3],
-                    op_freqs[3],
-                    sample_rate_hz,
-                    0.0,
-                    op_keycodes[3],
-                    lfo_am,
-                    am_depth,
-                );
-                (o2, o3, o4, (o2 + o3 + o4) / 3.0)
-            }
-            _ => {
-                let o2 = Self::advance_operator_sample(
-                    &mut channel.operators[1],
-                    op_freqs[1],
-                    sample_rate_hz,
-                    0.0,
-                    op_keycodes[1],
-                    lfo_am,
-                    am_depth,
-                );
-                let o3 = Self::advance_operator_sample(
-                    &mut channel.operators[2],
-                    op_freqs[2],
-                    sample_rate_hz,
-                    0.0,
-                    op_keycodes[2],
-                    lfo_am,
-                    am_depth,
-                );
-                let o4 = Self::advance_operator_sample(
-                    &mut channel.operators[3],
-                    op_freqs[3],
-                    sample_rate_hz,
-                    0.0,
-                    op_keycodes[3],
-                    lfo_am,
-                    am_depth,
-                );
-                (o2, o3, o4, (o1 + o2 + o3 + o4) * 0.25)
-            }
-        };
-
-        let _ = (o2, o3, o4);
-        // Soft clip improves perceived loudness while reducing harsh edges.
-        out.tanh()
+    fn route_algorithm_bus(
+        destination: YmAlgorithmBus,
+        sample: f32,
+        m2_bus: &mut f32,
+        c1_bus: &mut f32,
+        c2_bus: &mut f32,
+        mem_bus: &mut f32,
+        out_bus: &mut f32,
+    ) {
+        match destination {
+            YmAlgorithmBus::M2 => *m2_bus += sample,
+            YmAlgorithmBus::C1 => *c1_bus += sample,
+            YmAlgorithmBus::C2 => *c2_bus += sample,
+            YmAlgorithmBus::Mem => *mem_bus += sample,
+            YmAlgorithmBus::Out => *out_bus += sample,
+        }
     }
 
     fn next_sample_stereo(&mut self, sample_rate_hz: f32) -> (i16, i16) {
@@ -1121,6 +1105,9 @@ impl Ym2612 {
         let channel3_special_mode = self.channel3_special_mode_enabled();
         for (index, channel) in self.channels.iter_mut().enumerate() {
             if index == 5 && self.dac_enabled {
+                // CH6 FM output is muted while DAC is enabled.
+                // Skip FM rendering here so DAC cycle accumulators are not
+                // overwritten by channel feedback scratch values.
                 continue;
             }
             if !Self::channel_active(channel) {
@@ -1152,14 +1139,22 @@ impl Ym2612 {
         } else {
             (right_mix * 18_000.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16
         };
-        let (dac_left, dac_right) = if self.dac_enabled {
-            let channel = &self.channels[5];
-            let left = if channel.pan_left { self.dac_output } else { 0 };
-            let right = if channel.pan_right {
-                self.dac_output
+        let (dac_left, dac_right) = if self.dac_enabled || self.channels[5].feedback_sample_prev > 0.0
+        {
+            let channel = &mut self.channels[5];
+            // Accumulate DAC sample-hold output in Z80 time and average here.
+            // This preserves sub-sample DAC write timing and avoids "beep"/alias
+            // artifacts when drivers stream PCM between host output samples.
+            let dac_sample = if channel.feedback_sample_prev > 0.0 {
+                channel.feedback_sample / channel.feedback_sample_prev
             } else {
-                0
+                self.dac_output as f32
             };
+            channel.feedback_sample = 0.0;
+            channel.feedback_sample_prev = 0.0;
+            let dac_i16 = dac_sample.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            let left = if channel.pan_left { dac_i16 } else { 0 };
+            let right = if channel.pan_right { dac_i16 } else { 0 };
             (left, right)
         } else {
             (0, 0)
@@ -1173,6 +1168,77 @@ impl Ym2612 {
 
     fn step_z80_cycles(&mut self, cycles: u32) {
         self.busy_z80_cycles = self.busy_z80_cycles.saturating_sub(cycles);
+        if cycles > 0 {
+            let pending_enabled = self.dac_enabled_pending.take();
+            let pending_output = self
+                .dac_output_pending
+                .take()
+                .map(Self::decode_pending_dac_output);
+            let pending_count = pending_enabled.is_some() as u8 + pending_output.is_some() as u8;
+            if pending_count == 0 {
+                self.accumulate_dac_cycles(cycles);
+            } else {
+                // Z80 writes happen during the elapsed instruction slice.
+                // Apply pending DAC changes inside this slice instead of only
+                // at the end to reduce one-instruction quantization artifacts.
+                let total_cycles = cycles as u64;
+                let mut stage_index = 0u64;
+                let stage_count = pending_count as u64 + 1;
+                let mut consumed_cycles = 0u32;
+                match (pending_enabled, pending_output) {
+                    (Some(enabled), Some((output, output_after_enable))) => {
+                        if output_after_enable {
+                            stage_index += 1;
+                            let boundary = ((stage_index * total_cycles) / stage_count) as u32;
+                            let span = boundary.saturating_sub(consumed_cycles);
+                            self.accumulate_dac_cycles(span);
+                            consumed_cycles = boundary;
+                            self.set_dac_enabled(enabled);
+
+                            stage_index += 1;
+                            let boundary = ((stage_index * total_cycles) / stage_count) as u32;
+                            let span = boundary.saturating_sub(consumed_cycles);
+                            self.accumulate_dac_cycles(span);
+                            consumed_cycles = boundary;
+                            self.dac_output = output;
+                        } else {
+                            stage_index += 1;
+                            let boundary = ((stage_index * total_cycles) / stage_count) as u32;
+                            let span = boundary.saturating_sub(consumed_cycles);
+                            self.accumulate_dac_cycles(span);
+                            consumed_cycles = boundary;
+                            self.dac_output = output;
+
+                            stage_index += 1;
+                            let boundary = ((stage_index * total_cycles) / stage_count) as u32;
+                            let span = boundary.saturating_sub(consumed_cycles);
+                            self.accumulate_dac_cycles(span);
+                            consumed_cycles = boundary;
+                            self.set_dac_enabled(enabled);
+                        }
+                    }
+                    (Some(enabled), None) => {
+                        stage_index += 1;
+                        let boundary = ((stage_index * total_cycles) / stage_count) as u32;
+                        let span = boundary.saturating_sub(consumed_cycles);
+                        self.accumulate_dac_cycles(span);
+                        consumed_cycles = boundary;
+                        self.set_dac_enabled(enabled);
+                    }
+                    (None, Some((output, _))) => {
+                        stage_index += 1;
+                        let boundary = ((stage_index * total_cycles) / stage_count) as u32;
+                        let span = boundary.saturating_sub(consumed_cycles);
+                        self.accumulate_dac_cycles(span);
+                        consumed_cycles = boundary;
+                        self.dac_output = output;
+                    }
+                    (None, None) => {}
+                }
+                self.accumulate_dac_cycles(cycles.saturating_sub(consumed_cycles));
+            }
+        }
+
         let ym_cycle_divisor = Self::Z80_CLOCK_HZ * Self::YM2612_DIVIDER;
         self.timer_clock_accumulator += (cycles as u64) * Self::MASTER_CLOCK_HZ;
         let ym_cycles = self.timer_clock_accumulator / ym_cycle_divisor;
@@ -1204,6 +1270,7 @@ impl Ym2612 {
                 }
             }
         }
+
     }
 
     fn csm_mode_enabled(&self) -> bool {
@@ -1226,6 +1293,40 @@ impl Ym2612 {
             op.envelope_level = 0.0;
             op.key_on = true;
         }
+    }
+
+    fn accumulate_dac_cycles(&mut self, cycles: u32) {
+        if !self.dac_enabled || cycles == 0 {
+            return;
+        }
+        let channel = &mut self.channels[5];
+        channel.feedback_sample += self.dac_output as f32 * cycles as f32;
+        channel.feedback_sample_prev += cycles as f32;
+    }
+
+    fn set_dac_enabled(&mut self, enabled: bool) {
+        let was_enabled = self.dac_enabled;
+        self.dac_enabled = enabled;
+        if was_enabled != self.dac_enabled {
+            // Reset CH6 scratch state when DAC mode toggles.
+            self.channels[5].feedback_sample = 0.0;
+            self.channels[5].feedback_sample_prev = 0.0;
+        }
+    }
+
+    fn encode_pending_dac_output(output: i16, output_after_enable: bool) -> i16 {
+        (output & !Self::DAC_PENDING_ORDER_MASK)
+            | if output_after_enable {
+                Self::DAC_PENDING_ORDER_MASK
+            } else {
+                0
+            }
+    }
+
+    fn decode_pending_dac_output(tagged_output: i16) -> (i16, bool) {
+        let output_after_enable = (tagged_output & Self::DAC_PENDING_ORDER_MASK) != 0;
+        let output = tagged_output & !Self::DAC_PENDING_ORDER_MASK;
+        (output, output_after_enable)
     }
 
     fn read_status(&self) -> u8 {
@@ -1338,7 +1439,7 @@ impl Ym2612 {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct Psg {
     last_data: u8,
     writes: u64,
@@ -1365,7 +1466,7 @@ impl Default for Psg {
             tone_phase_acc: [0.0, 0.0, 0.0],
             attenuation: [0x0F; 4],
             noise_control: 0,
-            noise_lfsr: 0x8000,
+            noise_lfsr: 0x4000,
             noise_phase_acc: 0.0,
         }
     }
@@ -1385,7 +1486,9 @@ impl Psg {
             return;
         }
 
-        if !self.latched_is_volume && self.latched_channel < 3 {
+        if self.latched_is_volume {
+            self.attenuation[self.latched_channel] = value & 0x0F;
+        } else if self.latched_channel < 3 {
             let lo = self.tone_period[self.latched_channel] & 0x000F;
             let hi = ((value & 0x3F) as u16) << 4;
             self.tone_period[self.latched_channel] = lo | hi;
@@ -1427,15 +1530,15 @@ impl Psg {
             self.tone_period[self.latched_channel] = hi | data as u16;
         } else {
             self.noise_control = data & 0x07;
-            self.noise_lfsr = 0x8000;
+            self.noise_lfsr = 0x4000;
             self.noise_phase_acc = 0.0;
         }
     }
 
     fn tone_frequency_hz(&self, channel: usize) -> f32 {
         let raw_period = self.tone_period[channel.min(2)] & 0x03FF;
-        // SN76489-compatible behavior: period 0 is treated as divider 1024.
-        let period = if raw_period == 0 { 1024 } else { raw_period } as f32;
+        // Genesis integrated PSG behavior: period=0 behaves like period=1.
+        let period = raw_period.max(1) as f32;
         Self::PSG_CLOCK_HZ / (32.0 * period)
     }
 
@@ -1466,7 +1569,8 @@ impl Psg {
         } else {
             bit0
         };
-        self.noise_lfsr = (self.noise_lfsr >> 1) | (feedback << 15);
+        // SN76489-compatible 15-bit LFSR (bit14 is the injected tap bit).
+        self.noise_lfsr = ((self.noise_lfsr >> 1) | (feedback << 14)) & 0x7FFF;
     }
 
     fn next_sample(&mut self, sample_rate_hz: f32) -> i16 {
@@ -1519,7 +1623,7 @@ impl Psg {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct AudioBus {
     ym2612: Ym2612,
     psg: Psg,
@@ -1568,8 +1672,11 @@ impl AudioBus {
     }
 
     pub fn write_ym2612_from_z80(&mut self, port: u8, value: u8) {
+        // YM2612 BUSY is a status/read-side signal; writes are still latched.
+        // Dropping data writes while BUSY causes audible FM/DAC corruption in
+        // Z80-driven drivers (e.g. Landstalker effects).
         self.ym_writes_from_z80 += 1;
-        self.ym2612.write_port(port, value);
+        self.ym2612.write_port_from_z80(port, value);
     }
 
     pub fn write_psg(&mut self, value: u8) {
@@ -1595,8 +1702,34 @@ impl AudioBus {
         for _ in 0..produced {
             // Keep PSG clearly below FM in the global mix so square-wave beeps
             // do not overpower YM2612 music.
-            let psg_sample = (self.psg.next_sample(sample_rate_hz as f32) as i32) / 5;
-            let (ym_left, ym_right) = self.ym2612.next_sample_stereo(sample_rate_hz as f32);
+            // PSG can generate very high-frequency components that alias
+            // harshly at 44.1kHz. A small oversampling pass reduces "beepy"
+            // artifacts without changing the external sample rate.
+            let psg_oversample_u64 = 4u64;
+            let psg_oversample_i32 = 4i32;
+            let mut psg_acc = 0i32;
+            for _ in 0..psg_oversample_u64 {
+                psg_acc += self
+                    .psg
+                    .next_sample((sample_rate_hz * psg_oversample_u64) as f32)
+                    as i32;
+            }
+            let psg_sample = (psg_acc / psg_oversample_i32) * 2 / 5;
+            // A light YM oversampling pass reduces FM aliasing "beep" artifacts
+            // in effect-heavy scenes without changing the external output rate.
+            let ym_oversample_u64 = 2u64;
+            let ym_oversample_i32 = 2i32;
+            let mut ym_left_acc = 0i32;
+            let mut ym_right_acc = 0i32;
+            for _ in 0..ym_oversample_u64 {
+                let (l, r) = self
+                    .ym2612
+                    .next_sample_stereo((sample_rate_hz * ym_oversample_u64) as f32);
+                ym_left_acc += l as i32;
+                ym_right_acc += r as i32;
+            }
+            let ym_left = (ym_left_acc / ym_oversample_i32) as i16;
+            let ym_right = (ym_right_acc / ym_oversample_i32) as i16;
             let left = (psg_sample + ym_left as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             let right =
                 (psg_sample + ym_right as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
@@ -1664,6 +1797,157 @@ impl Default for AudioBus {
             output_sample_rate_hz: Self::DEFAULT_OUTPUT_SAMPLE_RATE_HZ,
             sample_accumulator: 0,
             sample_buffer: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Psg, Ym2612};
+
+    fn write_ym_reg(ym: &mut Ym2612, bank: usize, reg: u8, value: u8) {
+        let (addr_port, data_port) = if (bank & 1) == 0 {
+            (0u8, 1u8)
+        } else {
+            (2u8, 3u8)
+        };
+        ym.write_port(addr_port, reg);
+        ym.write_port(data_port, value);
+    }
+
+    #[test]
+    fn psg_data_byte_updates_latched_volume_register() {
+        let mut psg = Psg::default();
+
+        // Latch channel 2 volume register and set attenuation=3.
+        psg.write_data(0b1101_0011);
+        assert_eq!(psg.attenuation(2), 0x03);
+
+        // Data byte without latch should keep target register and update attenuation.
+        psg.write_data(0x0B);
+        assert_eq!(psg.attenuation(2), 0x0B);
+    }
+
+    #[test]
+    fn psg_data_byte_updates_latched_tone_period_high_bits() {
+        let mut psg = Psg::default();
+
+        // Latch channel 0 tone low nibble = 0x5.
+        psg.write_data(0b1000_0101);
+        // Data byte sets upper 6 bits = 0x12.
+        psg.write_data(0x12);
+
+        assert_eq!(psg.tone_period(0), 0x125);
+    }
+
+    #[test]
+    fn ym2612_pms_depth_table_matches_documented_semitone_steps() {
+        // PMS documented ranges (in semitones): 0, 0.034, 0.067, 0.10, 0.14,
+        // 0.20, 0.40, 0.80. Convert to multiplicative ratio delta.
+        let expected = [
+            0.0f32,
+            2f32.powf(0.034 / 12.0) - 1.0,
+            2f32.powf(0.067 / 12.0) - 1.0,
+            2f32.powf(0.10 / 12.0) - 1.0,
+            2f32.powf(0.14 / 12.0) - 1.0,
+            2f32.powf(0.20 / 12.0) - 1.0,
+            2f32.powf(0.40 / 12.0) - 1.0,
+            2f32.powf(0.80 / 12.0) - 1.0,
+        ];
+        for (idx, expected_depth) in expected.iter().enumerate() {
+            let got = Ym2612::channel_fms_depth(idx as u8);
+            assert!(
+                (got - expected_depth).abs() < 0.0001,
+                "pms={} expected={} got={}",
+                idx,
+                expected_depth,
+                got
+            );
+        }
+    }
+
+    #[test]
+    fn ym2612_channel3_special_mode_uses_ym3438_slot_mapping() {
+        let mut ym = Ym2612::default();
+
+        // Channel 3 normal frequency (used by operator 4 in CH3 special mode).
+        write_ym_reg(&mut ym, 0, 0xA2, 0x34);
+        write_ym_reg(&mut ym, 0, 0xA6, 0x21); // block=4, fnum high=1
+
+        // CH3 special slot frequencies:
+        // slot0 (A8/AC) -> operator 3
+        // slot1 (A9/AD) -> operator 1
+        // slot2 (AA/AE) -> operator 2
+        write_ym_reg(&mut ym, 0, 0xA8, 0x11);
+        write_ym_reg(&mut ym, 0, 0xAC, 0x18); // block=3, fnum high=0
+        write_ym_reg(&mut ym, 0, 0xA9, 0x22);
+        write_ym_reg(&mut ym, 0, 0xAD, 0x29); // block=5, fnum high=1
+        write_ym_reg(&mut ym, 0, 0xAA, 0x33);
+        write_ym_reg(&mut ym, 0, 0xAE, 0x31); // block=6, fnum high=1
+
+        // Enable CH3 special mode (mode bits 01 in reg 0x27).
+        write_ym_reg(&mut ym, 0, 0x27, 0x40);
+
+        let op1 = ym.channel_operator_frequency_hz_debug(2, 0);
+        let op2 = ym.channel_operator_frequency_hz_debug(2, 1);
+        let op3 = ym.channel_operator_frequency_hz_debug(2, 2);
+        let op4 = ym.channel_operator_frequency_hz_debug(2, 3);
+
+        let expected_op1 = Ym2612::fnum_block_frequency_hz(0x122, 5);
+        let expected_op2 = Ym2612::fnum_block_frequency_hz(0x133, 6);
+        let expected_op3 = Ym2612::fnum_block_frequency_hz(0x011, 3);
+        let expected_op4 = Ym2612::fnum_block_frequency_hz(0x134, 4);
+
+        assert!(
+            (op1 - expected_op1).abs() < 0.01,
+            "op1={} exp={}",
+            op1,
+            expected_op1
+        );
+        assert!(
+            (op2 - expected_op2).abs() < 0.01,
+            "op2={} exp={}",
+            op2,
+            expected_op2
+        );
+        assert!(
+            (op3 - expected_op3).abs() < 0.01,
+            "op3={} exp={}",
+            op3,
+            expected_op3
+        );
+        assert!(
+            (op4 - expected_op4).abs() < 0.01,
+            "op4={} exp={}",
+            op4,
+            expected_op4
+        );
+    }
+
+    #[test]
+    fn ym2612_channel3_without_special_mode_uses_normal_frequency_for_all_operators() {
+        let mut ym = Ym2612::default();
+        write_ym_reg(&mut ym, 0, 0xA2, 0x56);
+        write_ym_reg(&mut ym, 0, 0xA6, 0x2B); // block=5, fnum high=3
+
+        // Program distinct CH3 special slot values, but keep special mode off.
+        write_ym_reg(&mut ym, 0, 0xA8, 0x01);
+        write_ym_reg(&mut ym, 0, 0xAC, 0x10);
+        write_ym_reg(&mut ym, 0, 0xA9, 0x02);
+        write_ym_reg(&mut ym, 0, 0xAD, 0x18);
+        write_ym_reg(&mut ym, 0, 0xAA, 0x03);
+        write_ym_reg(&mut ym, 0, 0xAE, 0x20);
+
+        let expected = Ym2612::fnum_block_frequency_hz(0x356, 5);
+        for op in 0..4 {
+            let got = ym.channel_operator_frequency_hz_debug(2, op);
+            assert!(
+                (got - expected).abs() < 0.01,
+                "op{}={} exp={}",
+                op + 1,
+                got,
+                expected
+            );
         }
     }
 }

@@ -1,4 +1,4 @@
-use super::{encode_md_color, DmaTarget, Vdp, FRAME_HEIGHT, FRAME_WIDTH};
+use super::{DmaTarget, FRAME_HEIGHT, FRAME_WIDTH, Vdp, encode_md_color};
 
 #[test]
 fn supports_vram_read_write() {
@@ -346,6 +346,31 @@ fn hblank_interrupt_becomes_pending_when_enabled() {
 }
 
 #[test]
+fn hblank_interrupt_line_is_stable_across_frames() {
+    let mut vdp = Vdp::new();
+    // Enable H-INT and use a large line interval to surface frame-boundary drift.
+    vdp.write_control_port(0x8010);
+    vdp.write_control_port(0x8AB8);
+
+    let mut first_hint_line_by_frame: [Option<u8>; 3] = [None, None, None];
+    while vdp.frame_count() < 3 {
+        vdp.step(1);
+        if vdp.pending_interrupt_level() == Some(4) {
+            let frame = vdp.frame_count() as usize;
+            if frame < first_hint_line_by_frame.len() && first_hint_line_by_frame[frame].is_none() {
+                let line = (vdp.read_hv_counter() >> 8) as u8;
+                first_hint_line_by_frame[frame] = Some(line);
+            }
+            vdp.acknowledge_interrupt(4);
+        }
+    }
+
+    let line_frame1 = first_hint_line_by_frame[1].expect("H-INT line for frame 1");
+    let line_frame2 = first_hint_line_by_frame[2].expect("H-INT line for frame 2");
+    assert_eq!(line_frame1, line_frame2);
+}
+
+#[test]
 fn vblank_interrupt_has_priority_over_hblank_interrupt() {
     let mut vdp = Vdp::new();
     vdp.write_control_port(0x8010); // H-INT enable
@@ -648,6 +673,51 @@ fn comix_title_roll_quirk_keeps_default_plane_b_sampling_without_bias() {
     with_quirk.set_quirk_vscroll_swap_ab(true);
     with_quirk.step(Vdp::CYCLES_PER_FRAME as u32);
     assert_eq!(&with_quirk.frame_buffer()[0..3], &[252, 0, 0]);
+}
+
+#[test]
+fn comix_title_roll_quirk_masks_lower_region_to_black() {
+    let mut vdp = Vdp::new();
+    vdp.vram.fill(0);
+    vdp.cram.fill(0);
+    vdp.vsram.fill(0);
+
+    // Match Comix title-roll condition.
+    vdp.write_control_port(0x8140); // Display on.
+    vdp.write_control_port(0x8407); // Plane B base @ 0xE000.
+    vdp.write_control_port(0x8D3C); // HScroll table @ 0xF000.
+    vdp.write_control_port(0x8B00); // Full-screen h/v scroll mode.
+    vdp.write_control_port(0x9011); // Plane size 64x64.
+    vdp.write_control_port(0x8C89); // H40 + shadow/highlight bit set.
+    vdp.write_vsram_u16(0, 0x00B8); // Trigger value used by roll scene.
+    vdp.write_vsram_u16(1, 0x0000);
+    vdp.set_quirk_vscroll_swap_ab(true);
+
+    // Tile 1: solid palette index 1 (red).
+    for i in 0..32u16 {
+        vdp.write_vram_u8(32 + i, 0x11);
+    }
+    vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
+
+    // Fill Plane B map with tile 1 so clipping effect is easy to observe.
+    let plane_b_base = 0xE000usize;
+    for row in 0..64usize {
+        for col in 0..64usize {
+            let addr = plane_b_base + (row * 64 + col) * 2;
+            vdp.write_vram_u8(addr as u16, 0x00);
+            vdp.write_vram_u8((addr + 1) as u16, 0x01);
+        }
+    }
+
+    vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+
+    // Upper roll area remains visible.
+    let top = (20 * FRAME_WIDTH + 20) * 3;
+    assert_eq!(&vdp.frame_buffer()[top..top + 3], &[252, 0, 0]);
+
+    // Lower roll area is masked to background black.
+    let lower = (150 * FRAME_WIDTH + 20) * 3;
+    assert_eq!(&vdp.frame_buffer()[lower..lower + 3], &[0, 0, 0]);
 }
 
 #[test]
