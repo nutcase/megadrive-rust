@@ -389,6 +389,7 @@ pub struct Ym2612 {
     hw_eg_divider: u8,
     last_hw_output: (i16, i16),
     csm_key_on_active: bool,
+    test_register: u8, // reg 0x21: test mode bits (normally 0)
     channels: [YmChannel; 6],
 }
 
@@ -421,6 +422,7 @@ impl Default for Ym2612 {
             hw_eg_divider: 0,
             last_hw_output: (0, 0),
             csm_key_on_active: false,
+            test_register: 0,
             channels: [YmChannel::default(); 6],
         }
     }
@@ -476,7 +478,7 @@ impl Ym2612 {
         match port & 0x03 {
             0 => {
                 self.addr_port0 = value;
-                self.arm_busy();
+                // Address latch only — no BUSY flag (GenPlusGX behavior)
             }
             1 => {
                 let reg = self.addr_port0;
@@ -487,7 +489,7 @@ impl Ym2612 {
             }
             2 => {
                 self.addr_port1 = value;
-                self.arm_busy();
+                // Address latch only — no BUSY flag
             }
             3 => {
                 let reg = self.addr_port1;
@@ -564,6 +566,11 @@ impl Ym2612 {
 
         if bank == 0 {
             match reg {
+                0x21 => {
+                    // Test register: bit 0 = LFO halt (Nuked OPN2), other bits = test modes.
+                    // Most games write 0; store for reference.
+                    self.test_register = value;
+                }
                 0x22 => {
                     self.lfo_enabled = (value & 0x08) != 0;
                     self.lfo_rate = value & 0x07;
@@ -1059,6 +1066,7 @@ impl Ym2612 {
         lfo_am: u8,
         channel_ams: u8,
         eg_tick: bool,
+        eg_test: bool,
     ) -> i32 {
         if !Self::operator_active(op) {
             op.last_output = 0;
@@ -1078,8 +1086,8 @@ impl Ym2612 {
             }
         }
 
-        // Nuked OPN2: EG + TL + AM all summed in 10-bit space, then << 2 to 12-bit
-        let eg_level = Self::ssg_eg_output_level(op);
+        // Nuked OPN2: test register bit 0 forces EG output to 0 (max volume)
+        let eg_level = if eg_test { 0 } else { Self::ssg_eg_output_level(op) };
         let mut eg_out = eg_level as u32 + ((op.tl as u32) << 3);
         // AM modulation in 10-bit space
         if op.am_enable {
@@ -1132,6 +1140,7 @@ impl Ym2612 {
         lfo_pm_sign: bool,
         channel3_special_mode: bool,
         eg_tick: bool,
+        eg_test: bool,
     ) -> i32 {
         // Compute phase increments and keycodes for each operator
         let mut op_phase_incs = [0u32; 4];
@@ -1254,6 +1263,7 @@ impl Ym2612 {
             lfo_am,
             channel.ams,
             eg_tick,
+            eg_test,
         );
         channel.feedback_sample = op1_prev;
 
@@ -1286,6 +1296,7 @@ impl Ym2612 {
             lfo_am,
             channel.ams,
             eg_tick,
+            eg_test,
         );
         if let Some(destination) = connect3 {
             Self::route_algorithm_bus(
@@ -1308,6 +1319,7 @@ impl Ym2612 {
             lfo_am,
             channel.ams,
             eg_tick,
+            eg_test,
         );
         if let Some(destination) = connect2 {
             Self::route_algorithm_bus(
@@ -1330,6 +1342,7 @@ impl Ym2612 {
             lfo_am,
             channel.ams,
             eg_tick,
+            eg_test,
         );
         out_bus += o4;
 
@@ -1356,6 +1369,14 @@ impl Ym2612 {
         }
     }
 
+    /// YM2612 9-bit DAC quantization: truncate lower 5 bits of the 14-bit
+    /// accumulator value, simulating the real chip's DAC precision.
+    fn dac_9bit_quantize(sample: i32) -> i32 {
+        // Truncate toward zero: (sample / 32) * 32
+        // This matches the hardware's bit truncation behavior.
+        (sample >> 5) << 5
+    }
+
     /// Render one HW sample at the internal 53267 Hz rate.
     fn render_one_hw_sample(&mut self) -> (i16, i16) {
         let (lfo_am, lfo_pm_step, lfo_pm_sign) = self.advance_lfo_hw();
@@ -1366,6 +1387,7 @@ impl Ym2612 {
             self.csm_key_on_active = false;
         }
         let eg_counter = self.eg_counter;
+        let eg_test = (self.test_register & 0x01) != 0;
 
         let mut left_sum = 0i32;
         let mut right_sum = 0i32;
@@ -1388,6 +1410,7 @@ impl Ym2612 {
                 lfo_pm_sign,
                 channel3_special_mode && index == 2,
                 eg_tick,
+                eg_test,
             );
             if channel.pan_left {
                 left_sum += sample;
@@ -1416,40 +1439,34 @@ impl Ym2612 {
             }
         }
 
-        // Scale combined FM+DAC output (±8188 per carrier) to i16 range.
-        let left = ((left_sum as i64 * 18000) >> 13)
+        // YM2612 9-bit DAC: the accumulated sum is converted through a 9-bit
+        // (sign + 8 magnitude) DAC, truncating the lower 5 bits of the 14-bit value.
+        // This produces the characteristic quantization noise of real hardware.
+        let left_dac = Self::dac_9bit_quantize(left_sum);
+        let right_dac = Self::dac_9bit_quantize(right_sum);
+
+        // Scale quantized output to i16 range.
+        let left = ((left_dac as i64 * 18000) >> 13)
             .clamp(i16::MIN as i64, i16::MAX as i64) as i16;
-        let right = ((right_sum as i64 * 18000) >> 13)
+        let right = ((right_dac as i64 * 18000) >> 13)
             .clamp(i16::MIN as i64, i16::MAX as i64) as i16;
         (left, right)
     }
 
     /// Produce one output sample at the requested sample rate by running the
-    /// internal HW clock at 53267 Hz and averaging (box-filter downsampling).
+    /// internal HW clock at 53267 Hz (zero-order hold downsampling).
+    /// Uses the most recent HW sample, avoiding box-filter averaging artifacts
+    /// from variable sample counts (1 or 2 HW samples per output sample).
     fn next_sample_stereo(&mut self, sample_rate_hz: u32) -> (i16, i16) {
         let hw_rate = YM_HW_RATE as u32;
         self.hw_sample_frac += hw_rate;
-        let mut left_acc = 0i64;
-        let mut right_acc = 0i64;
-        let mut hw_count = 0u32;
 
         while self.hw_sample_frac >= sample_rate_hz {
             self.hw_sample_frac -= sample_rate_hz;
-            let (l, r) = self.render_one_hw_sample();
-            left_acc += l as i64;
-            right_acc += r as i64;
-            hw_count += 1;
+            self.last_hw_output = self.render_one_hw_sample();
         }
 
-        if hw_count == 0 {
-            return self.last_hw_output;
-        }
-        let result = (
-            (left_acc / hw_count as i64) as i16,
-            (right_acc / hw_count as i64) as i16,
-        );
-        self.last_hw_output = result;
-        result
+        self.last_hw_output
     }
 
     fn step_z80_cycles(&mut self, cycles: u32) {
