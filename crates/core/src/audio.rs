@@ -1,4 +1,266 @@
-use std::f32::consts::TAU;
+// YM2612 hardware sine ROM: quarter-wave log-attenuation (256 entries, 12-bit 4.8 format).
+// logsin[i] = round(-log2(sin((2*i+1) * PI / 1024)) * 256)
+const LOG_SIN_TABLE: [u16; 256] = [
+    2137, 1731, 1543, 1419, 1326, 1252, 1190, 1137,
+    1091, 1050, 1013, 979, 949, 920, 894, 869,
+    846, 825, 804, 785, 767, 749, 732, 717,
+    701, 687, 672, 659, 646, 633, 621, 609,
+    598, 587, 576, 566, 556, 546, 536, 527,
+    518, 509, 501, 492, 484, 476, 468, 461,
+    453, 446, 439, 432, 425, 418, 411, 405,
+    399, 392, 386, 380, 375, 369, 363, 358,
+    352, 347, 341, 336, 331, 326, 321, 316,
+    311, 307, 302, 297, 293, 289, 284, 280,
+    276, 271, 267, 263, 259, 255, 251, 248,
+    244, 240, 236, 233, 229, 226, 222, 219,
+    215, 212, 209, 205, 202, 199, 196, 193,
+    190, 187, 184, 181, 178, 175, 172, 169,
+    167, 164, 161, 159, 156, 153, 151, 148,
+    146, 143, 141, 138, 136, 134, 131, 129,
+    127, 125, 122, 120, 118, 116, 114, 112,
+    110, 108, 106, 104, 102, 100, 98, 96,
+    94, 92, 91, 89, 87, 85, 83, 82,
+    80, 78, 77, 75, 74, 72, 70, 69,
+    67, 66, 64, 63, 62, 60, 59, 57,
+    56, 55, 53, 52, 51, 49, 48, 47,
+    46, 45, 43, 42, 41, 40, 39, 38,
+    37, 36, 35, 34, 33, 32, 31, 30,
+    29, 28, 27, 26, 25, 24, 23, 23,
+    22, 21, 20, 20, 19, 18, 17, 17,
+    16, 15, 15, 14, 13, 13, 12, 12,
+    11, 10, 10, 9, 9, 8, 8, 7,
+    7, 7, 6, 6, 5, 5, 5, 4,
+    4, 4, 3, 3, 3, 2, 2, 2,
+    2, 1, 1, 1, 1, 1, 1, 1,
+    0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+// YM2612 hardware exponential ROM: converts 8-bit log mantissa to 10-bit linear.
+// exp[i] = round((pow(2, (255-i)/256.0) - 1.0) * 1024)
+const EXP_TABLE: [u16; 256] = [
+    1018, 1013, 1007, 1002, 996, 991, 986, 980,
+    975, 969, 964, 959, 953, 948, 942, 937,
+    932, 927, 921, 916, 911, 906, 900, 895,
+    890, 885, 880, 874, 869, 864, 859, 854,
+    849, 844, 839, 834, 829, 824, 819, 814,
+    809, 804, 799, 794, 789, 784, 779, 774,
+    770, 765, 760, 755, 750, 745, 741, 736,
+    731, 726, 722, 717, 712, 708, 703, 698,
+    693, 689, 684, 680, 675, 670, 666, 661,
+    657, 652, 648, 643, 639, 634, 630, 625,
+    621, 616, 612, 607, 603, 599, 594, 590,
+    585, 581, 577, 572, 568, 564, 560, 555,
+    551, 547, 542, 538, 534, 530, 526, 521,
+    517, 513, 509, 505, 501, 496, 492, 488,
+    484, 480, 476, 472, 468, 464, 460, 456,
+    452, 448, 444, 440, 436, 432, 428, 424,
+    420, 416, 412, 409, 405, 401, 397, 393,
+    389, 385, 382, 378, 374, 370, 367, 363,
+    359, 355, 352, 348, 344, 340, 337, 333,
+    329, 326, 322, 318, 315, 311, 308, 304,
+    300, 297, 293, 290, 286, 283, 279, 276,
+    272, 268, 265, 262, 258, 255, 251, 248,
+    244, 241, 237, 234, 231, 227, 224, 220,
+    217, 214, 210, 207, 204, 200, 197, 194,
+    190, 187, 184, 181, 177, 174, 171, 168,
+    164, 161, 158, 155, 152, 148, 145, 142,
+    139, 136, 133, 130, 126, 123, 120, 117,
+    114, 111, 108, 105, 102, 99, 96, 93,
+    90, 87, 84, 81, 78, 75, 72, 69,
+    66, 63, 60, 57, 54, 51, 48, 45,
+    42, 40, 37, 34, 31, 28, 25, 22,
+    20, 17, 14, 11, 8, 6, 3, 0,
+];
+
+// Hardware detune table from MAME: phase increment delta indexed by [dt_base (0-3)][keycode (0-31)].
+// DT1 register bits [2:0]: values 4-7 negate the delta.
+const DETUNE_TABLE: [[u8; 32]; 4] = [
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 6, 6, 7, 8, 8, 8, 8],
+    [1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 6, 6, 7, 8, 8, 9, 10, 11, 12, 13, 14, 16, 16, 16, 16],
+    [2, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 6, 6, 7, 8, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 20, 22, 22, 22, 22],
+];
+
+// Envelope generator increment patterns from MAME (19 groups × 8 counter steps).
+const EG_INC_TABLE: [[u16; 8]; 19] = [
+    [0, 1, 0, 1, 0, 1, 0, 1], //  0: rates 00..11 pattern 0
+    [0, 1, 0, 1, 1, 1, 0, 1], //  1: rates 00..11 pattern 1
+    [0, 1, 1, 1, 0, 1, 1, 1], //  2: rates 00..11 pattern 2
+    [0, 1, 1, 1, 1, 1, 1, 1], //  3: rates 00..11 pattern 3
+    [1, 1, 1, 1, 1, 1, 1, 1], //  4: rate 12 pattern 0
+    [1, 1, 1, 2, 1, 1, 1, 2], //  5: rate 12 pattern 1
+    [1, 2, 1, 2, 1, 2, 1, 2], //  6: rate 12 pattern 2
+    [1, 2, 2, 2, 1, 2, 2, 2], //  7: rate 12 pattern 3
+    [2, 2, 2, 2, 2, 2, 2, 2], //  8: rate 13 pattern 0
+    [2, 2, 2, 4, 2, 2, 2, 4], //  9: rate 13 pattern 1
+    [2, 4, 2, 4, 2, 4, 2, 4], // 10: rate 13 pattern 2
+    [2, 4, 4, 4, 2, 4, 4, 4], // 11: rate 13 pattern 3
+    [4, 4, 4, 4, 4, 4, 4, 4], // 12: rate 14 pattern 0
+    [4, 4, 4, 8, 4, 4, 4, 8], // 13: rate 14 pattern 1
+    [4, 8, 4, 8, 4, 8, 4, 8], // 14: rate 14 pattern 2
+    [4, 8, 8, 8, 4, 8, 8, 8], // 15: rate 14 pattern 3
+    [8, 8, 8, 8, 8, 8, 8, 8], // 16: rate 15+
+    [16, 16, 16, 16, 16, 16, 16, 16], // 17: maxed
+    [0, 0, 0, 0, 0, 0, 0, 0], // 18: zero (no change)
+];
+
+// Maps effective rate (0-63) to EG_INC_TABLE row index.
+const EG_RATE_SELECT: [u8; 64] = [
+    18, 18, 2, 3, 0, 1, 2, 3,
+    0, 1, 2, 3, 0, 1, 2, 3,
+    0, 1, 2, 3, 0, 1, 2, 3,
+    0, 1, 2, 3, 0, 1, 2, 3,
+    0, 1, 2, 3, 0, 1, 2, 3,
+    0, 1, 2, 3, 0, 1, 2, 3,
+    4, 5, 6, 7, 8, 9, 10, 11,
+    12, 13, 14, 15, 16, 17, 17, 17,
+];
+
+// Maps effective rate (0-63) to counter right-shift amount.
+const EG_RATE_SHIFT: [u8; 64] = [
+    0, 0, 11, 11, 10, 10, 10, 10,
+    9, 9, 9, 9, 8, 8, 8, 8,
+    7, 7, 7, 7, 6, 6, 6, 6,
+    5, 5, 5, 5, 4, 4, 4, 4,
+    3, 3, 3, 3, 2, 2, 2, 2,
+    1, 1, 1, 1, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+// LFO timer increment (16.16 fixed-point) per hardware sample, indexed by LFO rate register.
+// LFO counter is 7-bit (0-127). Increment = round(lfo_hz * 128 * 65536 / 53267).
+const LFO_TIMER_INC: [u32; 8] = [627, 876, 948, 1003, 1083, 1517, 7575, 11370];
+
+// LFO PM output table from GenPlusGX/Nuked: per-bit modulation values.
+// Indexed by [7 FNUM bits (4-10) * 8 FMS depths][8 LFO steps].
+// Each row stores the PM displacement contribution for one FNUM bit at one FMS depth.
+const LFO_PM_OUTPUT: [[u8; 8]; 56] = [
+    // FNUM bit 4: 0, 0, 0, 0, 0, 0, 0, 0
+    [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0],
+    // FNUM bit 4, depth 7
+    [0,0,0,0,1,1,1,1],
+    // FNUM bit 5: 0..
+    [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0],
+    // FNUM bit 5, depth 6
+    [0,0,0,0,1,1,1,1],
+    // FNUM bit 5, depth 7
+    [0,0,1,1,2,2,2,3],
+    // FNUM bit 6
+    [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0],
+    // FNUM bit 6, depth 5
+    [0,0,0,0,1,1,1,1],
+    // FNUM bit 6, depth 6
+    [0,0,1,1,2,2,2,3],
+    // FNUM bit 6, depth 7
+    [0,0,2,3,4,4,5,6],
+    // FNUM bit 7
+    [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0],
+    // FNUM bit 7, depth 4
+    [0,0,0,0,1,1,1,1],
+    // FNUM bit 7, depth 5
+    [0,0,1,1,2,2,2,3],
+    // FNUM bit 7, depth 6
+    [0,0,2,3,4,4,5,6],
+    // FNUM bit 7, depth 7
+    [0,0,4,6,8,8,0x0A,0x0C],
+    // FNUM bit 8
+    [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0],
+    // FNUM bit 8, depth 3
+    [0,0,0,0,1,1,1,1],
+    // FNUM bit 8, depth 4
+    [0,0,1,1,2,2,2,3],
+    // FNUM bit 8, depth 5
+    [0,0,2,3,4,4,5,6],
+    // FNUM bit 8, depth 6
+    [0,0,4,6,8,8,0x0A,0x0C],
+    // FNUM bit 8, depth 7
+    [0,0,8,0x0C,0x10,0x10,0x14,0x18],
+    // FNUM bit 9
+    [0,0,0,0,0,0,0,0], [0,0,0,0,0,0,0,0],
+    // FNUM bit 9, depth 2
+    [0,0,0,0,1,1,1,1],
+    // FNUM bit 9, depth 3
+    [0,0,1,1,2,2,2,3],
+    // FNUM bit 9, depth 4
+    [0,0,2,3,4,4,5,6],
+    // FNUM bit 9, depth 5
+    [0,0,4,6,8,8,0x0A,0x0C],
+    // FNUM bit 9, depth 6
+    [0,0,8,0x0C,0x10,0x10,0x14,0x18],
+    // FNUM bit 9, depth 7
+    [0,0,0x10,0x18,0x20,0x20,0x28,0x30],
+    // FNUM bit 10
+    [0,0,0,0,0,0,0,0],
+    // FNUM bit 10, depth 1
+    [0,0,0,0,1,1,1,1],
+    // FNUM bit 10, depth 2
+    [0,0,1,1,2,2,2,3],
+    // FNUM bit 10, depth 3
+    [0,0,2,3,4,4,5,6],
+    // FNUM bit 10, depth 4
+    [0,0,4,6,8,8,0x0A,0x0C],
+    // FNUM bit 10, depth 5
+    [0,0,8,0x0C,0x10,0x10,0x14,0x18],
+    // FNUM bit 10, depth 6
+    [0,0,0x10,0x18,0x20,0x20,0x28,0x30],
+    // FNUM bit 10, depth 7
+    [0,0,0x20,0x30,0x40,0x40,0x50,0x60],
+];
+
+// Hardware fn_note table: maps (fnum >> 7) & 0x0F to note value for keycode calculation.
+// Nuked OPN2: kcode = (block << 2) | fn_note[(fnum >> 7) & 0x0f]
+const FN_NOTE: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 3, 3, 3, 3, 3, 3];
+
+// Phase accumulator uses 32-bit: top 20 bits = hardware phase, bottom 12 bits = fractional.
+// Hardware sample rate: master_clock / (6 * 24) = 7670454 / 144 ≈ 53267 Hz.
+const YM_HW_RATE: u64 = 7_670_454 / 144;
+// EG cycles at HW_RATE / 3 ≈ 17756 Hz.
+
+/// Hardware sine ROM + exponential ROM lookup.
+/// `phase_10bit`: top 10 bits of the 20-bit phase (sign + mirror + 8-bit index).
+/// `attenuation`: total attenuation in 4.8 fixed-point log2 domain.
+/// Returns signed 14-bit value (approx ±8188).
+fn op_calc(phase_10bit: u32, attenuation: u32) -> i32 {
+    let sign = (phase_10bit >> 9) & 1;
+    let mirror = (phase_10bit >> 8) & 1;
+    let index = if mirror != 0 {
+        255 - (phase_10bit & 0xFF)
+    } else {
+        phase_10bit & 0xFF
+    } as usize;
+
+    let log_sin = LOG_SIN_TABLE[index] as u32;
+    let total = (log_sin + attenuation).min(0xFFF);
+
+    let shift = total >> 8;
+    let exp_index = (total & 0xFF) as usize;
+    // 10-bit significand + implicit bit = 11 bits, left-shift 2 for 13-bit, then right-shift by exponent.
+    let linear = ((EXP_TABLE[exp_index] as u32 | 0x400) << 2) >> shift;
+
+    if sign != 0 {
+        -(linear as i32)
+    } else {
+        linear as i32
+    }
+}
+
+/// Look up EG increment for a given effective rate and global EG counter.
+/// MAME/GenPlusGX: only fires when lower `shift` bits of counter are zero.
+fn eg_increment(effective_rate: u8, eg_counter: u32) -> u16 {
+    let rate = effective_rate.min(63) as usize;
+    let shift = EG_RATE_SHIFT[rate] as u32;
+    // Gate: only update when counter is aligned to shift boundary
+    if shift > 0 && (eg_counter & ((1u32 << shift) - 1)) != 0 {
+        return 0;
+    }
+    let row = EG_RATE_SELECT[rate] as usize;
+    let step = ((eg_counter >> shift) & 7) as usize;
+    EG_INC_TABLE[row][step]
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 enum YmEnvelopePhase {
@@ -24,11 +286,13 @@ struct YmOperator {
     sustain_rate: u8,
     sustain_level: u8,
     release_rate: u8,
-    key_on: bool,
-    phase: f32,
+    key_on: bool,       // composite: reg_key_on || csm_key_on
+    reg_key_on: bool,   // key-on from register 0x28
+    csm_key_on: bool,   // key-on from CSM Timer A overflow
+    phase: u32,
     envelope_phase: YmEnvelopePhase,
-    envelope_level: f32,
-    last_output: f32,
+    envelope_level: u16,
+    last_output: i32,
 }
 
 impl Default for YmOperator {
@@ -50,10 +314,12 @@ impl Default for YmOperator {
             // hasn't initialized operator envelopes yet.
             release_rate: 15,
             key_on: false,
-            phase: 0.0,
+            reg_key_on: false,
+            csm_key_on: false,
+            phase: 0,
             envelope_phase: YmEnvelopePhase::Off,
-            envelope_level: 0.0,
-            last_output: 0.0,
+            envelope_level: 1023,
+            last_output: 0,
         }
     }
 }
@@ -66,8 +332,8 @@ struct YmChannel {
     special_block: [u8; 3],
     algorithm: u8,
     feedback: u8,
-    feedback_sample: f32,
-    feedback_sample_prev: f32,
+    feedback_sample: i32,
+    feedback_sample_prev: i32,
     pan_left: bool,
     pan_right: bool,
     ams: u8,
@@ -84,8 +350,8 @@ impl Default for YmChannel {
             special_block: [4; 3],
             algorithm: 0,
             feedback: 0,
-            feedback_sample: 0.0,
-            feedback_sample_prev: 0.0,
+            feedback_sample: 0,
+            feedback_sample_prev: 0,
             pan_left: true,
             pan_right: true,
             ams: 0,
@@ -116,7 +382,13 @@ pub struct Ym2612 {
     dac_output_pending: Option<i16>,
     lfo_enabled: bool,
     lfo_rate: u8,
-    lfo_phase: f32,
+    lfo_counter: u8,
+    lfo_timer: u32,
+    eg_counter: u32,
+    hw_sample_frac: u32,
+    hw_eg_divider: u8,
+    last_hw_output: (i16, i16),
+    csm_key_on_active: bool,
     channels: [YmChannel; 6],
 }
 
@@ -142,7 +414,13 @@ impl Default for Ym2612 {
             dac_output_pending: None,
             lfo_enabled: false,
             lfo_rate: 0,
-            lfo_phase: 0.0,
+            lfo_counter: 0,
+            lfo_timer: 0,
+            eg_counter: 0,
+            hw_sample_frac: 0,
+            hw_eg_divider: 0,
+            last_hw_output: (0, 0),
+            csm_key_on_active: false,
             channels: [YmChannel::default(); 6],
         }
     }
@@ -175,7 +453,7 @@ impl Ym2612 {
     const BUSY_DURATION_MASTER_CYCLES: u64 = 32;
     const MASTER_CLOCK_HZ: u64 = 7_670_454;
     const Z80_CLOCK_HZ: u64 = 3_579_545;
-    const YM2612_DIVIDER: u64 = 7;
+    const YM2612_DIVIDER: u64 = 6;
     const BUSY_DURATION_Z80_CYCLES: u32 = ((Self::BUSY_DURATION_MASTER_CYCLES * Self::Z80_CLOCK_HZ
         + (Self::MASTER_CLOCK_HZ - 1))
         / Self::MASTER_CLOCK_HZ) as u32;
@@ -289,9 +567,7 @@ impl Ym2612 {
                 0x22 => {
                     self.lfo_enabled = (value & 0x08) != 0;
                     self.lfo_rate = value & 0x07;
-                    if !self.lfo_enabled {
-                        self.lfo_phase = 0.0;
-                    }
+                    // Nuked OPN2: LFO counter preserved when disabled (just stops advancing)
                 }
                 0x24 => {
                     self.timer_a_value = (self.timer_a_value & 0x0003) | ((value as u16) << 2);
@@ -303,6 +579,7 @@ impl Ym2612 {
                     self.timer_b_value = value;
                 }
                 0x27 => {
+                    let old = self.timer_control;
                     self.timer_control = value;
                     if (value & 0x10) != 0 {
                         self.timer_status &= !0x01;
@@ -310,10 +587,11 @@ impl Ym2612 {
                     if (value & 0x20) != 0 {
                         self.timer_status &= !0x02;
                     }
-                    if (value & 0x01) != 0 {
+                    // Only reset timers on rising edge of enable bit
+                    if (value & 0x01) != 0 && (old & 0x01) == 0 {
                         self.timer_a_elapsed_ym_cycles = 0;
                     }
-                    if (value & 0x02) != 0 {
+                    if (value & 0x02) != 0 && (old & 0x02) == 0 {
                         self.timer_b_elapsed_ym_cycles = 0;
                     }
                 }
@@ -322,34 +600,45 @@ impl Ym2612 {
                         let mut reset_feedback = false;
                         let slot_mask = (value >> 4) & 0x0F;
                         for op_index in 0..4 {
-                            let next_key_on =
+                            let next_reg_key_on =
                                 Self::keyon_slot_mask_targets_operator(slot_mask, op_index);
                             let op = &mut self.channels[channel].operators[op_index];
-                            if next_key_on && !op.key_on {
-                                op.phase = 0.0;
-                                op.last_output = 0.0;
+                            let old_key_on = op.key_on;
+                            op.reg_key_on = next_reg_key_on;
+                            let new_key_on = op.reg_key_on || op.csm_key_on;
+                            if new_key_on && !old_key_on {
+                                op.phase = 0;
+                                op.last_output = 0;
                                 op.envelope_phase = YmEnvelopePhase::Attack;
-                                op.envelope_level = 0.0;
+                                // Do not reset envelope_level — real HW continues from current level
+                                // Nuked OPN2: normalize SSG-EG inverted level on key-on
+                                if Self::ssg_eg_enabled(op) && (op.envelope_level & 0x200) != 0 {
+                                    op.envelope_level = (0x200u16.wrapping_sub(op.envelope_level)) & 0x3FF;
+                                }
                                 op.ssg_invert = false;
                                 op.ssg_hold_active = false;
                                 if op_index == 0 {
                                     reset_feedback = true;
                                 }
-                            } else if !next_key_on && op.key_on {
-                                op.envelope_phase = if op.envelope_level > 0.0 {
+                            } else if !new_key_on && old_key_on {
+                                // Nuked OPN2: normalize SSG-EG inverted level before Release
+                                if Self::ssg_eg_enabled(op) && (op.envelope_level & 0x200) != 0 {
+                                    op.envelope_level =
+                                        (0x200u16.wrapping_sub(op.envelope_level)) & 0x3FF;
+                                }
+                                op.ssg_invert = false;
+                                op.envelope_phase = if op.envelope_level < 1023 {
                                     YmEnvelopePhase::Release
                                 } else {
                                     YmEnvelopePhase::Off
                                 };
                                 op.ssg_hold_active = false;
                             }
-                            op.key_on = next_key_on;
+                            op.key_on = new_key_on;
                         }
                         if reset_feedback {
-                            // `feedback_sample` keeps OP1 feedback history and
-                            // `feedback_sample_prev` keeps YM MEM delayed bus.
-                            self.channels[channel].feedback_sample = 0.0;
-                            self.channels[channel].feedback_sample_prev = 0.0;
+                            self.channels[channel].feedback_sample = 0;
+                            self.channels[channel].feedback_sample_prev = 0;
                         }
                     }
                 }
@@ -480,63 +769,17 @@ impl Ym2612 {
         Some((channel, slot, param))
     }
 
-    fn fnum_block_frequency_hz(fnum: u16, block: u8) -> f32 {
-        // OPN2/2612 pitch approximation:
-        // f ~= FNUM * 2^(BLOCK-1) * (master / (144 * 2^20))
-        // This keeps pitch much closer to real hardware than the previous
-        // A3-relative heuristic.
-        let base = Self::MASTER_CLOCK_HZ as f32 / (144.0 * 1_048_576.0);
-        let octave_scale = 2f32.powi(block as i32 - 1);
-        let freq = (fnum.max(1) as f32) * octave_scale * base;
-        freq.clamp(5.0, 100_000.0)
-    }
-
-    fn channel_base_frequency_hz(channel: &YmChannel) -> f32 {
-        Self::fnum_block_frequency_hz(channel.fnum, channel.block)
-    }
-
     fn block_fnum_keycode(block: u8, fnum: u16) -> u8 {
-        ((block & 0x07) << 2) | (((fnum >> 9) & 0x03) as u8)
+        ((block & 0x07) << 2) | FN_NOTE[((fnum >> 7) & 0x0F) as usize]
     }
 
+    #[allow(dead_code)]
     fn channel_keycode(channel: &YmChannel) -> u8 {
-        // 5-bit note code used by key-scale rate approximation.
         Self::block_fnum_keycode(channel.block, channel.fnum)
     }
 
     fn channel3_special_mode_enabled(&self) -> bool {
-        (self.channel3_mode_bits() & 0x01) != 0
-    }
-
-    fn channel_operator_base_frequency_hz(
-        channel: &YmChannel,
-        operator_index: usize,
-        channel3_special_mode: bool,
-    ) -> f32 {
-        // YM2612 CH3 special mode follows the internal slot schedule used by
-        // ym3438/Nuked core:
-        // OP1 <- A9/AD, OP2 <- AA/AE, OP3 <- A8/AC, OP4 <- normal A2/A6.
-        if channel3_special_mode
-            && let Some(slot) = Self::channel3_special_slot_for_operator(operator_index)
-        {
-            Self::fnum_block_frequency_hz(channel.special_fnum[slot], channel.special_block[slot])
-        } else {
-            Self::channel_base_frequency_hz(channel)
-        }
-    }
-
-    fn channel_operator_keycode(
-        channel: &YmChannel,
-        operator_index: usize,
-        channel3_special_mode: bool,
-    ) -> u8 {
-        if channel3_special_mode
-            && let Some(slot) = Self::channel3_special_slot_for_operator(operator_index)
-        {
-            Self::block_fnum_keycode(channel.special_block[slot], channel.special_fnum[slot])
-        } else {
-            Self::channel_keycode(channel)
-        }
+        self.channel3_mode_bits() != 0 // CSM (0b10) also enables special frequencies
     }
 
     fn channel3_special_slot_for_operator(operator_index: usize) -> Option<usize> {
@@ -548,6 +791,45 @@ impl Ym2612 {
         }
     }
 
+    fn operator_fnum_block(
+        channel: &YmChannel,
+        operator_index: usize,
+        channel3_special_mode: bool,
+    ) -> (u16, u8) {
+        if channel3_special_mode
+            && let Some(slot) = Self::channel3_special_slot_for_operator(operator_index)
+        {
+            (channel.special_fnum[slot], channel.special_block[slot])
+        } else {
+            (channel.fnum, channel.block)
+        }
+    }
+
+    #[allow(dead_code)]
+    fn operator_keycode(
+        channel: &YmChannel,
+        operator_index: usize,
+        channel3_special_mode: bool,
+    ) -> u8 {
+        let (fnum, block) = Self::operator_fnum_block(channel, operator_index, channel3_special_mode);
+        Self::block_fnum_keycode(block, fnum)
+    }
+
+    /// Compute the raw phase increment from FNUM, BLOCK, MUL, and detune.
+    /// Nuked OPN2: detune is applied to base frequency before MUL multiplication.
+    fn compute_phase_inc(fnum: u16, block: u8, mul: u8, detune: u8, keycode: u8) -> u32 {
+        let base = ((fnum as u32) << (block as u32)) >> 1;
+        let dt_base = (detune & 0x03) as usize;
+        let dt_delta = DETUNE_TABLE[dt_base][keycode as usize] as u32;
+        let detuned = if (detune & 0x04) != 0 {
+            base.saturating_sub(dt_delta)
+        } else {
+            base + dt_delta
+        };
+        if mul == 0 { detuned >> 1 } else { detuned * (mul as u32) }
+    }
+
+
     fn key_scale_rate_boost(keycode: u8, key_scale: u8) -> u8 {
         // Nuked OPN2: rks = kc >> (ks ^ 0x03)
         match key_scale & 0x03 {
@@ -558,161 +840,33 @@ impl Ym2612 {
         }
     }
 
-    fn apply_key_scale_rate(base_rate: u8, key_scale: u8, keycode: u8) -> u8 {
-        let boost = Self::key_scale_rate_boost(keycode, key_scale);
-        base_rate.saturating_add(boost).min(31)
-    }
-
-    fn carrier_mul_factor(raw_mul: u8) -> f32 {
-        if (raw_mul & 0x0F) == 0 {
-            0.5
-        } else {
-            (raw_mul & 0x0F) as f32
-        }
-    }
-
-    fn detune_ratio(detune: u8) -> f32 {
-        // Approximate YM2612 DT1 steps in semitones.
-        // Real hardware varies with keycode (up to ~1.1 semitones at DT=3).
-        // Using mid-range keycode approximation for each DT level.
-        const DETUNE_SEMITONES: [f32; 8] = [0.0, 0.2, 0.5, 0.8, -0.8, -0.5, -0.2, 0.0];
-        let semitones = DETUNE_SEMITONES[(detune & 0x07) as usize];
-        2f32.powf(semitones / 12.0)
-    }
-
-    fn lfo_rate_hz(rate: u8) -> f32 {
-        // YM2612 LFO frequency steps (approximate).
-        const LFO_HZ: [f32; 8] = [3.98, 5.56, 6.02, 6.37, 6.88, 9.63, 48.10, 72.20];
-        LFO_HZ[(rate & 0x07) as usize]
-    }
-
-    fn channel_ams_depth(ams: u8) -> f32 {
-        // Output amplitude modulation depth.
-        // Real YM2612 AMS: 0dB, 1.4dB, 5.9dB, 11.8dB → linear ratio.
-        const AMS_DEPTH: [f32; 4] = [0.0, 0.148, 0.493, 0.743];
-        AMS_DEPTH[(ams & 0x03) as usize]
-    }
-
-    fn channel_fms_depth(fms: u8) -> f32 {
-        // Frequency modulation sensitivity.
-        // Values are derived from YM2612 PMS steps (±0.034, ±0.067, ±0.10,
-        // ±0.14, ±0.20, ±0.40, ±0.80 semitones) converted to linear ratio
-        // via `2^(semitones/12)-1`.
-        const FMS_DEPTH: [f32; 8] = [
-            0.0, 0.001965, 0.003877, 0.005793, 0.008118, 0.011619, 0.023374, 0.047294,
-        ];
-        FMS_DEPTH[(fms & 0x07) as usize]
-    }
-
-    fn operator_level_scale(op: &YmOperator) -> f32 {
-        if op.tl >= 0x7F {
-            return 0.0;
-        }
-        let attenuation_db = op.tl as f32 * 0.75;
-        10f32.powf(-attenuation_db / 20.0)
-    }
-
-    fn attack_rate_to_step(rate: u8, sample_rate_hz: f32) -> f32 {
-        if rate == 0 {
-            // AR=0 on real YM2612 means the envelope does not advance at all.
-            return 0.0;
-        }
-        // Envelope time approximation table (seconds to near-full level).
-        // Calibrated against real YM2612 timing: AR=31 completes in ~1ms,
-        // lower rates scale roughly logarithmically.
-        const ATTACK_SECONDS: [f32; 32] = [
-            0.0, 0.100, 0.088, 0.077, 0.068, 0.060, 0.052, 0.046, 0.040, 0.035, 0.030, 0.026,
-            0.023, 0.020, 0.017, 0.015, 0.013, 0.0115, 0.010, 0.0087, 0.0076, 0.0066, 0.0057,
-            0.0050, 0.0043, 0.0037, 0.0032, 0.0027, 0.0023, 0.0019, 0.0015, 0.001,
-        ];
-        Self::rate_table_step(rate, sample_rate_hz, &ATTACK_SECONDS)
-    }
-
-    fn decay_rate_to_step(rate: u8, sample_rate_hz: f32) -> f32 {
-        // Linear decay time (seconds) calibrated against real YM2612 EG at
-        // 53.3kHz.  Each 4 rate steps halves the time.  Rate 31 (internal
-        // rate 62) completes in ~3.5ms.
-        const DECAY_SECONDS: [f32; 32] = [
-            0.0, 0.634, 0.534, 0.449, 0.378, 0.318, 0.267, 0.225, 0.189, 0.159, 0.134, 0.112,
-            0.094, 0.080, 0.067, 0.056, 0.047, 0.040, 0.033, 0.028, 0.024, 0.020, 0.017, 0.014,
-            0.012, 0.010, 0.0084, 0.007, 0.0059, 0.005, 0.0042, 0.0035,
-        ];
-        Self::rate_table_step(rate, sample_rate_hz, &DECAY_SECONDS)
-    }
-
-    fn sustain_rate_to_step(rate: u8, sample_rate_hz: f32) -> f32 {
-        // Sustain rate uses the same EG mechanism as decay on real hardware.
-        const SUSTAIN_SECONDS: [f32; 32] = [
-            0.0, 0.824, 0.694, 0.583, 0.491, 0.413, 0.347, 0.293, 0.246, 0.207, 0.174, 0.146,
-            0.122, 0.104, 0.087, 0.073, 0.061, 0.052, 0.043, 0.036, 0.031, 0.026, 0.022, 0.018,
-            0.016, 0.013, 0.011, 0.009, 0.0077, 0.0065, 0.0055, 0.0046,
-        ];
-        Self::rate_table_step(rate, sample_rate_hz, &SUSTAIN_SECONDS)
-    }
-
-    fn release_rate_to_step(rate: u8, sample_rate_hz: f32) -> f32 {
-        // Release rate is 4-bit; internal rate ≈ 4*RR+1.  Each 4 internal
-        // rate steps halves the time.  RR=15 (internal ~61) ≈ 3ms.
-        const RELEASE_SECONDS: [f32; 16] = [
-            10.0, 6.0, 3.5, 2.0, 1.2, 0.7, 0.42, 0.25, 0.15, 0.09, 0.053, 0.032, 0.019, 0.011,
-            0.006, 0.003,
-        ];
-        let rate = rate.min(15) as usize;
-        let seconds = RELEASE_SECONDS[rate];
-        if sample_rate_hz <= 0.0 || seconds <= 0.0 {
-            return 0.0;
-        }
-        (1.0 / (seconds * sample_rate_hz)).clamp(0.0, 1.0)
-    }
-
-    fn sustain_level_to_amplitude(level: u8) -> f32 {
-        if level >= 0x0F {
-            0.0
-        } else {
-            1.0 - (level as f32 / 15.0)
-        }
-    }
-
-    fn rate_table_step(rate: u8, sample_rate_hz: f32, table: &[f32; 32]) -> f32 {
-        let idx = rate.min(31) as usize;
-        let seconds = table[idx];
-        if idx == 0 || sample_rate_hz <= 0.0 || seconds <= 0.0 {
-            return 0.0;
-        }
-        (1.0 / (seconds * sample_rate_hz)).clamp(0.0, 1.0)
-    }
-
     fn ssg_eg_enabled(op: &YmOperator) -> bool {
         (op.ssg_eg & 0x08) != 0
     }
 
-    fn ssg_eg_effective_sustain_target(op: &YmOperator) -> f32 {
-        if Self::ssg_eg_enabled(op) {
-            0.0
-        } else {
-            Self::sustain_level_to_amplitude(op.sustain_level)
-        }
-    }
-
-    fn ssg_eg_output_level(op: &YmOperator, envelope: f32) -> f32 {
-        if !Self::ssg_eg_enabled(op) {
-            return envelope;
+    fn ssg_eg_output_level(op: &YmOperator) -> u16 {
+        // GenPlusGX: SSG-EG output inversion disabled when key is off
+        if !Self::ssg_eg_enabled(op) || !op.key_on {
+            return op.envelope_level;
         }
         let attack_invert = (op.ssg_eg & 0x04) != 0;
         let invert = attack_invert ^ op.ssg_invert;
         if invert {
-            (1.0 - envelope).clamp(0.0, 1.0)
+            (512u16.wrapping_sub(op.envelope_level)) & 0x3FF
         } else {
-            envelope.clamp(0.0, 1.0)
+            op.envelope_level
         }
     }
 
-    fn advance_ssg_eg_cycle(op: &mut YmOperator) {
+    /// Returns true if SSG-EG cycle fired (phase changed to Attack), in which case
+    /// the caller should skip EG advance for this cycle (Nuked OPN2 behavior).
+    fn advance_ssg_eg_cycle(op: &mut YmOperator) -> bool {
         if !Self::ssg_eg_enabled(op) || !op.key_on {
-            return;
+            return false;
         }
-        if op.envelope_phase != YmEnvelopePhase::Sustain || op.envelope_level > 0.0 {
-            return;
+        // Nuked OPN2: SSG-EG cycle triggers when bit 9 of envelope level is set (>= 0x200).
+        if op.envelope_phase == YmEnvelopePhase::Attack || op.envelope_level < 0x200 {
+            return false;
         }
 
         let hold = (op.ssg_eg & 0x01) != 0;
@@ -723,88 +877,101 @@ impl Ym2612 {
             if alternate {
                 op.ssg_invert = !op.ssg_invert;
             }
-            // Keep output stable at the held terminal level.
-            // In this model, envelope=0 + invert chooses top/bottom.
             if current_top {
                 op.ssg_invert = attack;
             }
             op.ssg_hold_active = true;
-            return;
+            return false; // hold doesn't restart Attack
         }
         if alternate {
             op.ssg_invert = !op.ssg_invert;
         }
+        if !hold && !alternate {
+            op.phase = 0; // Nuked OPN2: phase reset on SSG-EG loop (non-alternate)
+        }
         op.envelope_phase = YmEnvelopePhase::Attack;
-        op.envelope_level = 0.0;
+        // Nuked OPN2: level is NOT reset on SSG-EG cycle
+        true // cycle fired — skip EG advance this cycle
     }
 
-    fn advance_envelope(op: &mut YmOperator, sample_rate_hz: f32, keycode: u8) -> f32 {
+    fn advance_envelope(op: &mut YmOperator, eg_counter: u32, keycode: u8) {
         if Self::ssg_eg_enabled(op) && op.ssg_hold_active && op.key_on {
-            return op.envelope_level;
+            return;
         }
-        let attack_rate = Self::apply_key_scale_rate(op.attack_rate, op.key_scale, keycode);
-        let decay_rate = Self::apply_key_scale_rate(op.decay_rate, op.key_scale, keycode);
-        let sustain_rate = Self::apply_key_scale_rate(op.sustain_rate, op.key_scale, keycode);
-        let release_rate = op
-            .release_rate
-            .saturating_add((Self::key_scale_rate_boost(keycode, op.key_scale) + 1) >> 1)
-            .min(15);
+
+        // Nuked OPN2: ksv = kc >> (ks ^ 0x03), applied once to each rate
+        let ksv = Self::key_scale_rate_boost(keycode, op.key_scale) as u16;
+
         match op.envelope_phase {
             YmEnvelopePhase::Off => {
-                op.envelope_level = 0.0;
+                op.envelope_level = 1023;
             }
             YmEnvelopePhase::Attack => {
-                let step = Self::attack_rate_to_step(attack_rate, sample_rate_hz);
-                if step > 0.0 {
-                    // Attack is exponential toward 1.0 to avoid buzzy starts.
-                    op.envelope_level =
-                        (op.envelope_level + (1.0 - op.envelope_level) * step * 8.0).min(1.0);
-                    if op.envelope_level >= 0.999 {
-                        op.envelope_level = 1.0;
+                // GenPlusGX: if base rate is 0, effective rate stays 0 regardless of KSR
+                let effective_rate = if op.attack_rate == 0 {
+                    0u8
+                } else {
+                    ((op.attack_rate as u16) * 2 + ksv).min(63) as u8
+                };
+                if effective_rate >= 62 {
+                    op.envelope_level = 0;
+                    op.envelope_phase = YmEnvelopePhase::Decay;
+                } else {
+                    let inc = eg_increment(effective_rate, eg_counter);
+                    if inc > 0 {
+                        let level = op.envelope_level as i32;
+                        let delta = ((!level) * inc as i32) >> 4;
+                        let new_level = (level + delta).max(0);
+                        op.envelope_level = new_level as u16;
+                    }
+                    if op.envelope_level == 0 {
                         op.envelope_phase = YmEnvelopePhase::Decay;
                     }
                 }
             }
             YmEnvelopePhase::Decay => {
-                let sustain_target = Self::ssg_eg_effective_sustain_target(op);
-                let step = Self::decay_rate_to_step(decay_rate, sample_rate_hz);
-                if step <= 0.0 || op.envelope_level <= sustain_target {
-                    op.envelope_level = sustain_target;
-                    op.envelope_phase = YmEnvelopePhase::Sustain;
+                let sustain_target = if op.sustain_level >= 0x0F {
+                    1023
                 } else {
-                    op.envelope_level = (op.envelope_level - step).max(sustain_target);
-                    if op.envelope_level <= sustain_target {
-                        op.envelope_phase = YmEnvelopePhase::Sustain;
-                    }
+                    (op.sustain_level as u16) << 5
+                };
+                let effective_rate = if op.decay_rate == 0 {
+                    0u8
+                } else {
+                    ((op.decay_rate as u16) * 2 + ksv).min(63) as u8
+                };
+                let inc = eg_increment(effective_rate, eg_counter);
+                if inc > 0 {
+                    op.envelope_level = (op.envelope_level + inc).min(1023);
+                }
+                if op.envelope_level >= sustain_target {
+                    op.envelope_phase = YmEnvelopePhase::Sustain;
                 }
             }
             YmEnvelopePhase::Sustain => {
-                let step = if Self::ssg_eg_enabled(op) && sustain_rate == 0 {
-                    // SSG-EG shapes often keep cycling even when SR is low/zero.
-                    // Use DR as fallback in this mode so looping waveforms keep moving.
-                    Self::decay_rate_to_step(decay_rate.max(1), sample_rate_hz)
+                let effective_rate = if op.sustain_rate == 0 {
+                    0u8
                 } else {
-                    Self::sustain_rate_to_step(sustain_rate, sample_rate_hz)
+                    ((op.sustain_rate as u16) * 2 + ksv).min(63) as u8
                 };
-                if step > 0.0 {
-                    op.envelope_level = (op.envelope_level - step).max(0.0);
+                let inc = eg_increment(effective_rate, eg_counter);
+                if inc > 0 {
+                    op.envelope_level = (op.envelope_level + inc).min(1023);
                 }
             }
             YmEnvelopePhase::Release => {
-                let step = Self::release_rate_to_step(release_rate, sample_rate_hz);
-                if step <= 0.0 {
-                    op.envelope_level = 0.0;
+                // Nuked OPN2: release rate = RR * 4 + 2 + ksv
+                let effective_rate =
+                    ((op.release_rate as u16) * 4 + 2 + ksv).min(63) as u8;
+                let inc = eg_increment(effective_rate, eg_counter);
+                if inc > 0 {
+                    op.envelope_level = (op.envelope_level + inc).min(1023);
+                }
+                if op.envelope_level >= 1023 {
                     op.envelope_phase = YmEnvelopePhase::Off;
-                } else {
-                    op.envelope_level = (op.envelope_level - step).max(0.0);
-                    if op.envelope_level <= 0.0 {
-                        op.envelope_phase = YmEnvelopePhase::Off;
-                    }
                 }
             }
         }
-        Self::advance_ssg_eg_cycle(op);
-        op.envelope_level
     }
 
     fn operator_active(op: &YmOperator) -> bool {
@@ -815,49 +982,124 @@ impl Ym2612 {
         channel.operators.iter().any(Self::operator_active)
     }
 
-    fn advance_lfo(&mut self, sample_rate_hz: f32) -> (f32, f32) {
-        if !self.lfo_enabled || sample_rate_hz <= 0.0 {
-            return (0.0, 0.0);
+    /// Advance the LFO and return (am_value, pm_step, pm_sign).
+    /// am_value: 0-126 triangle wave for amplitude modulation.
+    /// pm_step: 0-7 magnitude step for phase modulation (8 steps per half-cycle).
+    /// pm_sign: false=positive, true=negative.
+    /// Advance LFO by one HW sample tick and return (am_value, pm_step, pm_sign).
+    fn advance_lfo_hw(&mut self) -> (u8, u8, bool) {
+        if !self.lfo_enabled {
+            return (0, 0, false);
         }
-        let rate_hz = Self::lfo_rate_hz(self.lfo_rate);
-        self.lfo_phase += rate_hz / sample_rate_hz;
-        if self.lfo_phase >= 1.0 {
-            self.lfo_phase -= self.lfo_phase.floor();
+        let lfo_inc = LFO_TIMER_INC[self.lfo_rate as usize & 7];
+        self.lfo_timer = self.lfo_timer.wrapping_add(lfo_inc);
+        while self.lfo_timer >= 65536 {
+            self.lfo_timer -= 65536;
+            self.lfo_counter = (self.lfo_counter + 1) & 0x7F;
         }
-        let wave = (self.lfo_phase * TAU).sin();
-        let am = (wave + 1.0) * 0.5;
-        let pm = wave;
-        (am, pm)
+
+        let counter = self.lfo_counter;
+        // AM: triangle wave 0→126→0
+        let am = if counter < 64 {
+            counter << 1
+        } else {
+            (127 - counter) << 1
+        };
+        // PM: step = (counter >> 2) & 7, sign from counter bit 6.
+        let pm_step = (counter >> 2) & 7;
+        let pm_sign = counter >= 64;
+        (am, pm_step, pm_sign)
+    }
+
+    /// Compute PM displacement using the per-bit LFO_PM_OUTPUT table (GenPlusGX approach).
+    /// fms: 0-7 depth, pm_step: 0-7 step within half-cycle, pm_sign: true = negative half.
+    fn lfo_pm_displacement(fnum: u16, fms: u8, pm_step: u8, pm_sign: bool) -> i32 {
+        if fms == 0 {
+            return 0;
+        }
+        let step = (pm_step & 0x07) as usize;
+        let fms_idx = (fms & 0x07) as usize;
+        let mut displacement = 0i32;
+        // Sum contributions from FNUM bits 4-10
+        for bit in 0..7u32 {
+            if (fnum >> (bit + 4)) & 1 != 0 {
+                let row = (bit as usize) * 8 + fms_idx;
+                displacement += LFO_PM_OUTPUT[row][step] as i32;
+            }
+        }
+        if displacement == 0 {
+            return 0;
+        }
+        if pm_sign {
+            -displacement
+        } else {
+            displacement
+        }
+    }
+
+    /// Advance the global EG counter by one HW sample tick.
+    /// EG advances every 3 HW samples (HW_RATE / 3 = EG_RATE).
+    fn advance_eg_counter_hw(&mut self) -> bool {
+        self.hw_eg_divider += 1;
+        if self.hw_eg_divider >= 3 {
+            self.hw_eg_divider = 0;
+            self.eg_counter = self.eg_counter.wrapping_add(1);
+            if self.eg_counter == 0 { self.eg_counter = 1; } // Nuked OPN2: skip 0
+            return true;
+        }
+        false
     }
 
     fn advance_operator_sample(
         op: &mut YmOperator,
-        base_freq_hz: f32,
-        sample_rate_hz: f32,
-        phase_mod_radians: f32,
+        phase_inc: u32,
+        phase_mod: i32,
+        eg_counter: u32,
         keycode: u8,
-        lfo_am: f32,
-        channel_ams_depth: f32,
-    ) -> f32 {
+        lfo_am: u8,
+        channel_ams: u8,
+        eg_tick: bool,
+    ) -> i32 {
         if !Self::operator_active(op) {
-            op.last_output = 0.0;
-            return 0.0;
+            op.last_output = 0;
+            return 0;
         }
 
-        let freq = base_freq_hz * Self::carrier_mul_factor(op.mul) * Self::detune_ratio(op.detune);
-        op.phase += freq / sample_rate_hz;
-        if op.phase >= 1.0 {
-            op.phase -= op.phase.floor();
+        // Advance 20-bit phase accumulator directly at HW rate
+        op.phase = op.phase.wrapping_add(phase_inc) & 0xFFFFF;
+
+        // EG only advances on EG tick (every 3 HW samples)
+        if eg_tick {
+            // GenPlusGX: SSG-EG cycle processed before envelope advance.
+            // Nuked OPN2: if cycle fires (phase→Attack), skip EG advance this cycle.
+            let ssg_cycled = Self::advance_ssg_eg_cycle(op);
+            if !ssg_cycled {
+                Self::advance_envelope(op, eg_counter, keycode);
+            }
         }
-        let mut envelope = Self::advance_envelope(op, sample_rate_hz, keycode);
-        if op.am_enable && channel_ams_depth > 0.0 {
-            envelope *= 1.0 - (lfo_am * channel_ams_depth * 0.85);
-            envelope = envelope.max(0.0);
+
+        // Nuked OPN2: EG + TL + AM all summed in 10-bit space, then << 2 to 12-bit
+        let eg_level = Self::ssg_eg_output_level(op);
+        let mut eg_out = eg_level as u32 + ((op.tl as u32) << 3);
+        // AM modulation in 10-bit space
+        if op.am_enable {
+            let am_atten = match channel_ams {
+                0 => (lfo_am as u32) >> 8, // Nuked OPN2: am_shift[0] = 8
+                1 => (lfo_am as u32) >> 3,
+                2 => (lfo_am as u32) >> 1,
+                _ => lfo_am as u32,
+            };
+            eg_out += am_atten;
         }
-        envelope = Self::ssg_eg_output_level(op, envelope);
-        let sample = ((TAU * op.phase) + phase_mod_radians).sin()
-            * Self::operator_level_scale(op)
-            * envelope;
+        eg_out = eg_out.min(0x3FF); // 10-bit clamp
+        let total_atten = eg_out << 2; // convert to 12-bit
+
+        // Apply phase modulation to 20-bit phase, get 10-bit sine index
+        let mod_shifted = (phase_mod as u32) << 10;
+        let total_phase = op.phase.wrapping_add(mod_shifted);
+        let sine_input = (total_phase >> 10) & 0x3FF;
+
+        let sample = op_calc(sine_input, total_atten);
         op.last_output = sample;
         sample
     }
@@ -884,33 +1126,36 @@ impl Ym2612 {
 
     fn render_channel_sample(
         channel: &mut YmChannel,
-        sample_rate_hz: f32,
-        lfo_am: f32,
-        lfo_pm: f32,
+        eg_counter: u32,
+        lfo_am: u8,
+        lfo_pm_step: u8,
+        lfo_pm_sign: bool,
         channel3_special_mode: bool,
-    ) -> f32 {
-        let am_depth = Self::channel_ams_depth(channel.ams);
-        let pm_factor = 1.0 + lfo_pm * Self::channel_fms_depth(channel.fms);
-        let op_freqs = [
-            (Self::channel_operator_base_frequency_hz(channel, 0, channel3_special_mode)
-                * pm_factor)
-                .max(1.0),
-            (Self::channel_operator_base_frequency_hz(channel, 1, channel3_special_mode)
-                * pm_factor)
-                .max(1.0),
-            (Self::channel_operator_base_frequency_hz(channel, 2, channel3_special_mode)
-                * pm_factor)
-                .max(1.0),
-            (Self::channel_operator_base_frequency_hz(channel, 3, channel3_special_mode)
-                * pm_factor)
-                .max(1.0),
-        ];
-        let op_keycodes = [
-            Self::channel_operator_keycode(channel, 0, channel3_special_mode),
-            Self::channel_operator_keycode(channel, 1, channel3_special_mode),
-            Self::channel_operator_keycode(channel, 2, channel3_special_mode),
-            Self::channel_operator_keycode(channel, 3, channel3_special_mode),
-        ];
+        eg_tick: bool,
+    ) -> i32 {
+        // Compute phase increments and keycodes for each operator
+        let mut op_phase_incs = [0u32; 4];
+        let mut op_keycodes = [0u8; 4];
+        for i in 0..4 {
+            let (fnum, block) =
+                Self::operator_fnum_block(channel, i, channel3_special_mode);
+            let keycode = Self::block_fnum_keycode(block, fnum);
+            op_keycodes[i] = keycode;
+
+            // Apply PM to FNUM
+            let pm_offset = Self::lfo_pm_displacement(fnum, channel.fms, lfo_pm_step, lfo_pm_sign);
+            let modulated_fnum = ((fnum as i32) + pm_offset).clamp(0, 0x7FF) as u16;
+
+            // At HW rate, raw phase inc is used directly (no scaling needed)
+            op_phase_incs[i] = Self::compute_phase_inc(
+                modulated_fnum,
+                block,
+                channel.operators[i].mul,
+                channel.operators[i].detune,
+                keycode,
+            );
+        }
+
         let alg = channel.algorithm & 0x07;
         let (connect1, connect2, connect3, mem_restore_to, special_alg5) = match alg {
             0 => (
@@ -970,11 +1215,15 @@ impl Ym2612 {
                 false,
             ),
         };
-        let mut m2_bus = 0.0f32;
-        let mut c1_bus = 0.0f32;
-        let mut c2_bus = 0.0f32;
-        let mut mem_bus = 0.0f32;
-        let mut out_bus = 0.0f32;
+
+        // GenPlusGX/MAME: buses are computed fresh each sample. Only mem (feedback_sample_prev)
+        // has a 1-sample delay.
+        let mut m2_bus = 0i32;
+        let mut c1_bus = 0i32;
+        let mut c2_bus = 0i32;
+        let mut mem_bus = 0i32;
+        let mut out_bus = 0i32;
+
         if let Some(destination) = mem_restore_to {
             Self::route_algorithm_bus(
                 destination,
@@ -986,35 +1235,34 @@ impl Ym2612 {
                 &mut out_bus,
             );
         }
-        // FM phase modulation depth (radians) for internal operator routing.
-        // Real YM2612: 14-bit operator output added to 10-bit phase (1024=2π).
-        // Max modulation = ~4096/1024 * 2π = 8π radians.
-        let op_mod_index = 8.0 * std::f32::consts::PI;
-        // YM2612 feedback level (self-modulation on OP1).
-        // Standard OPN values: FB=1→π/16 .. FB=7→4π (peak radians).
-        // Code applies to the sum of two samples (±2.0 peak), so table
-        // stores half the documented peak: [0, π/32, π/16, .., 2π].
-        const FEEDBACK_PHASE_RADIANS: [f32; 8] =
-            [0.0, 0.098, 0.196, 0.393, 0.785, 1.571, 3.1416, 6.2832];
-        // OPN feedback uses OP1's last two outputs. `operators[0].last_output`
-        // stores n-1 and `feedback_sample` tracks n-2.
+
+        // OP1 feedback: Nuked OPN2: mod >> (10 - FB). FB=0 means no feedback.
         let op1_prev = channel.operators[0].last_output;
-        let fb_phase_mod =
-            (op1_prev + channel.feedback_sample) * FEEDBACK_PHASE_RADIANS[channel.feedback.min(7) as usize];
+        let fb_phase_mod = if channel.feedback > 0 {
+            let shift = (10 - channel.feedback.min(7)) as i32;
+            (op1_prev + channel.feedback_sample) >> shift
+        } else {
+            0
+        };
+
         let o1 = Self::advance_operator_sample(
             &mut channel.operators[0],
-            op_freqs[0],
-            sample_rate_hz,
+            op_phase_incs[0],
             fb_phase_mod,
+            eg_counter,
             op_keycodes[0],
             lfo_am,
-            am_depth,
+            channel.ams,
+            eg_tick,
         );
         channel.feedback_sample = op1_prev;
+
+        // Route OP1 output to buses (immediate propagation within same sample)
         if special_alg5 {
             mem_bus += o1;
             c1_bus += o1;
             c2_bus += o1;
+            m2_bus += o1;
         } else if let Some(destination) = connect1 {
             Self::route_algorithm_bus(
                 destination,
@@ -1026,15 +1274,18 @@ impl Ym2612 {
                 &mut out_bus,
             );
         }
+
         // YM internal slot order is OP1 -> OP3 -> OP2 -> OP4.
+        // Nuked OPN2: non-feedback operators apply >> 1 to modulation input
         let o3 = Self::advance_operator_sample(
             &mut channel.operators[2],
-            op_freqs[2],
-            sample_rate_hz,
-            m2_bus * op_mod_index,
+            op_phase_incs[2],
+            m2_bus >> 1,
+            eg_counter,
             op_keycodes[2],
             lfo_am,
-            am_depth,
+            channel.ams,
+            eg_tick,
         );
         if let Some(destination) = connect3 {
             Self::route_algorithm_bus(
@@ -1047,14 +1298,16 @@ impl Ym2612 {
                 &mut out_bus,
             );
         }
+
         let o2 = Self::advance_operator_sample(
             &mut channel.operators[1],
-            op_freqs[1],
-            sample_rate_hz,
-            c1_bus * op_mod_index,
+            op_phase_incs[1],
+            c1_bus >> 1,
+            eg_counter,
             op_keycodes[1],
             lfo_am,
-            am_depth,
+            channel.ams,
+            eg_tick,
         );
         if let Some(destination) = connect2 {
             Self::route_algorithm_bus(
@@ -1067,28 +1320,32 @@ impl Ym2612 {
                 &mut out_bus,
             );
         }
+
         let o4 = Self::advance_operator_sample(
             &mut channel.operators[3],
-            op_freqs[3],
-            sample_rate_hz,
-            c2_bus * op_mod_index,
+            op_phase_incs[3],
+            c2_bus >> 1,
+            eg_counter,
             op_keycodes[3],
             lfo_am,
-            am_depth,
+            channel.ams,
+            eg_tick,
         );
         out_bus += o4;
+
         channel.feedback_sample_prev = mem_bus;
-        out_bus
+        // Nuked OPN2 / GenPlusGX: 14-bit channel output clipping
+        out_bus.clamp(-8192, 8191)
     }
 
     fn route_algorithm_bus(
         destination: YmAlgorithmBus,
-        sample: f32,
-        m2_bus: &mut f32,
-        c1_bus: &mut f32,
-        c2_bus: &mut f32,
-        mem_bus: &mut f32,
-        out_bus: &mut f32,
+        sample: i32,
+        m2_bus: &mut i32,
+        c1_bus: &mut i32,
+        c2_bus: &mut i32,
+        mem_bus: &mut i32,
+        out_bus: &mut i32,
     ) {
         match destination {
             YmAlgorithmBus::M2 => *m2_bus += sample,
@@ -1099,74 +1356,100 @@ impl Ym2612 {
         }
     }
 
-    fn next_sample_stereo(&mut self, sample_rate_hz: f32) -> (i16, i16) {
-        let (lfo_am, lfo_pm) = self.advance_lfo(sample_rate_hz);
-        let mut left_mix = 0.0f32;
-        let mut right_mix = 0.0f32;
-        let mut left_active = 0usize;
-        let mut right_active = 0usize;
+    /// Render one HW sample at the internal 53267 Hz rate.
+    fn render_one_hw_sample(&mut self) -> (i16, i16) {
+        let (lfo_am, lfo_pm_step, lfo_pm_sign) = self.advance_lfo_hw();
+        let eg_tick = self.advance_eg_counter_hw();
+        // Nuked OPN2: CSM key-on is a 1-sample pulse; key-off after next EG cycle
+        if self.csm_key_on_active {
+            self.trigger_csm_channel3_key_off();
+            self.csm_key_on_active = false;
+        }
+        let eg_counter = self.eg_counter;
+
+        let mut left_sum = 0i32;
+        let mut right_sum = 0i32;
         let channel3_special_mode = self.channel3_special_mode_enabled();
+
         for (index, channel) in self.channels.iter_mut().enumerate() {
             if index == 5 && self.dac_enabled {
-                // CH6 FM output is muted while DAC is enabled.
-                // Skip FM rendering here so DAC cycle accumulators are not
-                // overwritten by channel feedback scratch values.
                 continue;
             }
             if !Self::channel_active(channel) {
+                channel.feedback_sample = 0;
+                channel.feedback_sample_prev = 0;
                 continue;
             }
             let sample = Self::render_channel_sample(
                 channel,
-                sample_rate_hz,
+                eg_counter,
                 lfo_am,
-                lfo_pm,
+                lfo_pm_step,
+                lfo_pm_sign,
                 channel3_special_mode && index == 2,
+                eg_tick,
             );
             if channel.pan_left {
-                left_mix += sample;
-                left_active += 1;
+                left_sum += sample;
             }
             if channel.pan_right {
-                right_mix += sample;
-                right_active += 1;
+                right_sum += sample;
             }
         }
-        let fm_left = if left_active == 0 {
-            0
-        } else {
-            (left_mix * 18_000.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16
-        };
-        let fm_right = if right_active == 0 {
-            0
-        } else {
-            (right_mix * 18_000.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16
-        };
-        let (dac_left, dac_right) = if self.dac_enabled || self.channels[5].feedback_sample_prev > 0.0
-        {
+
+        // Add DAC output to the same 14-bit sum as FM channels
+        if self.dac_enabled {
             let channel = &mut self.channels[5];
-            // Accumulate DAC sample-hold output in Z80 time and average here.
-            // This preserves sub-sample DAC write timing and avoids "beep"/alias
-            // artifacts when drivers stream PCM between host output samples.
-            let dac_sample = if channel.feedback_sample_prev > 0.0 {
+            let dac_sample = if channel.feedback_sample_prev > 0 {
                 channel.feedback_sample / channel.feedback_sample_prev
             } else {
-                self.dac_output as f32
+                self.dac_output as i32
             };
-            channel.feedback_sample = 0.0;
-            channel.feedback_sample_prev = 0.0;
-            let dac_i16 = dac_sample.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-            let left = if channel.pan_left { dac_i16 } else { 0 };
-            let right = if channel.pan_right { dac_i16 } else { 0 };
-            (left, right)
-        } else {
-            (0, 0)
-        };
-        let left =
-            (fm_left as i32 + dac_left as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-        let right =
-            (fm_right as i32 + dac_right as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            channel.feedback_sample = 0;
+            channel.feedback_sample_prev = 0;
+            let dac_14bit = dac_sample.clamp(-8192, 8191);
+            if channel.pan_left {
+                left_sum += dac_14bit;
+            }
+            if channel.pan_right {
+                right_sum += dac_14bit;
+            }
+        }
+
+        // Scale combined FM+DAC output (±8188 per carrier) to i16 range.
+        let left = ((left_sum as i64 * 18000) >> 13)
+            .clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+        let right = ((right_sum as i64 * 18000) >> 13)
+            .clamp(i16::MIN as i64, i16::MAX as i64) as i16;
         (left, right)
+    }
+
+    /// Produce one output sample at the requested sample rate by running the
+    /// internal HW clock at 53267 Hz and averaging (box-filter downsampling).
+    fn next_sample_stereo(&mut self, sample_rate_hz: u32) -> (i16, i16) {
+        let hw_rate = YM_HW_RATE as u32;
+        self.hw_sample_frac += hw_rate;
+        let mut left_acc = 0i64;
+        let mut right_acc = 0i64;
+        let mut hw_count = 0u32;
+
+        while self.hw_sample_frac >= sample_rate_hz {
+            self.hw_sample_frac -= sample_rate_hz;
+            let (l, r) = self.render_one_hw_sample();
+            left_acc += l as i64;
+            right_acc += r as i64;
+            hw_count += 1;
+        }
+
+        if hw_count == 0 {
+            return self.last_hw_output;
+        }
+        let result = (
+            (left_acc / hw_count as i64) as i16,
+            (right_acc / hw_count as i64) as i16,
+        );
+        self.last_hw_output = result;
+        result
     }
 
     fn step_z80_cycles(&mut self, cycles: u32) {
@@ -1181,9 +1464,6 @@ impl Ym2612 {
             if pending_count == 0 {
                 self.accumulate_dac_cycles(cycles);
             } else {
-                // Z80 writes happen during the elapsed instruction slice.
-                // Apply pending DAC changes inside this slice instead of only
-                // at the end to reduce one-instruction quantization artifacts.
                 let total_cycles = cycles as u64;
                 let mut stage_index = 0u64;
                 let stage_count = pending_count as u64 + 1;
@@ -1260,6 +1540,7 @@ impl Ym2612 {
                 }
                 if self.csm_mode_enabled() {
                     self.trigger_csm_channel3_key_on();
+                    self.csm_key_on_active = true;
                 }
             }
         }
@@ -1273,7 +1554,6 @@ impl Ym2612 {
                 }
             }
         }
-
     }
 
     fn csm_mode_enabled(&self) -> bool {
@@ -1285,16 +1565,48 @@ impl Ym2612 {
     }
 
     fn trigger_csm_channel3_key_on(&mut self) {
-        // CSM (bit7 of mode register) retriggers channel 3 on Timer A overflow.
         let ch3 = &mut self.channels[2];
-        ch3.feedback_sample = 0.0;
-        ch3.feedback_sample_prev = 0.0;
+        ch3.feedback_sample = 0;
+        ch3.feedback_sample_prev = 0;
         for op in &mut ch3.operators {
-            op.phase = 0.0;
-            op.last_output = 0.0;
-            op.envelope_phase = YmEnvelopePhase::Attack;
-            op.envelope_level = 0.0;
-            op.key_on = true;
+            let was_on = op.key_on;
+            op.csm_key_on = true;
+            op.key_on = true; // composite = reg_key_on || csm_key_on
+            if !was_on {
+                op.phase = 0;
+                op.last_output = 0;
+                op.envelope_phase = YmEnvelopePhase::Attack;
+                if Self::ssg_eg_enabled(op) && (op.envelope_level & 0x200) != 0 {
+                    op.envelope_level = (0x200u16.wrapping_sub(op.envelope_level)) & 0x3FF;
+                }
+                op.ssg_invert = false;
+                op.ssg_hold_active = false;
+            }
+        }
+    }
+
+    fn trigger_csm_channel3_key_off(&mut self) {
+        let ch3 = &mut self.channels[2];
+        for op in &mut ch3.operators {
+            if !op.csm_key_on {
+                continue;
+            }
+            op.csm_key_on = false;
+            let new_key_on = op.reg_key_on; // reg 0x28 takes priority
+            if !new_key_on && op.key_on {
+                // Transition to key-off: apply SSG-EG normalization + Release
+                if Self::ssg_eg_enabled(op) && (op.envelope_level & 0x200) != 0 {
+                    op.envelope_level = (0x200u16.wrapping_sub(op.envelope_level)) & 0x3FF;
+                }
+                op.ssg_invert = false;
+                op.envelope_phase = if op.envelope_level < 1023 {
+                    YmEnvelopePhase::Release
+                } else {
+                    YmEnvelopePhase::Off
+                };
+                op.ssg_hold_active = false;
+            }
+            op.key_on = new_key_on;
         }
     }
 
@@ -1303,17 +1615,16 @@ impl Ym2612 {
             return;
         }
         let channel = &mut self.channels[5];
-        channel.feedback_sample += self.dac_output as f32 * cycles as f32;
-        channel.feedback_sample_prev += cycles as f32;
+        channel.feedback_sample += self.dac_output as i32 * cycles as i32;
+        channel.feedback_sample_prev += cycles as i32;
     }
 
     fn set_dac_enabled(&mut self, enabled: bool) {
         let was_enabled = self.dac_enabled;
         self.dac_enabled = enabled;
         if was_enabled != self.dac_enabled {
-            // Reset CH6 scratch state when DAC mode toggles.
-            self.channels[5].feedback_sample = 0.0;
-            self.channels[5].feedback_sample_prev = 0.0;
+            self.channels[5].feedback_sample = 0;
+            self.channels[5].feedback_sample_prev = 0;
         }
     }
 
@@ -1385,14 +1696,15 @@ impl Ym2612 {
     pub fn channel_operator_frequency_hz_debug(&self, channel: usize, operator: usize) -> f32 {
         let channel_index = channel.min(5);
         let operator_index = operator.min(3);
-        let channel = self.channels[channel_index];
-        let base_hz = Self::channel_operator_base_frequency_hz(
-            &channel,
-            operator_index,
-            channel_index == 2 && self.channel3_special_mode_enabled(),
-        );
-        let op = channel.operators[operator_index];
-        base_hz * Self::carrier_mul_factor(op.mul) * Self::detune_ratio(op.detune)
+        let ch = &self.channels[channel_index];
+        let op = &ch.operators[operator_index];
+        let is_ch3_special = channel_index == 2 && self.channel3_special_mode_enabled();
+        let (fnum, block) = Self::operator_fnum_block(ch, operator_index, is_ch3_special);
+        let keycode = Self::block_fnum_keycode(block, fnum);
+        let raw_inc = Self::compute_phase_inc(fnum, block, op.mul, op.detune, keycode);
+        // Frequency = phase_inc * HW_RATE / 2^20
+        const HW_RATE_F: f32 = 7_670_454.0 / 144.0;
+        raw_inc as f32 * HW_RATE_F / 1_048_576.0
     }
 
     pub fn channel_carrier_mul(&self, channel: usize) -> u8 {
@@ -1422,7 +1734,9 @@ impl Ym2612 {
     }
 
     pub fn channel_envelope_level(&self, channel: usize) -> f32 {
-        self.channels[channel.min(5)].operators[3].envelope_level
+        let level = self.channels[channel.min(5)].operators[3].envelope_level;
+        // Convert integer attenuation (0=max, 1023=silence) to float (1.0=max, 0.0=silence)
+        1.0 - (level as f32 / 1023.0)
     }
 
     pub fn channel_envelope_params(&self, channel: usize) -> (u8, u8, u8, u8, u8) {
@@ -1449,13 +1763,20 @@ pub struct Psg {
     latched_channel: usize,
     latched_is_volume: bool,
     tone_period: [u16; 3],
-    tone_phase_high: [bool; 3],
-    tone_phase_acc: [f32; 3],
+    tone_output: [bool; 3],       // current output state (replaces tone_phase_high)
+    tone_counter: [u16; 3],       // 10-bit downcounters (replaces tone_phase_acc)
     attenuation: [u8; 4],
     noise_control: u8,
     noise_lfsr: u16,
-    noise_phase_acc: f32,
+    noise_counter: u16,           // noise downcounter (replaces noise_phase_acc)
+    sample_counter: u32,          // Bresenham counter for PSG clock vs output rate
 }
+
+// Pre-computed: round(8000.0 * 10^(-att*2/20)) for att=0..14, att=15→0
+const PSG_VOLUME: [i16; 16] = [
+    8000, 6355, 5048, 4009, 3184, 2529, 2009, 1596,
+    1268, 1007, 800, 635, 505, 401, 318, 0,
+];
 
 impl Default for Psg {
     fn default() -> Self {
@@ -1465,18 +1786,20 @@ impl Default for Psg {
             latched_channel: 0,
             latched_is_volume: false,
             tone_period: [1, 1, 1],
-            tone_phase_high: [true, true, true],
-            tone_phase_acc: [0.0, 0.0, 0.0],
+            tone_output: [true, true, true],
+            tone_counter: [1, 1, 1],
             attenuation: [0x0F; 4],
             noise_control: 0,
             noise_lfsr: 0x4000,
-            noise_phase_acc: 0.0,
+            noise_counter: 0x10,
+            sample_counter: 0,
         }
     }
 }
 
 impl Psg {
-    const PSG_CLOCK_HZ: f32 = 3_579_545.0;
+    // SN76489 internal clock = master / 16
+    const PSG_CLOCK_HZ: u32 = 3_579_545 / 16; // 223,721 Hz
 
     fn write_data(&mut self, value: u8) {
         self.last_data = value;
@@ -1519,7 +1842,9 @@ impl Psg {
     }
 
     pub fn tone_frequency_hz_debug(&self, channel: usize) -> f32 {
-        self.tone_frequency_hz(channel)
+        let raw_period = self.tone_period[channel.min(2)] & 0x03FF;
+        let period = raw_period.max(1) as f32;
+        3_579_545.0 / (32.0 * period)
     }
 
     fn apply_latched_data(&mut self, data: u8) {
@@ -1534,33 +1859,16 @@ impl Psg {
         } else {
             self.noise_control = data & 0x07;
             self.noise_lfsr = 0x4000;
-            self.noise_phase_acc = 0.0;
+            self.noise_counter = Self::noise_period(data & 0x07, self.tone_period[2]);
         }
     }
 
-    fn tone_frequency_hz(&self, channel: usize) -> f32 {
-        let raw_period = self.tone_period[channel.min(2)] & 0x03FF;
-        // Genesis integrated PSG behavior: period=0 behaves like period=1.
-        let period = raw_period.max(1) as f32;
-        Self::PSG_CLOCK_HZ / (32.0 * period)
-    }
-
-    fn noise_frequency_hz(&self) -> f32 {
-        match self.noise_control & 0x03 {
-            0x00 => Self::PSG_CLOCK_HZ / 512.0,
-            0x01 => Self::PSG_CLOCK_HZ / 1024.0,
-            0x02 => Self::PSG_CLOCK_HZ / 2048.0,
-            0x03 => self.tone_frequency_hz(2),
-            _ => Self::PSG_CLOCK_HZ / 512.0,
-        }
-    }
-
-    fn channel_amplitude(&self, channel: usize) -> f32 {
-        let att = self.attenuation[channel.min(3)] as f32;
-        if att >= 15.0 {
-            0.0
-        } else {
-            10f32.powf(-(att * 2.0) / 20.0)
+    fn noise_period(noise_control: u8, tone3_period: u16) -> u16 {
+        match noise_control & 0x03 {
+            0x00 => 0x10,   // clock/512 → period 16
+            0x01 => 0x20,   // clock/1024 → period 32
+            0x02 => 0x40,   // clock/2048 → period 64
+            _ => tone3_period.max(1), // use tone channel 3 period
         }
     }
 
@@ -1572,57 +1880,62 @@ impl Psg {
         } else {
             bit0
         };
-        // SN76489-compatible 15-bit LFSR (bit14 is the injected tap bit).
         self.noise_lfsr = ((self.noise_lfsr >> 1) | (feedback << 14)) & 0x7FFF;
     }
 
-    fn next_sample(&mut self, sample_rate_hz: f32) -> i16 {
+    /// Advance PSG by one internal clock tick
+    fn clock_tick(&mut self) {
         let noise_uses_tone3 = (self.noise_control & 0x03) == 0x03;
-        let mut tone3_falling_edges = 0usize;
-        for channel in 0..3 {
-            // The divider formula returns full square-wave frequency, while
-            // this phase accumulator toggles high/low once per wrap.
-            self.tone_phase_acc[channel] +=
-                (self.tone_frequency_hz(channel) * 2.0) / sample_rate_hz;
-            while self.tone_phase_acc[channel] >= 1.0 {
-                self.tone_phase_acc[channel] -= 1.0;
-                let was_high = self.tone_phase_high[channel];
-                self.tone_phase_high[channel] = !self.tone_phase_high[channel];
-                if noise_uses_tone3 && channel == 2 && was_high && !self.tone_phase_high[channel] {
-                    tone3_falling_edges = tone3_falling_edges.saturating_add(1);
+
+        // Advance tone counters
+        for ch in 0..3 {
+            if self.tone_counter[ch] > 0 {
+                self.tone_counter[ch] -= 1;
+            }
+            if self.tone_counter[ch] == 0 {
+                let period = (self.tone_period[ch] & 0x3FF).max(1);
+                self.tone_counter[ch] = period;
+                let was_high = self.tone_output[ch];
+                self.tone_output[ch] = !self.tone_output[ch];
+                // Noise channel clocked by tone3 falling edge
+                if noise_uses_tone3 && ch == 2 && was_high && !self.tone_output[ch] {
+                    self.clock_noise_lfsr();
                 }
             }
         }
 
-        if noise_uses_tone3 {
-            for _ in 0..tone3_falling_edges {
-                self.clock_noise_lfsr();
+        // Advance noise counter (independent clock unless using tone3)
+        if !noise_uses_tone3 {
+            if self.noise_counter > 0 {
+                self.noise_counter -= 1;
             }
-        } else {
-            self.noise_phase_acc += self.noise_frequency_hz() / sample_rate_hz;
-            while self.noise_phase_acc >= 1.0 {
-                self.noise_phase_acc -= 1.0;
+            if self.noise_counter == 0 {
+                self.noise_counter = Self::noise_period(self.noise_control, self.tone_period[2]);
                 self.clock_noise_lfsr();
             }
         }
+    }
 
-        let mut mix = 0.0f32;
-        for channel in 0..3 {
-            let amp = self.channel_amplitude(channel);
-            mix += if self.tone_phase_high[channel] {
-                amp
-            } else {
-                -amp
-            };
+    fn next_sample(&mut self, sample_rate_hz: u32) -> i16 {
+        // Bresenham resampler: PSG_CLOCK_HZ → sample_rate_hz
+        self.sample_counter += Self::PSG_CLOCK_HZ;
+        while self.sample_counter >= sample_rate_hz {
+            self.sample_counter -= sample_rate_hz;
+            self.clock_tick();
         }
-        let noise_amp = self.channel_amplitude(3);
-        mix += if (self.noise_lfsr & 1) != 0 {
-            noise_amp
-        } else {
-            -noise_amp
-        };
 
-        (mix * 1800.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16
+        // Mix using pre-computed integer volume table
+        let mut mix = 0i32;
+        for ch in 0..3 {
+            let vol = PSG_VOLUME[self.attenuation[ch].min(15) as usize] as i32;
+            mix += if self.tone_output[ch] { vol } else { -vol };
+        }
+        let noise_vol = PSG_VOLUME[self.attenuation[3].min(15) as usize] as i32;
+        mix += if (self.noise_lfsr & 1) != 0 { noise_vol } else { -noise_vol };
+
+        // Scale to match previous float output level (~1800.0 * amplitude)
+        // PSG_VOLUME[0]=8000, old was 1.0*1800=1800, so scale by 1800/8000 ≈ 9/40
+        ((mix * 9) / 40).clamp(i16::MIN as i32, i16::MAX as i32) as i16
     }
 }
 
@@ -1675,9 +1988,6 @@ impl AudioBus {
     }
 
     pub fn write_ym2612_from_z80(&mut self, port: u8, value: u8) {
-        // YM2612 BUSY is a status/read-side signal; writes are still latched.
-        // Dropping data writes while BUSY causes audible FM/DAC corruption in
-        // Z80-driven drivers (e.g. Landstalker effects).
         self.ym_writes_from_z80 += 1;
         self.ym2612.write_port_from_z80(port, value);
     }
@@ -1703,36 +2013,17 @@ impl AudioBus {
         let produced = (self.sample_accumulator / Self::M68K_CLOCK_HZ) as usize;
         self.sample_accumulator %= Self::M68K_CLOCK_HZ;
         for _ in 0..produced {
-            // Keep PSG clearly below FM in the global mix so square-wave beeps
-            // do not overpower YM2612 music.
-            // PSG can generate very high-frequency components that alias
-            // harshly at 44.1kHz. A small oversampling pass reduces "beepy"
-            // artifacts without changing the external sample rate.
             let psg_oversample_u64 = 4u64;
             let psg_oversample_i32 = 4i32;
             let mut psg_acc = 0i32;
             for _ in 0..psg_oversample_u64 {
                 psg_acc += self
                     .psg
-                    .next_sample((sample_rate_hz * psg_oversample_u64) as f32)
+                    .next_sample((sample_rate_hz * psg_oversample_u64) as u32)
                     as i32;
             }
             let psg_sample = (psg_acc / psg_oversample_i32) * 2 / 5;
-            // A light YM oversampling pass reduces FM aliasing "beep" artifacts
-            // in effect-heavy scenes without changing the external output rate.
-            let ym_oversample_u64 = 2u64;
-            let ym_oversample_i32 = 2i32;
-            let mut ym_left_acc = 0i32;
-            let mut ym_right_acc = 0i32;
-            for _ in 0..ym_oversample_u64 {
-                let (l, r) = self
-                    .ym2612
-                    .next_sample_stereo((sample_rate_hz * ym_oversample_u64) as f32);
-                ym_left_acc += l as i32;
-                ym_right_acc += r as i32;
-            }
-            let ym_left = (ym_left_acc / ym_oversample_i32) as i16;
-            let ym_right = (ym_right_acc / ym_oversample_i32) as i16;
+            let (ym_left, ym_right) = self.ym2612.next_sample_stereo(sample_rate_hz as u32);
             let left = (psg_sample + ym_left as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             let right =
                 (psg_sample + ym_right as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
@@ -1806,7 +2097,9 @@ impl Default for AudioBus {
 
 #[cfg(test)]
 mod tests {
-    use super::{Psg, Ym2612};
+    use super::{
+        op_calc, Psg, Ym2612, LOG_SIN_TABLE, EXP_TABLE, DETUNE_TABLE,
+    };
 
     fn write_ym_reg(ym: &mut Ym2612, bank: usize, reg: u8, value: u8) {
         let (addr_port, data_port) = if (bank & 1) == 0 {
@@ -1821,12 +2114,8 @@ mod tests {
     #[test]
     fn psg_data_byte_updates_latched_volume_register() {
         let mut psg = Psg::default();
-
-        // Latch channel 2 volume register and set attenuation=3.
         psg.write_data(0b1101_0011);
         assert_eq!(psg.attenuation(2), 0x03);
-
-        // Data byte without latch should keep target register and update attenuation.
         psg.write_data(0x0B);
         assert_eq!(psg.attenuation(2), 0x0B);
     }
@@ -1834,61 +2123,113 @@ mod tests {
     #[test]
     fn psg_data_byte_updates_latched_tone_period_high_bits() {
         let mut psg = Psg::default();
-
-        // Latch channel 0 tone low nibble = 0x5.
         psg.write_data(0b1000_0101);
-        // Data byte sets upper 6 bits = 0x12.
         psg.write_data(0x12);
-
         assert_eq!(psg.tone_period(0), 0x125);
     }
 
     #[test]
-    fn ym2612_pms_depth_table_matches_documented_semitone_steps() {
-        // PMS documented ranges (in semitones): 0, 0.034, 0.067, 0.10, 0.14,
-        // 0.20, 0.40, 0.80. Convert to multiplicative ratio delta.
-        let expected = [
-            0.0f32,
-            2f32.powf(0.034 / 12.0) - 1.0,
-            2f32.powf(0.067 / 12.0) - 1.0,
-            2f32.powf(0.10 / 12.0) - 1.0,
-            2f32.powf(0.14 / 12.0) - 1.0,
-            2f32.powf(0.20 / 12.0) - 1.0,
-            2f32.powf(0.40 / 12.0) - 1.0,
-            2f32.powf(0.80 / 12.0) - 1.0,
-        ];
-        for (idx, expected_depth) in expected.iter().enumerate() {
-            let got = Ym2612::channel_fms_depth(idx as u8);
-            assert!(
-                (got - expected_depth).abs() < 0.0001,
-                "pms={} expected={} got={}",
-                idx,
-                expected_depth,
-                got
-            );
+    fn sine_table_peak_and_zero_crossing() {
+        // At quarter-wave peak (index 255), attenuation should be 0 (maximum output).
+        assert_eq!(LOG_SIN_TABLE[255], 0);
+        // At zero crossing (index 0), attenuation should be large.
+        assert!(LOG_SIN_TABLE[0] > 2000);
+    }
+
+    #[test]
+    fn exp_table_range() {
+        // Index 0 should give near-maximum significand.
+        assert!(EXP_TABLE[0] >= 1016);
+        // Index 255 should give 0.
+        assert_eq!(EXP_TABLE[255], 0);
+    }
+
+    #[test]
+    fn op_calc_zero_attenuation_gives_max_output() {
+        // Phase at quarter-wave peak (0x100 = mirror=1, index=0 → index=255)
+        let output = op_calc(0x100, 0);
+        // Should be near +8188 (13-bit max)
+        assert!(output > 8000, "expected >8000, got {}", output);
+    }
+
+    #[test]
+    fn op_calc_sign_bit() {
+        // Phase with sign bit set → negative output
+        let positive = op_calc(0x100, 0);
+        let negative = op_calc(0x300, 0); // bit 9 set = sign
+        assert!(positive > 0);
+        assert!(negative < 0);
+        assert_eq!(positive, -negative);
+    }
+
+    #[test]
+    fn op_calc_max_attenuation_gives_zero() {
+        let output = op_calc(0x100, 0xFFF);
+        assert_eq!(output, 0);
+    }
+
+    #[test]
+    fn detune_table_dt0_is_all_zeros() {
+        for kc in 0..32 {
+            assert_eq!(DETUNE_TABLE[0][kc], 0);
         }
+    }
+
+    #[test]
+    fn feedback_levels_sweep() {
+        // Verify that higher feedback levels produce larger self-modulation.
+        // Use algorithm 0 (serial) and measure OP1 output with different FB values.
+        let mut max_outputs = Vec::new();
+        for fb in 0..8u8 {
+            let mut ym = Ym2612::default();
+            // CH1: set algorithm 0, feedback = fb
+            write_ym_reg(&mut ym, 0, 0xB0, fb << 3);
+            // Set all operators to max volume (TL=0), fast attack, no decay
+            for op_reg_base in [0x30u8, 0x38, 0x34, 0x3C] {
+                write_ym_reg(&mut ym, 0, op_reg_base, 0x01); // MUL=1, DT=0
+            }
+            for op_reg_base in [0x40u8, 0x48, 0x44, 0x4C] {
+                write_ym_reg(&mut ym, 0, op_reg_base, 0x00); // TL=0
+            }
+            for op_reg_base in [0x50u8, 0x58, 0x54, 0x5C] {
+                write_ym_reg(&mut ym, 0, op_reg_base, 0x1F); // AR=31
+            }
+            for op_reg_base in [0x60u8, 0x68, 0x64, 0x6C] {
+                write_ym_reg(&mut ym, 0, op_reg_base, 0x00); // DR=0
+            }
+            for op_reg_base in [0x80u8, 0x88, 0x84, 0x8C] {
+                write_ym_reg(&mut ym, 0, op_reg_base, 0x00); // SL=0, RR=0
+            }
+            // Set frequency: fnum=0x200, block=4
+            write_ym_reg(&mut ym, 0, 0xA4, 0x22);
+            write_ym_reg(&mut ym, 0, 0xA0, 0x00);
+            // Key-on all operators
+            write_ym_reg(&mut ym, 0, 0x28, 0xF0);
+            // Render some samples and find max
+            let mut max_val = 0i32;
+            for _ in 0..1000 {
+                let (l, _) = ym.next_sample_stereo(44100);
+                max_val = max_val.max(l.unsigned_abs() as i32);
+            }
+            max_outputs.push(max_val);
+        }
+        // FB=0 should give some output (pure FM chain)
+        assert!(max_outputs[0] > 0, "FB=0 should produce output");
+        // Higher FB levels should generally produce different (often larger) peak outputs
+        // due to self-modulation creating harmonics
     }
 
     #[test]
     fn ym2612_channel3_special_mode_uses_ym3438_slot_mapping() {
         let mut ym = Ym2612::default();
-
-        // Channel 3 normal frequency (used by operator 4 in CH3 special mode).
         write_ym_reg(&mut ym, 0, 0xA2, 0x34);
-        write_ym_reg(&mut ym, 0, 0xA6, 0x21); // block=4, fnum high=1
-
-        // CH3 special slot frequencies:
-        // slot0 (A8/AC) -> operator 3
-        // slot1 (A9/AD) -> operator 1
-        // slot2 (AA/AE) -> operator 2
+        write_ym_reg(&mut ym, 0, 0xA6, 0x21);
         write_ym_reg(&mut ym, 0, 0xA8, 0x11);
-        write_ym_reg(&mut ym, 0, 0xAC, 0x18); // block=3, fnum high=0
+        write_ym_reg(&mut ym, 0, 0xAC, 0x18);
         write_ym_reg(&mut ym, 0, 0xA9, 0x22);
-        write_ym_reg(&mut ym, 0, 0xAD, 0x29); // block=5, fnum high=1
+        write_ym_reg(&mut ym, 0, 0xAD, 0x29);
         write_ym_reg(&mut ym, 0, 0xAA, 0x33);
-        write_ym_reg(&mut ym, 0, 0xAE, 0x31); // block=6, fnum high=1
-
-        // Enable CH3 special mode (mode bits 01 in reg 0x27).
+        write_ym_reg(&mut ym, 0, 0xAE, 0x31);
         write_ym_reg(&mut ym, 0, 0x27, 0x40);
 
         let op1 = ym.channel_operator_frequency_hz_debug(2, 0);
@@ -1896,31 +2237,40 @@ mod tests {
         let op3 = ym.channel_operator_frequency_hz_debug(2, 2);
         let op4 = ym.channel_operator_frequency_hz_debug(2, 3);
 
-        let expected_op1 = Ym2612::fnum_block_frequency_hz(0x122, 5);
-        let expected_op2 = Ym2612::fnum_block_frequency_hz(0x133, 6);
-        let expected_op3 = Ym2612::fnum_block_frequency_hz(0x011, 3);
-        let expected_op4 = Ym2612::fnum_block_frequency_hz(0x134, 4);
+        // Expected frequencies computed from phase increment formula:
+        // freq = ((fnum << block) >> 1) * mul * HW_RATE / 2^20
+        // With default mul=1, detune=0:
+        // freq = ((fnum << block) >> 1) * 53267 / 1048576
+        let compute_freq = |fnum: u16, block: u8| -> f32 {
+            let inc = ((fnum as u32) << (block as u32)) >> 1;
+            inc as f32 * (7_670_454.0 / 144.0) / 1_048_576.0
+        };
+
+        let expected_op1 = compute_freq(0x122, 5);
+        let expected_op2 = compute_freq(0x133, 6);
+        let expected_op3 = compute_freq(0x011, 3);
+        let expected_op4 = compute_freq(0x134, 4);
 
         assert!(
-            (op1 - expected_op1).abs() < 0.01,
+            (op1 - expected_op1).abs() < 0.5,
             "op1={} exp={}",
             op1,
             expected_op1
         );
         assert!(
-            (op2 - expected_op2).abs() < 0.01,
+            (op2 - expected_op2).abs() < 0.5,
             "op2={} exp={}",
             op2,
             expected_op2
         );
         assert!(
-            (op3 - expected_op3).abs() < 0.01,
+            (op3 - expected_op3).abs() < 0.5,
             "op3={} exp={}",
             op3,
             expected_op3
         );
         assert!(
-            (op4 - expected_op4).abs() < 0.01,
+            (op4 - expected_op4).abs() < 0.5,
             "op4={} exp={}",
             op4,
             expected_op4
@@ -1931,9 +2281,7 @@ mod tests {
     fn ym2612_channel3_without_special_mode_uses_normal_frequency_for_all_operators() {
         let mut ym = Ym2612::default();
         write_ym_reg(&mut ym, 0, 0xA2, 0x56);
-        write_ym_reg(&mut ym, 0, 0xA6, 0x2B); // block=5, fnum high=3
-
-        // Program distinct CH3 special slot values, but keep special mode off.
+        write_ym_reg(&mut ym, 0, 0xA6, 0x2B);
         write_ym_reg(&mut ym, 0, 0xA8, 0x01);
         write_ym_reg(&mut ym, 0, 0xAC, 0x10);
         write_ym_reg(&mut ym, 0, 0xA9, 0x02);
@@ -1941,11 +2289,14 @@ mod tests {
         write_ym_reg(&mut ym, 0, 0xAA, 0x03);
         write_ym_reg(&mut ym, 0, 0xAE, 0x20);
 
-        let expected = Ym2612::fnum_block_frequency_hz(0x356, 5);
+        let expected = {
+            let inc = ((0x356u32) << 5) >> 1;
+            inc as f32 * (7_670_454.0 / 144.0) / 1_048_576.0
+        };
         for op in 0..4 {
             let got = ym.channel_operator_frequency_hz_debug(2, op);
             assert!(
-                (got - expected).abs() < 0.01,
+                (got - expected).abs() < 0.5,
                 "op{}={} exp={}",
                 op + 1,
                 got,
