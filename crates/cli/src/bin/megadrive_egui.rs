@@ -1,5 +1,7 @@
 #[path = "../egui_ui/mod.rs"]
 mod egui_ui;
+#[path = "../hud_toast.rs"]
+mod hud_toast;
 
 use std::error::Error;
 use std::io;
@@ -10,6 +12,7 @@ use egui_sdl2_gl::ShaderVersion;
 use egui_sdl2_gl::gl;
 use egui_ui::CheatToolUi;
 use egui_ui::gl_game::GlGameRenderer;
+use hud_toast::{HudToast, draw_hud_toast_rgb24, show_hud_toast};
 use megadrive_core::{Button, Cartridge, ControllerType, Emulator, FRAME_HEIGHT, FRAME_WIDTH};
 use sdl2::audio::AudioSpecDesired;
 use sdl2::event::Event;
@@ -283,6 +286,7 @@ fn run_window_loop(
     let mut cheat_ui = CheatToolUi::new();
     let mut prev_panel_visible = false;
     let mut state_slots: [Option<Emulator>; 10] = std::array::from_fn(|_| None);
+    let mut hud_toast: Option<HudToast> = None;
 
     let text_input = video.text_input();
     let mut text_input_active = false;
@@ -340,17 +344,23 @@ fn run_window_loop(
                         if keymod_has_state_save_modifier(keymod) {
                             state_slots[slot] = Some(emulator.clone());
                             match emulator.save_state_to_file(&state_path) {
-                                Ok(()) => println!(
-                                    "Saved state slot {} -> {}",
-                                    slot,
-                                    state_path.display()
-                                ),
-                                Err(err) => eprintln!(
-                                    "failed to save state slot {} to {}: {}",
-                                    slot,
-                                    state_path.display(),
-                                    err
-                                ),
+                                Ok(()) => {
+                                    println!(
+                                        "Saved state slot {} -> {}",
+                                        slot,
+                                        state_path.display()
+                                    );
+                                    show_hud_toast(&mut hud_toast, format!("SAVE {slot} OK"));
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "failed to save state slot {} to {}: {}",
+                                        slot,
+                                        state_path.display(),
+                                        err
+                                    );
+                                    show_hud_toast(&mut hud_toast, format!("SAVE {slot} ERR"));
+                                }
                             }
                             continue;
                         }
@@ -360,6 +370,7 @@ fn run_window_loop(
                                 emulator.set_audio_output_sample_rate_hz(output_sample_rate_hz);
                                 audio_queue.clear();
                                 println!("Loaded state slot {} (session)", slot);
+                                show_hud_toast(&mut hud_toast, format!("LOAD {slot} OK"));
                             } else {
                                 if state_path.exists() {
                                     match emulator.load_state_from_file(&state_path) {
@@ -374,16 +385,27 @@ fn run_window_loop(
                                                 slot,
                                                 state_path.display()
                                             );
+                                            show_hud_toast(
+                                                &mut hud_toast,
+                                                format!("LOAD {slot} OK"),
+                                            );
                                         }
-                                        Err(err) => eprintln!(
-                                            "failed to load state slot {} from {}: {}",
-                                            slot,
-                                            state_path.display(),
-                                            err
-                                        ),
+                                        Err(err) => {
+                                            eprintln!(
+                                                "failed to load state slot {} from {}: {}",
+                                                slot,
+                                                state_path.display(),
+                                                err
+                                            );
+                                            show_hud_toast(
+                                                &mut hud_toast,
+                                                format!("LOAD {slot} ERR"),
+                                            );
+                                        }
                                     }
                                 } else {
                                     println!("State slot {} is empty", slot);
+                                    show_hud_toast(&mut hud_toast, format!("SLOT {slot} EMPTY"));
                                 }
                             }
                             continue;
@@ -460,7 +482,13 @@ fn run_window_loop(
             }
         }
 
-        game_renderer.upload_frame_rgb24(emulator.frame_buffer(), FRAME_WIDTH, FRAME_HEIGHT);
+        if hud_toast.is_some() {
+            let mut frame_buf = emulator.frame_buffer().to_vec();
+            draw_hud_toast_rgb24(&mut frame_buf, FRAME_WIDTH, FRAME_HEIGHT, &mut hud_toast);
+            game_renderer.upload_frame_rgb24(&frame_buf, FRAME_WIDTH, FRAME_HEIGHT);
+        } else {
+            game_renderer.upload_frame_rgb24(emulator.frame_buffer(), FRAME_WIDTH, FRAME_HEIGHT);
+        }
 
         let (win_w, _) = window.size();
         let (drawable_w, drawable_h) = window.drawable_size();
