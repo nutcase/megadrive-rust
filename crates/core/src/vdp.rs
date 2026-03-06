@@ -1626,13 +1626,13 @@ impl Vdp {
                 Self::plane_tile_dimensions_from_regs(&regs);
             let (window_width_tiles, window_height_tiles) =
                 Self::window_tile_dimensions_from_regs(&regs);
+            let quirk_64x32_paged = self.quirk_plane_a_64x32_paged && plane_width_tiles > 64;
             let plane_a_uses_64x32_paged = !disable_64x32_paged
                 && !disable_64x32_paged_a
-                && (debug_plane_a_64x32_paged
-                    || (self.quirk_plane_a_64x32_paged && plane_width_tiles > 64));
+                && (debug_plane_a_64x32_paged || quirk_64x32_paged);
             let plane_b_uses_64x32_paged = !disable_64x32_paged
                 && !disable_64x32_paged_b
-                && debug_plane_b_64x32_paged;
+                && (debug_plane_b_64x32_paged || quirk_64x32_paged);
             let plane_width_px = plane_width_tiles * 8;
             let plane_height_px = plane_height_tiles * 8;
             let window_width_px = window_width_tiles * 8;

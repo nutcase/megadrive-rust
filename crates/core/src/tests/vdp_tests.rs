@@ -1640,6 +1640,85 @@ fn plane_size_code_3_decodes_to_128_cells() {
 }
 
 #[test]
+fn plane_a_64x32_paged_quirk_changes_second_page_row_addressing() {
+    let mut baseline = Vdp::new();
+    baseline.vram.fill(0);
+    baseline.cram.fill(0);
+    baseline.vsram.fill(0);
+
+    // reg16=0x03 => 128x32 cells.
+    baseline.write_control_port(0x9003);
+    baseline.write_control_port(0x8D3C); // hscroll table @ 0xF000
+    let plane_a = 0xC000usize;
+
+    // Sample row 1, column 64 at screen origin.
+    let linear_addr = plane_a + ((128 + 64) * 2);
+    let paged_addr = plane_a + 64 * 32 * 2 + 64 * 2;
+    baseline.write_vram_u8(linear_addr as u16, 0x00);
+    baseline.write_vram_u8((linear_addr + 1) as u16, 0x01);
+    baseline.write_vram_u8(paged_addr as u16, 0x00);
+    baseline.write_vram_u8((paged_addr + 1) as u16, 0x02);
+
+    baseline.write_cram_u16(1, encode_md_color(7, 0, 0));
+    baseline.write_cram_u16(2, encode_md_color(0, 7, 0));
+    for i in 0..4u16 {
+        baseline.write_vram_u8(32 + i, 0x11);
+        baseline.write_vram_u8(64 + i, 0x22);
+    }
+    baseline.write_vsram_u16(0, 8);
+    baseline.write_vram_u8(0xF000, 0xFE);
+    baseline.write_vram_u8(0xF001, 0x00);
+
+    baseline.step(Vdp::CYCLES_PER_FRAME as u32);
+    assert_eq!(&baseline.frame_buffer()[0..3], &[252, 0, 0]);
+
+    let mut with_quirk = baseline.clone();
+    with_quirk.set_quirk_plane_a_64x32_paged(true);
+    with_quirk.step(Vdp::CYCLES_PER_FRAME as u32);
+    assert_eq!(&with_quirk.frame_buffer()[0..3], &[0, 252, 0]);
+}
+
+#[test]
+fn plane_b_64x32_paged_quirk_changes_second_page_row_addressing() {
+    let mut baseline = Vdp::new();
+    baseline.vram.fill(0);
+    baseline.cram.fill(0);
+    baseline.vsram.fill(0);
+
+    // Plane B base @ 0xE000, reg16=0x03 => 128x32 cells.
+    baseline.write_control_port(0x8407);
+    baseline.write_control_port(0x9003);
+    baseline.write_control_port(0x8D3C); // hscroll table @ 0xF000
+    let plane_b = 0xE000usize;
+
+    // Sample row 1, column 64 at screen origin.
+    let linear_addr = plane_b + ((128 + 64) * 2);
+    let paged_addr = plane_b + 64 * 32 * 2 + 64 * 2;
+    baseline.write_vram_u8(linear_addr as u16, 0x00);
+    baseline.write_vram_u8((linear_addr + 1) as u16, 0x01);
+    baseline.write_vram_u8(paged_addr as u16, 0x00);
+    baseline.write_vram_u8((paged_addr + 1) as u16, 0x02);
+
+    baseline.write_cram_u16(1, encode_md_color(7, 0, 0));
+    baseline.write_cram_u16(2, encode_md_color(0, 7, 0));
+    for i in 0..4u16 {
+        baseline.write_vram_u8(32 + i, 0x11);
+        baseline.write_vram_u8(64 + i, 0x22);
+    }
+    baseline.write_vsram_u16(1, 8);
+    baseline.write_vram_u8(0xF002, 0xFE);
+    baseline.write_vram_u8(0xF003, 0x00);
+
+    baseline.step(Vdp::CYCLES_PER_FRAME as u32);
+    assert_eq!(&baseline.frame_buffer()[0..3], &[252, 0, 0]);
+
+    let mut with_quirk = baseline.clone();
+    with_quirk.set_quirk_plane_a_64x32_paged(true);
+    with_quirk.step(Vdp::CYCLES_PER_FRAME as u32);
+    assert_eq!(&with_quirk.frame_buffer()[0..3], &[0, 252, 0]);
+}
+
+#[test]
 fn dma_fill_writes_repeated_bytes_to_vram() {
     let mut vdp = Vdp::new();
     // Register 1: display + DMA enable.
