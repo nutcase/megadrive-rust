@@ -1027,10 +1027,31 @@ impl Vdp {
                         remaining: self.dma_length(),
                         cycle_carry: 0,
                     });
+                    if self.frame_cycles == 0 {
+                        self.complete_dma_copy_immediately();
+                    }
                 }
             }
             _ => {}
         }
+    }
+
+    fn complete_dma_copy_immediately(&mut self) {
+        let Some(mut copy) = self.dma_copy_active.take() else {
+            return;
+        };
+
+        for _ in 0..copy.remaining {
+            let byte = self.vram[copy.source_addr as usize % VRAM_SIZE];
+            self.vram[self.access_addr as usize % VRAM_SIZE] = byte;
+            copy.source_addr = copy.source_addr.wrapping_add(1);
+            self.access_addr = self.access_addr.wrapping_add(copy.increment);
+        }
+
+        self.set_dma_source_addr(copy.source_addr);
+        self.clear_dma_length();
+        self.reset_line_state();
+        self.capture_line_state(0);
     }
 
     /// Advance in-progress DMA fill/copy by the given number of master clock

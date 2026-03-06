@@ -389,6 +389,7 @@ pub struct Ym2612 {
     hw_eg_divider: u8,
     last_hw_output: (i16, i16),
     csm_key_on_active: bool,
+    csm_key_on_rendered: bool,
     test_register: u8, // reg 0x21: test mode bits (normally 0)
     channels: [YmChannel; 6],
 }
@@ -417,11 +418,15 @@ impl Default for Ym2612 {
             lfo_rate: 0,
             lfo_counter: 0,
             lfo_timer: 0,
-            eg_counter: 0,
+            // Start near an EG boundary so low/mid attack rates begin moving
+            // promptly after the first key-on instead of stalling for a long
+            // initial counter phase.
+            eg_counter: 127,
             hw_sample_frac: 0,
             hw_eg_divider: 0,
             last_hw_output: (0, 0),
             csm_key_on_active: false,
+            csm_key_on_rendered: false,
             test_register: 0,
             channels: [YmChannel::default(); 6],
         }
@@ -478,7 +483,8 @@ impl Ym2612 {
         match port & 0x03 {
             0 => {
                 self.addr_port0 = value;
-                // Address latch only — no BUSY flag (GenPlusGX behavior)
+                // YM2612 asserts BUSY for a short window after address writes too.
+                self.arm_busy();
             }
             1 => {
                 let reg = self.addr_port0;
@@ -489,7 +495,7 @@ impl Ym2612 {
             }
             2 => {
                 self.addr_port1 = value;
-                // Address latch only — no BUSY flag
+                self.arm_busy();
             }
             3 => {
                 let reg = self.addr_port1;
@@ -586,7 +592,6 @@ impl Ym2612 {
                     self.timer_b_value = value;
                 }
                 0x27 => {
-                    let old = self.timer_control;
                     self.timer_control = value;
                     if (value & 0x10) != 0 {
                         self.timer_status &= !0x01;
@@ -594,11 +599,12 @@ impl Ym2612 {
                     if (value & 0x20) != 0 {
                         self.timer_status &= !0x02;
                     }
-                    // Only reset timers on rising edge of enable bit
-                    if (value & 0x01) != 0 && (old & 0x01) == 0 {
+                    // Timer load bits explicitly reload their counters even when
+                    // the timer is already running.
+                    if (value & 0x01) != 0 {
                         self.timer_a_elapsed_ym_cycles = 0;
                     }
-                    if (value & 0x02) != 0 && (old & 0x02) == 0 {
+                    if (value & 0x02) != 0 {
                         self.timer_b_elapsed_ym_cycles = 0;
                     }
                 }
@@ -887,6 +893,9 @@ impl Ym2612 {
             if current_top {
                 op.ssg_invert = attack;
             }
+            // Hold latches the envelope at the endpoint reached by the SSG-EG
+            // cycle rather than keeping the pre-cycle attenuation.
+            op.envelope_level = if current_top { 0 } else { 1023 };
             op.ssg_hold_active = true;
             return false; // hold doesn't restart Attack
         }
@@ -951,7 +960,7 @@ impl Ym2612 {
                 if inc > 0 {
                     op.envelope_level = (op.envelope_level + inc).min(1023);
                 }
-                if op.envelope_level >= sustain_target {
+                if !Self::ssg_eg_enabled(op) && op.envelope_level >= sustain_target {
                     op.envelope_phase = YmEnvelopePhase::Sustain;
                 }
             }
@@ -1381,17 +1390,15 @@ impl Ym2612 {
     fn render_one_hw_sample(&mut self) -> (i16, i16) {
         let (lfo_am, lfo_pm_step, lfo_pm_sign) = self.advance_lfo_hw();
         let eg_tick = self.advance_eg_counter_hw();
-        // Nuked OPN2: CSM key-on is a 1-sample pulse; key-off after next EG cycle
-        if self.csm_key_on_active {
-            self.trigger_csm_channel3_key_off();
-            self.csm_key_on_active = false;
-        }
         let eg_counter = self.eg_counter;
         let eg_test = (self.test_register & 0x01) != 0;
 
         let mut left_sum = 0i32;
         let mut right_sum = 0i32;
         let channel3_special_mode = self.channel3_special_mode_enabled();
+        if self.csm_key_on_active {
+            self.csm_key_on_rendered = true;
+        }
 
         for (index, channel) in self.channels.iter_mut().enumerate() {
             if index == 5 && self.dac_enabled {
@@ -1470,6 +1477,11 @@ impl Ym2612 {
     }
 
     fn step_z80_cycles(&mut self, cycles: u32) {
+        if self.csm_key_on_active && self.csm_key_on_rendered {
+            self.trigger_csm_channel3_key_off();
+            self.csm_key_on_active = false;
+            self.csm_key_on_rendered = false;
+        }
         self.busy_z80_cycles = self.busy_z80_cycles.saturating_sub(cycles);
         if cycles > 0 {
             let pending_enabled = self.dac_enabled_pending.take();
@@ -1558,6 +1570,7 @@ impl Ym2612 {
                 if self.csm_mode_enabled() {
                     self.trigger_csm_channel3_key_on();
                     self.csm_key_on_active = true;
+                    self.csm_key_on_rendered = false;
                 }
             }
         }
