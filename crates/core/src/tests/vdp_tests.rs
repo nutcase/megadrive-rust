@@ -847,12 +847,13 @@ fn renders_window_plane_over_plane_a() {
         vdp.write_vram_u8(64 + i as u16, 0x22);
     }
 
-    // Enable window over the full screen.
-    vdp.write_control_port(0x9100);
+    // Full-width window: bit7 set + split 0 => x >= 0.
+    vdp.write_control_port(0x9180);
+    // Full-height window: bit7 set + split 0 => y >= 0.
     vdp.write_control_port(0x9280);
 
     vdp.step(Vdp::CYCLES_PER_FRAME as u32);
-    assert_ne!(&vdp.frame_buffer()[0..3], &[0, 0, 0]);
+    assert_eq!(&vdp.frame_buffer()[0..3], &[0, 252, 0]);
 }
 
 #[test]
@@ -889,7 +890,6 @@ fn window_horizontal_split_selects_region() {
         vdp.write_vram_u8(64 + i as u16, 0x22);
     }
 
-    // x<16: Plane A, x>=16: Window.
     // x<16: Plane A, x>=16: Window (bit7 set => right side active).
     vdp.write_control_port(0x9181);
     // Full-height window (bit7 set + split 0).
@@ -933,8 +933,7 @@ fn window_vertical_split_bit7_set_uses_bottom_region() {
         vdp.write_vram_u8(64 + i, 0x22);
     }
 
-    // Full width window, vertical split at y=8, bit7=1 => window on/below split.
-    // Full-width window (bit7 set + split 0).
+    // Full-width window, vertical split at y=8, bit7=1 => window on/below split.
     vdp.write_control_port(0x9180);
     vdp.write_control_port(0x9281);
 
@@ -979,8 +978,7 @@ fn window_vertical_split_bit7_clear_uses_top_region() {
         vdp.write_vram_u8(64 + i, 0x22);
     }
 
-    // Full width window, vertical split at y=8, bit7=0 => window above split.
-    // Full-width window (bit7 set + split 0).
+    // Full-width window, vertical split at y=8, bit7=0 => window above split.
     vdp.write_control_port(0x9180);
     vdp.write_control_port(0x9201);
 
@@ -990,6 +988,52 @@ fn window_vertical_split_bit7_clear_uses_top_region() {
     // y=8 => plane A (red)
     let y8 = 8 * FRAME_WIDTH * 3;
     assert_eq!(&vdp.frame_buffer()[y8..y8 + 3], &[252, 0, 0]);
+}
+
+#[test]
+fn window_vertical_region_takes_priority_over_horizontal_split() {
+    let mut vdp = Vdp::new();
+    let plane_a_base = 0xC000u16;
+    let window_base = 0xD000u16;
+
+    vdp.vram.fill(0);
+    vdp.cram.fill(0);
+    vdp.vsram.fill(0);
+    vdp.write_control_port(0x8D3C);
+    vdp.write_vram_u8(0xF000, 0x00);
+    vdp.write_vram_u8(0xF001, 0x00);
+
+    // Plane A rows use tile 1 (red).
+    vdp.write_vram_u8(plane_a_base, 0x00);
+    vdp.write_vram_u8(plane_a_base + 1, 0x01);
+    vdp.write_vram_u8((plane_a_base + 64) as u16, 0x00);
+    vdp.write_vram_u8((plane_a_base + 65) as u16, 0x01);
+
+    // Window rows use tile 2 (green).
+    vdp.write_control_port(0x8334);
+    vdp.write_vram_u8(window_base, 0x00);
+    vdp.write_vram_u8(window_base + 1, 0x02);
+    vdp.write_vram_u8((window_base + 64) as u16, 0x00);
+    vdp.write_vram_u8((window_base + 65) as u16, 0x02);
+
+    vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
+    vdp.write_cram_u16(2, encode_md_color(0, 7, 0));
+    for i in 0..32u16 {
+        vdp.write_vram_u8(32 + i, 0x11);
+        vdp.write_vram_u8(64 + i, 0x22);
+    }
+
+    // Horizontal split alone would enable the window only for x >= 16.
+    vdp.write_control_port(0x9181);
+    // Vertical split at y=8 with bit7=1 should force the entire line to window.
+    vdp.write_control_port(0x9281);
+
+    vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+    // Above the split: x=0 remains plane A.
+    assert_eq!(&vdp.frame_buffer()[0..3], &[252, 0, 0]);
+    // On/below the split: x=0 must still be window because vertical takes priority.
+    let y8 = 8 * FRAME_WIDTH * 3;
+    assert_eq!(&vdp.frame_buffer()[y8..y8 + 3], &[0, 252, 0]);
 }
 
 #[test]
