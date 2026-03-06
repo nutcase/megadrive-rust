@@ -1413,13 +1413,22 @@ impl Vdp {
             && regs[11] == 0x03
     }
 
-    fn comix_title_roll_active(regs: &[u8; REG_COUNT], _vsram: &[u16; VSRAM_WORDS]) -> bool {
-        regs[REG_PLANE_B_NAMETABLE] == 0x07
+    fn comix_title_roll_active(regs: &[u8; REG_COUNT], vsram: &[u16; VSRAM_WORDS]) -> bool {
+        if !(regs[REG_PLANE_B_NAMETABLE] == 0x07
             && (regs[REG_MODE_SET_2] & 0x40) != 0
             && regs[REG_HSCROLL_TABLE] == 0x3C
             && regs[REG_PLANE_SIZE] == 0x11
             && regs[11] == 0x00
-            && (regs[12] & 0x08) != 0
+            && (regs[12] & 0x08) != 0)
+        {
+            return false;
+        }
+        // During the roll-down animation, VSRAM has non-zero scroll values
+        // (the roll effect is driven by H-INT updating scroll per line).
+        // On the static start menu, all VSRAM entries are zero.
+        // Require at least one non-zero entry to avoid false-positive
+        // sparse mask clipping on the start menu.
+        vsram.iter().any(|&v| v != 0)
     }
 
     /// For the plane B nametable, compute the first pixel row whose nametable
@@ -1758,12 +1767,15 @@ impl Vdp {
                 self.frame_buffer[out + 2] = b;
 
                 let meta_index = y * FRAME_WIDTH + x;
-                // Encode: bit 0 = opaque, bit 1 = any_plane_priority (for S/H),
-                // bits 2..7 = color_index
+                // Encode: bit 0 = opaque, bit 1 = composed pixel priority
+                // (for sprite vs plane ordering), bits 2..7 = color_index.
+                // Note: S/H uses any_plane_priority (OR of raw priorities)
+                // which is computed separately above and not stored here.
                 let ci = (color_index as u8) & 0x3F;
                 let opaque = composed.map(|s| s.opaque).unwrap_or(false);
+                let composed_pri = composed.map(|s| s.priority_high).unwrap_or(false);
                 plane_meta[meta_index] = (opaque as u8)
-                    | ((any_plane_priority as u8) << 1)
+                    | ((composed_pri as u8) << 1)
                     | (ci << 2);
             }
             if comix_title_roll && !disable_comix_roll_sparse_mask {
