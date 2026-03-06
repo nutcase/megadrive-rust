@@ -67,6 +67,7 @@ fn supports_pal_video_standard_timing() {
 #[test]
 fn dma_copy_updates_line0_latch_when_triggered_at_frame_start() {
     let mut vdp = Vdp::new();
+    vdp.set_line_vram_latch_enabled_for_debug(true);
     // Register 1: display + DMA enable.
     vdp.write_control_port(0x8150);
     // Auto-increment = 1 byte.
@@ -97,6 +98,38 @@ fn dma_copy_updates_line0_latch_when_triggered_at_frame_start() {
     assert_eq!(vdp.line_vram_u8(0, 0x0201), 0xAD);
     assert_eq!(vdp.line_vram_u8(0, 0x0202), 0xBE);
     assert_eq!(vdp.line_vram_u8(0, 0x0203), 0xEF);
+}
+
+#[test]
+fn dma_fill_updates_line0_latch_when_triggered_at_frame_start() {
+    let mut vdp = Vdp::new();
+    vdp.set_line_vram_latch_enabled_for_debug(true);
+    // Register 1: display + DMA enable.
+    vdp.write_control_port(0x8150);
+    // Auto-increment = 2 bytes so fill writes land on stable byte lanes.
+    vdp.write_control_port(0x8F02);
+    // DMA length = 2 words.
+    vdp.write_control_port(0x9302);
+    vdp.write_control_port(0x9400);
+    // DMA mode = fill.
+    vdp.write_control_port(0x9780);
+
+    // VRAM write DMA command @ 0x0200 (code with DMA bit set).
+    vdp.write_control_port(0x4200);
+    vdp.write_control_port(0x0080);
+
+    // Data-port write provides the fill byte and starts DMA fill.
+    vdp.write_data_port(0xABCD);
+    vdp.step(16);
+
+    assert_eq!(vdp.read_vram_u8(0x0200), 0xAB);
+    assert_eq!(vdp.read_vram_u8(0x0201), 0xCD);
+    assert_eq!(vdp.read_vram_u8(0x0203), 0xCD);
+    assert_eq!(vdp.read_vram_u8(0x0205), 0xCD);
+    assert_eq!(vdp.line_vram_u8(0, 0x0200), 0xAB);
+    assert_eq!(vdp.line_vram_u8(0, 0x0201), 0xCD);
+    assert_eq!(vdp.line_vram_u8(0, 0x0203), 0xCD);
+    assert_eq!(vdp.line_vram_u8(0, 0x0205), 0xCD);
 }
 
 #[test]

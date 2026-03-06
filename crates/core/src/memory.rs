@@ -298,6 +298,7 @@ impl MemoryMap {
                 dma.words_remaining -= 1;
 
                 self.vdp.write_data_port(word);
+                self.vdp.refresh_line0_latch_if_active();
             }
 
             if dma.words_remaining == 0 {
@@ -1111,6 +1112,40 @@ mod tests {
         assert_eq!(last.words, 2);
         assert_eq!(last.first_word, 0xAABB);
         assert_eq!(last.last_word, 0xCCDD);
+    }
+
+    #[test]
+    fn bus_dma_updates_line0_latch_when_triggered_at_frame_start() {
+        let mut rom = vec![0; 0x400];
+        rom[0x200] = 0xAA;
+        rom[0x201] = 0xBB;
+        rom[0x202] = 0xCC;
+        rom[0x203] = 0xDD;
+
+        let cart = Cartridge::from_bytes(rom).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+        memory.vdp_mut().set_line_vram_latch_enabled_for_debug(true);
+
+        memory.write_u16(0xC00004, 0x8150);
+        memory.write_u16(0xC00004, 0x8F02);
+        memory.write_u16(0xC00004, 0x9302);
+        memory.write_u16(0xC00004, 0x9400);
+        memory.write_u16(0xC00004, 0x9500);
+        memory.write_u16(0xC00004, 0x9601);
+        memory.write_u16(0xC00004, 0x9700);
+        memory.write_u16(0xC00004, 0x4000);
+        memory.write_u16(0xC00004, 0x0080);
+
+        memory.step_vdp(4);
+
+        assert_eq!(memory.vdp().read_vram_u8(0x0000), 0xAA);
+        assert_eq!(memory.vdp().read_vram_u8(0x0001), 0xBB);
+        assert_eq!(memory.vdp().read_vram_u8(0x0002), 0xCC);
+        assert_eq!(memory.vdp().read_vram_u8(0x0003), 0xDD);
+        assert_eq!(memory.vdp().line_vram_u8(0, 0x0000), 0xAA);
+        assert_eq!(memory.vdp().line_vram_u8(0, 0x0001), 0xBB);
+        assert_eq!(memory.vdp().line_vram_u8(0, 0x0002), 0xCC);
+        assert_eq!(memory.vdp().line_vram_u8(0, 0x0003), 0xDD);
     }
 
     #[test]

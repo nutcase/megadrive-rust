@@ -1066,24 +1066,30 @@ impl Vdp {
             } else {
                 DMA_FILL_CYCLES_PER_BYTE_ACTIVE
             };
-            let fill = self.dma_fill_active.as_mut().unwrap();
-            fill.cycle_carry += cycles;
-            while fill.cycle_carry >= rate && fill.remaining > 0 {
-                fill.cycle_carry -= rate;
-                if fill.fill_word {
-                    let addr = self.access_addr as usize % VRAM_SIZE;
-                    self.vram[addr] = fill.fill_byte;
-                    self.vram[(addr + 1) % VRAM_SIZE] = fill.fill_byte;
-                } else {
-                    let addr = if fill.lane_no_xor {
-                        self.access_addr as usize
+            self.dma_fill_active.as_mut().unwrap().cycle_carry += cycles;
+            while {
+                let fill = self.dma_fill_active.as_ref().unwrap();
+                fill.cycle_carry >= rate && fill.remaining > 0
+            } {
+                {
+                    let fill = self.dma_fill_active.as_mut().unwrap();
+                    fill.cycle_carry -= rate;
+                    if fill.fill_word {
+                        let addr = self.access_addr as usize % VRAM_SIZE;
+                        self.vram[addr] = fill.fill_byte;
+                        self.vram[(addr + 1) % VRAM_SIZE] = fill.fill_byte;
                     } else {
-                        self.access_addr as usize ^ 0x0001
-                    } % VRAM_SIZE;
-                    self.vram[addr] = fill.fill_byte;
+                        let addr = if fill.lane_no_xor {
+                            self.access_addr as usize
+                        } else {
+                            self.access_addr as usize ^ 0x0001
+                        } % VRAM_SIZE;
+                        self.vram[addr] = fill.fill_byte;
+                    }
+                    self.access_addr = self.access_addr.wrapping_add(fill.increment);
+                    fill.remaining -= 1;
                 }
-                self.access_addr = self.access_addr.wrapping_add(fill.increment);
-                fill.remaining -= 1;
+                self.refresh_line0_latch_if_active();
             }
             if self.dma_fill_active.as_ref().unwrap().remaining == 0 {
                 self.dma_fill_active = None;
@@ -1102,15 +1108,21 @@ impl Vdp {
             } else {
                 DMA_COPY_CYCLES_PER_BYTE_ACTIVE
             };
-            let copy = self.dma_copy_active.as_mut().unwrap();
-            copy.cycle_carry += cycles;
-            while copy.cycle_carry >= rate && copy.remaining > 0 {
-                copy.cycle_carry -= rate;
-                let byte = self.vram[copy.source_addr as usize % VRAM_SIZE];
-                self.vram[self.access_addr as usize % VRAM_SIZE] = byte;
-                copy.source_addr = copy.source_addr.wrapping_add(1);
-                self.access_addr = self.access_addr.wrapping_add(copy.increment);
-                copy.remaining -= 1;
+            self.dma_copy_active.as_mut().unwrap().cycle_carry += cycles;
+            while {
+                let copy = self.dma_copy_active.as_ref().unwrap();
+                copy.cycle_carry >= rate && copy.remaining > 0
+            } {
+                {
+                    let copy = self.dma_copy_active.as_mut().unwrap();
+                    copy.cycle_carry -= rate;
+                    let byte = self.vram[copy.source_addr as usize % VRAM_SIZE];
+                    self.vram[self.access_addr as usize % VRAM_SIZE] = byte;
+                    copy.source_addr = copy.source_addr.wrapping_add(1);
+                    self.access_addr = self.access_addr.wrapping_add(copy.increment);
+                    copy.remaining -= 1;
+                }
+                self.refresh_line0_latch_if_active();
             }
             if self.dma_copy_active.as_ref().unwrap().remaining == 0 {
                 let src = self.dma_copy_active.unwrap().source_addr;
@@ -1163,6 +1175,18 @@ impl Vdp {
     #[cfg(test)]
     fn nametable_base(&self) -> usize {
         Self::nametable_base_from_regs(&self.registers)
+    }
+
+    pub fn set_line_vram_latch_enabled_for_debug(&mut self, enabled: bool) {
+        self.line_vram_latch_enabled = enabled;
+        self.reset_line_state();
+        self.capture_line_state(0);
+    }
+
+    pub(crate) fn refresh_line0_latch_if_active(&mut self) {
+        if self.line_vram_latch_enabled && self.line_index_for_cycle(self.frame_cycles) == 0 {
+            self.capture_line_state(0);
+        }
     }
 
     fn sprite_table_base(&self) -> usize {
