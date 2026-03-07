@@ -188,6 +188,8 @@ pub struct Vdp {
     quirk_comix_pretitle_plane_b_bias: bool,
     /// Scratch buffer for per-pixel plane metadata (reused across frames).
     render_plane_meta: ScratchBuf<u8>,
+    /// Scratch flags for SAT debug rendering options (not serialized).
+    debug_sat_flags: ScratchBuf<bool>,
     /// Scratch buffer for sprite pixel fill tracking (reused across frames).
     render_sprite_filled: ScratchBuf<bool>,
 }
@@ -203,6 +205,9 @@ impl Vdp {
     const NTSC_CYCLES_PER_FRAME: u64 = 127_800;
     const NTSC_TOTAL_LINES: u64 = 262;
     const PAL_TOTAL_LINES: u64 = 313;
+    const DEBUG_SAT_LINE_LATCH_FLAG: usize = 0;
+    const DEBUG_SAT_LIVE_FLAG: usize = 1;
+    const DEBUG_SAT_PER_LINE_FLAG: usize = 2;
     #[cfg(test)]
     const CYCLES_PER_FRAME: u64 = Self::NTSC_CYCLES_PER_FRAME;
     #[cfg(test)]
@@ -263,6 +268,7 @@ impl Vdp {
             quirk_vscroll_swap_ab: false,
             quirk_comix_pretitle_plane_b_bias: false,
             render_plane_meta: ScratchBuf(vec![0u8; FRAME_WIDTH * FRAME_HEIGHT]),
+            debug_sat_flags: ScratchBuf(vec![false; 3]),
             render_sprite_filled: ScratchBuf(vec![false; FRAME_WIDTH * FRAME_HEIGHT]),
         };
         vdp.reset_line_state();
@@ -1183,6 +1189,18 @@ impl Vdp {
         self.capture_line_state(0);
     }
 
+    pub fn set_sat_line_latch_for_debug(&mut self, enabled: bool) {
+        self.set_debug_sat_flag(Self::DEBUG_SAT_LINE_LATCH_FLAG, enabled);
+    }
+
+    pub fn set_sat_live_for_debug(&mut self, enabled: bool) {
+        self.set_debug_sat_flag(Self::DEBUG_SAT_LIVE_FLAG, enabled);
+    }
+
+    pub fn set_sat_per_line_for_debug(&mut self, enabled: bool) {
+        self.set_debug_sat_flag(Self::DEBUG_SAT_PER_LINE_FLAG, enabled);
+    }
+
     pub(crate) fn refresh_line0_latch_if_active(&mut self) {
         if self.line_vram_latch_enabled && self.line_index_for_cycle(self.frame_cycles) == 0 {
             self.capture_line_state(0);
@@ -1193,6 +1211,17 @@ impl Vdp {
         // In H40 mode the SAT base is 1KB aligned (bit0 ignored).
         let mask = if self.h40_mode() { 0x7E } else { 0x7F };
         ((self.registers[REG_SPRITE_TABLE] as usize & mask) << 9) % VRAM_SIZE
+    }
+
+    fn debug_sat_flag(&self, index: usize) -> bool {
+        self.debug_sat_flags.get(index).copied().unwrap_or(false)
+    }
+
+    fn set_debug_sat_flag(&mut self, index: usize, enabled: bool) {
+        if self.debug_sat_flags.len() <= index {
+            self.debug_sat_flags.resize(index + 1, false);
+        }
+        self.debug_sat_flags[index] = enabled;
     }
 
     fn nametable_base_from_regs(regs: &[u8; REG_COUNT]) -> usize {
@@ -1871,10 +1900,13 @@ impl Vdp {
     fn render_sprites(&mut self, plane_meta: &[u8]) {
         let max_sat_sprites = if self.h40_mode() { 80usize } else { 64usize };
         let sat_use_line_latched = self.line_vram_latch_enabled
-            && std::env::var_os("MEGADRIVE_DEBUG_SAT_LINE_LATCH").is_some();
-        let sat_use_live =
-            std::env::var_os("MEGADRIVE_DEBUG_SAT_LIVE").is_some() || !sat_use_line_latched;
-        let sat_per_line = std::env::var_os("MEGADRIVE_DEBUG_SAT_PER_LINE").is_some();
+            && (self.debug_sat_flag(Self::DEBUG_SAT_LINE_LATCH_FLAG)
+                || std::env::var_os("MEGADRIVE_DEBUG_SAT_LINE_LATCH").is_some());
+        let sat_use_live = self.debug_sat_flag(Self::DEBUG_SAT_LIVE_FLAG)
+            || std::env::var_os("MEGADRIVE_DEBUG_SAT_LIVE").is_some()
+            || !sat_use_line_latched;
+        let sat_per_line = self.debug_sat_flag(Self::DEBUG_SAT_PER_LINE_FLAG)
+            || std::env::var_os("MEGADRIVE_DEBUG_SAT_PER_LINE").is_some();
         let sprite_x_offset = std::env::var("MEGADRIVE_DEBUG_SPRITE_X_OFFSET")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())

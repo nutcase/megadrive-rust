@@ -1,4 +1,4 @@
-use megadrive_core::vdp::{Vdp, VideoStandard};
+use megadrive_core::vdp::{FRAME_WIDTH, Vdp, VideoStandard};
 
 fn capture_v_counter_on_line_starts(vdp: &mut Vdp, line_count: usize) -> Vec<u8> {
     let [v0, h0] = vdp.read_hv_counter().to_be_bytes();
@@ -24,6 +24,55 @@ fn capture_v_counter_on_line_starts(vdp: &mut Vdp, line_count: usize) -> Vec<u8>
         "expected to capture {line_count} line starts"
     );
     out
+}
+
+fn step_until_line_start(vdp: &mut Vdp, target_line: u8) {
+    for _ in 0..2_000_000 {
+        let [v, h] = vdp.read_hv_counter().to_be_bytes();
+        if v == target_line && h <= 2 {
+            return;
+        }
+        vdp.step(1);
+    }
+
+    panic!("expected to reach line start {target_line}");
+}
+
+fn encode_md_color(r: u8, g: u8, b: u8) -> u16 {
+    ((b as u16 & 0x7) << 9) | ((g as u16 & 0x7) << 5) | ((r as u16 & 0x7) << 1)
+}
+
+fn run_mid_frame_sat_x_update(vdp: &mut Vdp) {
+    let sat = 0xE000u16;
+    let tile_addr = 32u16;
+    for i in 0..32u16 {
+        vdp.write_vram_u8(tile_addr + i, 0x11);
+    }
+    vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
+
+    // Sprite 0: 1x1 red tile at (0,0).
+    vdp.write_vram_u8(sat, 0x00);
+    vdp.write_vram_u8(sat + 1, 0x80);
+    vdp.write_vram_u8(sat + 2, 0x00);
+    vdp.write_vram_u8(sat + 3, 0x00);
+    vdp.write_vram_u8(sat + 4, 0x00);
+    vdp.write_vram_u8(sat + 5, 0x01);
+    vdp.write_vram_u8(sat + 6, 0x00);
+    vdp.write_vram_u8(sat + 7, 0x80);
+
+    step_until_line_start(vdp, 1);
+
+    // Mid-frame SAT update: move sprite right by 8 pixels.
+    vdp.write_vram_u8(sat + 6, 0x00);
+    vdp.write_vram_u8(sat + 7, 0x88);
+
+    for _ in 0..2_000_000 {
+        if vdp.step(1) {
+            return;
+        }
+    }
+
+    panic!("expected frame completion after SAT update");
 }
 
 #[test]
@@ -130,6 +179,33 @@ fn dma_fill_updates_line0_latch_when_triggered_at_frame_start() {
     assert_eq!(vdp.line_vram_u8(0, 0x0201), 0xCD);
     assert_eq!(vdp.line_vram_u8(0, 0x0203), 0xCD);
     assert_eq!(vdp.line_vram_u8(0, 0x0205), 0xCD);
+}
+
+#[test]
+fn live_sat_uses_final_sprite_position_for_entire_frame_after_mid_frame_write() {
+    let mut vdp = Vdp::new();
+    run_mid_frame_sat_x_update(&mut vdp);
+
+    // Live SAT sees the final X position for all lines, so x=0 stays blank.
+    assert_eq!(&vdp.frame_buffer()[0..3], &[0, 0, 0]);
+    let row1 = FRAME_WIDTH * 3;
+    assert_eq!(&vdp.frame_buffer()[row1..row1 + 3], &[0, 0, 0]);
+}
+
+#[test]
+fn sat_line_latch_preserves_early_line_sprite_position_after_mid_frame_write() {
+    let mut vdp = Vdp::new();
+    vdp.set_line_vram_latch_enabled_for_debug(true);
+    vdp.set_sat_line_latch_for_debug(true);
+    vdp.set_sat_live_for_debug(false);
+    vdp.set_sat_per_line_for_debug(true);
+
+    run_mid_frame_sat_x_update(&mut vdp);
+
+    // Line 0 keeps the pre-write SAT snapshot, while later lines see the moved sprite.
+    assert_eq!(&vdp.frame_buffer()[0..3], &[252, 0, 0]);
+    let row1 = FRAME_WIDTH * 3;
+    assert_eq!(&vdp.frame_buffer()[row1..row1 + 3], &[0, 0, 0]);
 }
 
 #[test]
