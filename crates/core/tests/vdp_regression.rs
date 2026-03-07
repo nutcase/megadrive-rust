@@ -38,6 +38,19 @@ fn step_until_line_start(vdp: &mut Vdp, target_line: u8) {
     panic!("expected to reach line start {target_line}");
 }
 
+fn step_until_line_hblank(vdp: &mut Vdp, target_line: u8) {
+    for _ in 0..2_000_000 {
+        let [v, h] = vdp.read_hv_counter().to_be_bytes();
+        let status = vdp.read_control_port();
+        if v == target_line && h >= 120 && (status & 0x0004) != 0 {
+            return;
+        }
+        vdp.step(1);
+    }
+
+    panic!("expected to reach hblank on line {target_line}");
+}
+
 fn encode_md_color(r: u8, g: u8, b: u8) -> u16 {
     ((b as u16 & 0x7) << 9) | ((g as u16 & 0x7) << 5) | ((r as u16 & 0x7) << 1)
 }
@@ -73,6 +86,41 @@ fn run_mid_frame_sat_x_update(vdp: &mut Vdp) {
     }
 
     panic!("expected frame completion after SAT update");
+}
+
+fn run_mid_frame_sprite_pattern_update(vdp: &mut Vdp) {
+    let sat = 0xE000u16;
+    let tile_addr = 32u16;
+    for i in 0..32u16 {
+        vdp.write_vram_u8(tile_addr + i, 0x11);
+    }
+    vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
+    vdp.write_cram_u16(2, encode_md_color(0, 7, 0));
+
+    // Sprite 0: 1x1 tile at (0,0).
+    vdp.write_vram_u8(sat, 0x00);
+    vdp.write_vram_u8(sat + 1, 0x80);
+    vdp.write_vram_u8(sat + 2, 0x00);
+    vdp.write_vram_u8(sat + 3, 0x00);
+    vdp.write_vram_u8(sat + 4, 0x00);
+    vdp.write_vram_u8(sat + 5, 0x01);
+    vdp.write_vram_u8(sat + 6, 0x00);
+    vdp.write_vram_u8(sat + 7, 0x80);
+
+    step_until_line_start(vdp, 1);
+
+    // Mid-frame tile update: tile 1 changes from red to green.
+    for i in 0..32u16 {
+        vdp.write_vram_u8(tile_addr + i, 0x22);
+    }
+
+    for _ in 0..2_000_000 {
+        if vdp.step(1) {
+            return;
+        }
+    }
+
+    panic!("expected frame completion after sprite pattern update");
 }
 
 #[test]
@@ -206,6 +254,109 @@ fn sat_line_latch_preserves_early_line_sprite_position_after_mid_frame_write() {
     assert_eq!(&vdp.frame_buffer()[0..3], &[252, 0, 0]);
     let row1 = FRAME_WIDTH * 3;
     assert_eq!(&vdp.frame_buffer()[row1..row1 + 3], &[0, 0, 0]);
+}
+
+#[test]
+fn live_sprite_pattern_uses_final_tile_data_for_entire_frame_after_mid_frame_write() {
+    let mut vdp = Vdp::new();
+    run_mid_frame_sprite_pattern_update(&mut vdp);
+
+    assert_eq!(&vdp.frame_buffer()[0..3], &[0, 252, 0]);
+    let row1 = FRAME_WIDTH * 3;
+    assert_eq!(&vdp.frame_buffer()[row1..row1 + 3], &[0, 252, 0]);
+}
+
+#[test]
+fn line_latched_sprite_pattern_updates_on_later_lines_after_mid_frame_write() {
+    let mut vdp = Vdp::new();
+    vdp.set_line_vram_latch_enabled_for_debug(true);
+
+    run_mid_frame_sprite_pattern_update(&mut vdp);
+
+    assert_eq!(&vdp.frame_buffer()[0..3], &[252, 0, 0]);
+    let row1 = FRAME_WIDTH * 3;
+    assert_eq!(&vdp.frame_buffer()[row1..row1 + 3], &[0, 252, 0]);
+}
+
+#[test]
+fn line0_sprite_pattern_latch_reuses_initial_tile_data_after_mid_frame_write() {
+    let mut vdp = Vdp::new();
+    vdp.set_line_vram_latch_enabled_for_debug(true);
+    vdp.set_sprite_pattern_line0_for_debug(true);
+
+    run_mid_frame_sprite_pattern_update(&mut vdp);
+
+    assert_eq!(&vdp.frame_buffer()[0..3], &[252, 0, 0]);
+    let row1 = FRAME_WIDTH * 3;
+    assert_eq!(&vdp.frame_buffer()[row1..row1 + 3], &[252, 0, 0]);
+}
+
+#[test]
+fn hscroll_write_before_hblank_updates_current_line_latch_only() {
+    let mut vdp = Vdp::new();
+    vdp.write_control_port(0x8D3C); // hscroll table @ 0xF000
+    vdp.write_vram_u8(0xF000, 0x00);
+    vdp.write_vram_u8(0xF001, 0x00);
+
+    step_until_line_start(&mut vdp, 0);
+    vdp.step(1);
+    vdp.write_vram_u8(0xF000, 0xFF);
+    vdp.write_vram_u8(0xF001, 0xF8);
+    step_until_line_hblank(&mut vdp, 0);
+
+    assert_eq!(vdp.line_hscroll_words(0)[0], 0xFFF8);
+    assert_eq!(vdp.line_hscroll_words(1)[0], 0x0000);
+}
+
+#[test]
+fn hscroll_write_after_hblank_affects_next_line_not_current_line() {
+    let mut vdp = Vdp::new();
+    vdp.write_control_port(0x8D3C); // hscroll table @ 0xF000
+    vdp.write_vram_u8(0xF000, 0x00);
+    vdp.write_vram_u8(0xF001, 0x00);
+
+    step_until_line_hblank(&mut vdp, 0);
+    vdp.step(1);
+    vdp.write_vram_u8(0xF000, 0xFF);
+    vdp.write_vram_u8(0xF001, 0xF8);
+
+    assert_eq!(vdp.line_hscroll_words(0)[0], 0x0000);
+    assert_eq!(vdp.line_hscroll_words(1)[0], 0x0000);
+
+    step_until_line_hblank(&mut vdp, 1);
+    assert_eq!(vdp.line_hscroll_words(0)[0], 0x0000);
+    assert_eq!(vdp.line_hscroll_words(1)[0], 0xFFF8);
+}
+
+#[test]
+fn vscroll_write_before_hblank_updates_current_line_latch_only() {
+    let mut vdp = Vdp::new();
+    vdp.write_vsram_u16(0, 0);
+
+    step_until_line_start(&mut vdp, 0);
+    vdp.step(1);
+    vdp.write_vsram_u16(0, 8);
+    step_until_line_hblank(&mut vdp, 0);
+
+    assert_eq!(vdp.line_vsram_u16(0, 0), 8);
+    assert_eq!(vdp.line_vsram_u16(1, 0), 0);
+}
+
+#[test]
+fn vscroll_write_after_hblank_affects_next_line_not_current_line() {
+    let mut vdp = Vdp::new();
+    vdp.write_vsram_u16(0, 0);
+
+    step_until_line_hblank(&mut vdp, 0);
+    vdp.step(1);
+    vdp.write_vsram_u16(0, 8);
+
+    assert_eq!(vdp.line_vsram_u16(0, 0), 0);
+    assert_eq!(vdp.line_vsram_u16(1, 0), 0);
+
+    step_until_line_hblank(&mut vdp, 1);
+    assert_eq!(vdp.line_vsram_u16(0, 0), 0);
+    assert_eq!(vdp.line_vsram_u16(1, 0), 8);
 }
 
 #[test]

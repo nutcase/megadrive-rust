@@ -188,8 +188,8 @@ pub struct Vdp {
     quirk_comix_pretitle_plane_b_bias: bool,
     /// Scratch buffer for per-pixel plane metadata (reused across frames).
     render_plane_meta: ScratchBuf<u8>,
-    /// Scratch flags for SAT debug rendering options (not serialized).
-    debug_sat_flags: ScratchBuf<bool>,
+    /// Scratch flags for sprite debug rendering options (not serialized).
+    debug_sprite_flags: ScratchBuf<bool>,
     /// Scratch buffer for sprite pixel fill tracking (reused across frames).
     render_sprite_filled: ScratchBuf<bool>,
 }
@@ -208,6 +208,8 @@ impl Vdp {
     const DEBUG_SAT_LINE_LATCH_FLAG: usize = 0;
     const DEBUG_SAT_LIVE_FLAG: usize = 1;
     const DEBUG_SAT_PER_LINE_FLAG: usize = 2;
+    const DEBUG_SPRITE_PATTERN_LINE0_FLAG: usize = 3;
+    const DEBUG_SPRITE_PATTERN_PER_LINE_FLAG: usize = 4;
     #[cfg(test)]
     const CYCLES_PER_FRAME: u64 = Self::NTSC_CYCLES_PER_FRAME;
     #[cfg(test)]
@@ -268,7 +270,7 @@ impl Vdp {
             quirk_vscroll_swap_ab: false,
             quirk_comix_pretitle_plane_b_bias: false,
             render_plane_meta: ScratchBuf(vec![0u8; FRAME_WIDTH * FRAME_HEIGHT]),
-            debug_sat_flags: ScratchBuf(vec![false; 3]),
+            debug_sprite_flags: ScratchBuf(vec![false; 5]),
             render_sprite_filled: ScratchBuf(vec![false; FRAME_WIDTH * FRAME_HEIGHT]),
         };
         vdp.reset_line_state();
@@ -1190,15 +1192,23 @@ impl Vdp {
     }
 
     pub fn set_sat_line_latch_for_debug(&mut self, enabled: bool) {
-        self.set_debug_sat_flag(Self::DEBUG_SAT_LINE_LATCH_FLAG, enabled);
+        self.set_debug_sprite_flag(Self::DEBUG_SAT_LINE_LATCH_FLAG, enabled);
     }
 
     pub fn set_sat_live_for_debug(&mut self, enabled: bool) {
-        self.set_debug_sat_flag(Self::DEBUG_SAT_LIVE_FLAG, enabled);
+        self.set_debug_sprite_flag(Self::DEBUG_SAT_LIVE_FLAG, enabled);
     }
 
     pub fn set_sat_per_line_for_debug(&mut self, enabled: bool) {
-        self.set_debug_sat_flag(Self::DEBUG_SAT_PER_LINE_FLAG, enabled);
+        self.set_debug_sprite_flag(Self::DEBUG_SAT_PER_LINE_FLAG, enabled);
+    }
+
+    pub fn set_sprite_pattern_line0_for_debug(&mut self, enabled: bool) {
+        self.set_debug_sprite_flag(Self::DEBUG_SPRITE_PATTERN_LINE0_FLAG, enabled);
+    }
+
+    pub fn set_sprite_pattern_per_line_for_debug(&mut self, enabled: bool) {
+        self.set_debug_sprite_flag(Self::DEBUG_SPRITE_PATTERN_PER_LINE_FLAG, enabled);
     }
 
     pub(crate) fn refresh_line0_latch_if_active(&mut self) {
@@ -1213,15 +1223,27 @@ impl Vdp {
         ((self.registers[REG_SPRITE_TABLE] as usize & mask) << 9) % VRAM_SIZE
     }
 
-    fn debug_sat_flag(&self, index: usize) -> bool {
-        self.debug_sat_flags.get(index).copied().unwrap_or(false)
+    fn debug_sprite_flag(&self, index: usize) -> bool {
+        self.debug_sprite_flags.get(index).copied().unwrap_or(false)
     }
 
-    fn set_debug_sat_flag(&mut self, index: usize, enabled: bool) {
-        if self.debug_sat_flags.len() <= index {
-            self.debug_sat_flags.resize(index + 1, false);
+    fn set_debug_sprite_flag(&mut self, index: usize, enabled: bool) {
+        if self.debug_sprite_flags.len() <= index {
+            self.debug_sprite_flags.resize(index + 1, false);
         }
-        self.debug_sat_flags[index] = enabled;
+        self.debug_sprite_flags[index] = enabled;
+    }
+
+    fn debug_sat_flag(&self, index: usize) -> bool {
+        self.debug_sprite_flag(index)
+    }
+
+    fn sprite_pattern_line0_enabled(&self) -> bool {
+        let force_per_line = self.debug_sprite_flag(Self::DEBUG_SPRITE_PATTERN_PER_LINE_FLAG)
+            || std::env::var_os("MEGADRIVE_DEBUG_SPRITE_PATTERN_PER_LINE").is_some();
+        !force_per_line
+            && (self.debug_sprite_flag(Self::DEBUG_SPRITE_PATTERN_LINE0_FLAG)
+                || std::env::var_os("MEGADRIVE_DEBUG_SPRITE_PATTERN_LINE0").is_some())
     }
 
     fn nametable_base_from_regs(regs: &[u8; REG_COUNT]) -> usize {
@@ -1995,9 +2017,7 @@ impl Vdp {
         sprite_y_offset: i32,
     ) {
         let swap_size = std::env::var_os("MEGADRIVE_DEBUG_SPRITE_SWAP_SIZE").is_some();
-        let sprite_pattern_line0 = std::env::var_os("MEGADRIVE_DEBUG_SPRITE_PATTERN_LINE0")
-            .is_some()
-            && std::env::var_os("MEGADRIVE_DEBUG_SPRITE_PATTERN_PER_LINE").is_none();
+        let sprite_pattern_line0 = self.sprite_pattern_line0_enabled();
         let sprite_row_major = std::env::var_os("MEGADRIVE_DEBUG_SPRITE_ROW_MAJOR").is_some();
         let disable_mask_sprite = std::env::var_os("MEGADRIVE_DEBUG_DISABLE_SPRITE_MASK").is_some();
 
@@ -2286,9 +2306,7 @@ impl Vdp {
         let height_px = height_tiles * 8;
         let disable_mask_sprite = std::env::var_os("MEGADRIVE_DEBUG_DISABLE_SPRITE_MASK").is_some();
         let is_mask_sprite = (x_word & 0x01FF) == 0 && !disable_mask_sprite;
-        let sprite_pattern_line0 = std::env::var_os("MEGADRIVE_DEBUG_SPRITE_PATTERN_LINE0")
-            .is_some()
-            && std::env::var_os("MEGADRIVE_DEBUG_SPRITE_PATTERN_PER_LINE").is_none();
+        let sprite_pattern_line0 = self.sprite_pattern_line0_enabled();
         let sprite_row_major = std::env::var_os("MEGADRIVE_DEBUG_SPRITE_ROW_MAJOR").is_some();
 
         for sy in 0..height_px {
