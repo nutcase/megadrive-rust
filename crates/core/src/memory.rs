@@ -593,23 +593,11 @@ impl MemoryMap {
     }
 
     fn apply_cartridge_compat_quirks(&mut self) {
-        let sonic3 = sonic3_compat_quirks_enabled(&self.cartridge);
-        let comix = comix_zone_compat_quirks_enabled(&self.cartridge);
-        self.vdp.set_quirk_plane_a_64x32_paged(sonic3);
-        self.vdp.set_quirk_vscroll_swap_ab(comix);
+        let _ = &self.cartridge;
     }
 }
 
-fn sonic3_compat_quirks_enabled(cartridge: &Cartridge) -> bool {
-    let header = cartridge.header();
-    if header.product_code.contains("MK-1079") {
-        return true;
-    }
-    let domestic = header.domestic_title.to_ascii_uppercase();
-    let overseas = header.overseas_title.to_ascii_uppercase();
-    domestic.contains("HEDGEHOG 3") || overseas.contains("HEDGEHOG 3")
-}
-
+#[cfg(test)]
 fn comix_zone_compat_quirks_enabled(cartridge: &Cartridge) -> bool {
     let header = cartridge.header();
     if header.product_code.contains("G-4132") {
@@ -739,16 +727,6 @@ mod tests {
         rom[0x120..0x150].copy_from_slice(&title);
         let cart = Cartridge::from_bytes(rom).expect("valid cart");
         assert!(comix_zone_compat_quirks_enabled(&cart));
-    }
-
-    #[test]
-    fn comix_zone_compat_quirk_enables_vscroll_swap() {
-        let mut rom = vec![0; 0x400];
-        rom[0x180..0x18E].copy_from_slice(b"GM G-4132  -00");
-        let cart = Cartridge::from_bytes(rom).expect("valid cart");
-        let memory = MemoryMap::new(cart);
-        assert!(memory.vdp().quirk_vscroll_swap_ab_enabled());
-        assert!(!memory.vdp().quirk_comix_pretitle_plane_b_bias_enabled());
     }
 
     #[test]

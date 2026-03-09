@@ -180,12 +180,6 @@ pub struct Vdp {
     dma_bus_pending: Option<BusDmaRequest>,
     dma_fill_ops: u64,
     dma_copy_ops: u64,
-    quirk_bottom_bg_mask: bool,
-    quirk_live_plane_vram: bool,
-    quirk_live_hscroll: bool,
-    quirk_plane_a_64x32_paged: bool,
-    quirk_vscroll_swap_ab: bool,
-    quirk_comix_pretitle_plane_b_bias: bool,
     /// Scratch buffer for per-pixel plane metadata (reused across frames).
     render_plane_meta: ScratchBuf<u8>,
     /// Scratch flags for sprite debug rendering options (not serialized).
@@ -263,12 +257,6 @@ impl Vdp {
             dma_bus_pending: None,
             dma_fill_ops: 0,
             dma_copy_ops: 0,
-            quirk_bottom_bg_mask: false,
-            quirk_live_plane_vram: false,
-            quirk_live_hscroll: false,
-            quirk_plane_a_64x32_paged: false,
-            quirk_vscroll_swap_ab: false,
-            quirk_comix_pretitle_plane_b_bias: false,
             render_plane_meta: ScratchBuf(vec![0u8; FRAME_WIDTH * FRAME_HEIGHT]),
             debug_sprite_flags: ScratchBuf(vec![false; 5]),
             render_sprite_filled: ScratchBuf(vec![false; FRAME_WIDTH * FRAME_HEIGHT]),
@@ -288,44 +276,10 @@ impl Vdp {
         self.video_standard.total_lines()
     }
 
-    pub fn set_quirk_bottom_bg_mask(&mut self, enabled: bool) {
-        self.quirk_bottom_bg_mask = enabled;
-    }
-
-    pub fn set_quirk_live_plane_vram(&mut self, enabled: bool) {
-        self.quirk_live_plane_vram = enabled;
-    }
-
-    pub fn set_quirk_live_hscroll(&mut self, enabled: bool) {
-        self.quirk_live_hscroll = enabled;
-    }
-
-    pub fn set_quirk_plane_a_64x32_paged(&mut self, enabled: bool) {
-        self.quirk_plane_a_64x32_paged = enabled;
-    }
-
-    pub fn set_quirk_vscroll_swap_ab(&mut self, enabled: bool) {
-        self.quirk_vscroll_swap_ab = enabled;
-    }
-
-    pub fn set_quirk_comix_pretitle_plane_b_bias(&mut self, enabled: bool) {
-        self.quirk_comix_pretitle_plane_b_bias = enabled;
-    }
-
     pub fn refresh_runtime_debug_config_from_env(&mut self) {
         self.line_vram_latch_enabled =
             std::env::var_os("MEGADRIVE_DEBUG_LINE_VRAM_LATCH").is_some();
         self.debug_line_latch_next = std::env::var_os("MEGADRIVE_DEBUG_LINE_LATCH_NEXT").is_some();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn quirk_vscroll_swap_ab_enabled(&self) -> bool {
-        self.quirk_vscroll_swap_ab
-    }
-
-    #[cfg(test)]
-    pub(crate) fn quirk_comix_pretitle_plane_b_bias_enabled(&self) -> bool {
-        self.quirk_comix_pretitle_plane_b_bias
     }
 
     fn cycles_per_frame(&self) -> u64 {
@@ -1489,16 +1443,6 @@ impl Vdp {
         hactive && vactive
     }
 
-    fn comix_pretitle_plane_b_bias_active(
-        regs: &[u8; REG_COUNT],
-        vsram: &[u16; VSRAM_WORDS],
-    ) -> bool {
-        regs[REG_PLANE_B_NAMETABLE] == 0x07
-            && (regs[REG_MODE_SET_2] & 0x40) != 0
-            && regs[REG_PLANE_SIZE] == 0x11
-            && (vsram[0] & 0x07FF) == 0x00B8
-    }
-
     fn comix_pretitle_vscroll_swap_active(regs: &[u8; REG_COUNT]) -> bool {
         // Comix Zone uses swapped A/B VSRAM sources during the early pre-title logo scene
         // (32x32 plane setup with per-line hscroll). Later title rollout uses normal mapping.
@@ -1589,10 +1533,8 @@ impl Vdp {
             .ok()
             .and_then(|v| v.parse::<isize>().ok())
             .unwrap_or(0);
-        let bottom_bg_mask = self.quirk_bottom_bg_mask
-            || std::env::var_os("MEGADRIVE_DEBUG_BOTTOM_BG_MASK").is_some();
-        let hscroll_live =
-            self.quirk_live_hscroll || std::env::var_os("MEGADRIVE_DEBUG_HSCROLL_LIVE").is_some();
+        let bottom_bg_mask = std::env::var_os("MEGADRIVE_DEBUG_BOTTOM_BG_MASK").is_some();
+        let hscroll_live = std::env::var_os("MEGADRIVE_DEBUG_HSCROLL_LIVE").is_some();
         let disable_64x32_paged =
             std::env::var_os("MEGADRIVE_DEBUG_DISABLE_64X32_PAGED").is_some();
         let disable_64x32_paged_a =
@@ -1603,14 +1545,8 @@ impl Vdp {
             std::env::var_os("MEGADRIVE_DEBUG_PLANE_A_64X32_PAGED").is_some();
         let debug_plane_b_64x32_paged =
             std::env::var_os("MEGADRIVE_DEBUG_PLANE_B_64X32_PAGED").is_some();
-        let disable_comix_bias =
-            std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_BIAS").is_some();
         let disable_comix_roll_fix =
             std::env::var_os("MEGADRIVE_DEBUG_DISABLE_COMIX_ROLL_FIX").is_some();
-        let comix_b_bias_offset = std::env::var("MEGADRIVE_DEBUG_COMIX_BIAS_Y")
-            .ok()
-            .and_then(|v| v.parse::<i16>().ok())
-            .unwrap_or(64);
         let comix_roll_offset = std::env::var("MEGADRIVE_DEBUG_COMIX_ROLL_Y")
             .ok()
             .and_then(|v| v.parse::<i16>().ok())
@@ -1653,7 +1589,7 @@ impl Vdp {
                 self.line_cram.get(line_idx).copied().unwrap_or(self.cram)
             };
             let vram =
-                if use_plane_line_latch && !force_plane_live_vram && !self.quirk_live_plane_vram {
+                if use_plane_line_latch && !force_plane_live_vram {
                     self.line_vram.get(line_idx).unwrap_or(&self.vram)
                 } else {
                     &self.vram
@@ -1677,13 +1613,13 @@ impl Vdp {
                 Self::plane_tile_dimensions_from_regs(&regs);
             let (window_width_tiles, window_height_tiles) =
                 Self::window_tile_dimensions_from_regs(&regs);
-            let quirk_64x32_paged = self.quirk_plane_a_64x32_paged && plane_width_tiles > 64;
+            let auto_64x32_paged = plane_width_tiles > 64;
             let plane_a_uses_64x32_paged = !disable_64x32_paged
                 && !disable_64x32_paged_a
-                && (debug_plane_a_64x32_paged || quirk_64x32_paged);
+                && (debug_plane_a_64x32_paged || auto_64x32_paged);
             let plane_b_uses_64x32_paged = !disable_64x32_paged
                 && !disable_64x32_paged_b
-                && (debug_plane_b_64x32_paged || quirk_64x32_paged);
+                && (debug_plane_b_64x32_paged || auto_64x32_paged);
             let plane_width_px = plane_width_tiles * 8;
             let plane_height_px = plane_height_tiles * 8;
             let window_width_px = window_width_tiles * 8;
@@ -1700,24 +1636,22 @@ impl Vdp {
                 normalize_scroll(Self::sign_extend_11(hscroll_words[0]), plane_width_px);
             let b_hscroll =
                 normalize_scroll(Self::sign_extend_11(hscroll_words[1]), plane_width_px);
-            let comix_b_bias_active = Self::comix_pretitle_plane_b_bias_active(&regs, &vsram);
-            let comix_b_bias = self.quirk_comix_pretitle_plane_b_bias
-                && !disable_comix_bias
-                && comix_b_bias_active;
-            let comix_title_roll = self.quirk_vscroll_swap_ab
+            let comix_swap_fix_active = Self::comix_pretitle_vscroll_swap_active(&regs)
+                || Self::comix_title_roll_active(&regs, &vsram);
+            let comix_title_roll = comix_swap_fix_active
                 && Self::comix_title_roll_active(&regs, &vsram)
                 && !disable_comix_roll_fix;
             // Suppress plane B pixels whose nametable entries fall inside the
             // HSCROLL table region.  This is computed from the actual register
             // values each line (independent of comix_title_roll_active) so that
             // mid-frame register changes from H-INT don't create gaps.
-            let comix_roll_overlap_limit = if self.quirk_vscroll_swap_ab {
+            let comix_roll_overlap_limit = if comix_swap_fix_active {
                 Self::plane_b_hscroll_overlap_pixel_row(&regs)
             } else {
                 None
             };
-            let swap_vscroll_ab = debug_swap_vscroll_ab
-                || (self.quirk_vscroll_swap_ab && Self::comix_pretitle_vscroll_swap_active(&regs));
+            let swap_vscroll_ab =
+                debug_swap_vscroll_ab || Self::comix_pretitle_vscroll_swap_active(&regs);
             if comix_title_roll {
                 comix_title_roll_any = true;
                 comix_title_roll_active_height = line_active_height;
@@ -1763,11 +1697,6 @@ impl Vdp {
                     } else {
                         (y + b_vscroll) % plane_height_px
                     };
-                    if comix_b_bias {
-                        sample_y = (sample_y as isize + comix_b_bias_offset as isize)
-                            .rem_euclid(plane_height_px as isize)
-                            as usize;
-                    }
                     if comix_title_roll {
                         sample_y = (sample_y as isize + comix_roll_offset as isize)
                             .rem_euclid(plane_height_px as isize)

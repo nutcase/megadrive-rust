@@ -580,7 +580,7 @@ fn plane_b_vertical_scroll_uses_positive_direction() {
 }
 
 #[test]
-fn vscroll_swap_quirk_swaps_plane_vsram_indices() {
+fn comix_pretitle_vscroll_swap_auto_swaps_plane_vsram_indices() {
     fn setup_plane_b_scroll_probe(vdp: &mut Vdp) {
         vdp.vram.fill(0);
         vdp.cram.fill(0);
@@ -614,20 +614,14 @@ fn vscroll_swap_quirk_swaps_plane_vsram_indices() {
         vdp.write_vsram_u16(1, 0);
     }
 
-    let mut baseline = Vdp::new();
-    setup_plane_b_scroll_probe(&mut baseline);
-    baseline.step(Vdp::CYCLES_PER_FRAME as u32);
-    assert_eq!(&baseline.frame_buffer()[0..3], &[252, 0, 0]);
-
-    let mut swapped = Vdp::new();
-    setup_plane_b_scroll_probe(&mut swapped);
-    swapped.set_quirk_vscroll_swap_ab(true);
-    swapped.step(Vdp::CYCLES_PER_FRAME as u32);
-    assert_eq!(&swapped.frame_buffer()[0..3], &[0, 252, 0]);
+    let mut vdp = Vdp::new();
+    setup_plane_b_scroll_probe(&mut vdp);
+    vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+    assert_eq!(&vdp.frame_buffer()[0..3], &[0, 252, 0]);
 }
 
 #[test]
-fn comix_title_roll_quirk_keeps_default_plane_b_sampling_without_bias() {
+fn comix_title_roll_auto_keeps_default_plane_b_sampling_without_bias() {
     fn setup_comix_title_roll_probe(vdp: &mut Vdp) {
         vdp.vram.fill(0);
         vdp.cram.fill(0);
@@ -663,20 +657,14 @@ fn comix_title_roll_quirk_keeps_default_plane_b_sampling_without_bias() {
         vdp.write_vsram_u16(1, 0x0000);
     }
 
-    let mut baseline = Vdp::new();
-    setup_comix_title_roll_probe(&mut baseline);
-    baseline.step(Vdp::CYCLES_PER_FRAME as u32);
-    assert_eq!(&baseline.frame_buffer()[0..3], &[252, 0, 0]);
-
-    let mut with_quirk = Vdp::new();
-    setup_comix_title_roll_probe(&mut with_quirk);
-    with_quirk.set_quirk_vscroll_swap_ab(true);
-    with_quirk.step(Vdp::CYCLES_PER_FRAME as u32);
-    assert_eq!(&with_quirk.frame_buffer()[0..3], &[252, 0, 0]);
+    let mut vdp = Vdp::new();
+    setup_comix_title_roll_probe(&mut vdp);
+    vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+    assert_eq!(&vdp.frame_buffer()[0..3], &[252, 0, 0]);
 }
 
 #[test]
-fn comix_title_roll_quirk_masks_lower_region_to_black() {
+fn comix_title_roll_auto_masks_lower_region_to_black() {
     let mut vdp = Vdp::new();
     vdp.vram.fill(0);
     vdp.cram.fill(0);
@@ -693,7 +681,6 @@ fn comix_title_roll_quirk_masks_lower_region_to_black() {
     // Plane B vscroll=128 so that screen line 150 maps to sample_y=278,
     // which falls inside the nametable/HSCROLL overlap region (>=256).
     vdp.write_vsram_u16(1, 0x0080);
-    vdp.set_quirk_vscroll_swap_ab(true);
 
     // Tile 1: solid palette index 1 (red).
     for i in 0..32u16 {
@@ -1619,9 +1606,10 @@ fn plane_size_code_3_decodes_to_128_cells() {
     // x=0 tile -> red
     vdp.write_vram_u8(plane_a as u16, 0x00);
     vdp.write_vram_u8((plane_a + 1) as u16, 0x01);
-    // x=64 tile -> green. Width=64 would wrap this position to x=0,
-    // while width=128 keeps it distinct.
-    let x64 = plane_a + 64 * 2;
+    // On 128x32 maps, the second half of the row lives in the second 64x32
+    // page. Width=64 would wrap this position to x=0; width=128 keeps it
+    // distinct and uses the paged nametable layout.
+    let x64 = plane_a + 64 * 32 * 2;
     vdp.write_vram_u8(x64 as u16, 0x00);
     vdp.write_vram_u8((x64 + 1) as u16, 0x02);
 
@@ -1640,82 +1628,72 @@ fn plane_size_code_3_decodes_to_128_cells() {
 }
 
 #[test]
-fn plane_a_64x32_paged_quirk_changes_second_page_row_addressing() {
-    let mut baseline = Vdp::new();
-    baseline.vram.fill(0);
-    baseline.cram.fill(0);
-    baseline.vsram.fill(0);
+fn plane_a_64x32_paged_changes_second_page_row_addressing() {
+    let mut vdp = Vdp::new();
+    vdp.vram.fill(0);
+    vdp.cram.fill(0);
+    vdp.vsram.fill(0);
 
     // reg16=0x03 => 128x32 cells.
-    baseline.write_control_port(0x9003);
-    baseline.write_control_port(0x8D3C); // hscroll table @ 0xF000
+    vdp.write_control_port(0x9003);
+    vdp.write_control_port(0x8D3C); // hscroll table @ 0xF000
     let plane_a = 0xC000usize;
 
     // Sample row 1, column 64 at screen origin.
     let linear_addr = plane_a + ((128 + 64) * 2);
     let paged_addr = plane_a + 64 * 32 * 2 + 64 * 2;
-    baseline.write_vram_u8(linear_addr as u16, 0x00);
-    baseline.write_vram_u8((linear_addr + 1) as u16, 0x01);
-    baseline.write_vram_u8(paged_addr as u16, 0x00);
-    baseline.write_vram_u8((paged_addr + 1) as u16, 0x02);
+    vdp.write_vram_u8(linear_addr as u16, 0x00);
+    vdp.write_vram_u8((linear_addr + 1) as u16, 0x01);
+    vdp.write_vram_u8(paged_addr as u16, 0x00);
+    vdp.write_vram_u8((paged_addr + 1) as u16, 0x02);
 
-    baseline.write_cram_u16(1, encode_md_color(7, 0, 0));
-    baseline.write_cram_u16(2, encode_md_color(0, 7, 0));
+    vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
+    vdp.write_cram_u16(2, encode_md_color(0, 7, 0));
     for i in 0..4u16 {
-        baseline.write_vram_u8(32 + i, 0x11);
-        baseline.write_vram_u8(64 + i, 0x22);
+        vdp.write_vram_u8(32 + i, 0x11);
+        vdp.write_vram_u8(64 + i, 0x22);
     }
-    baseline.write_vsram_u16(0, 8);
-    baseline.write_vram_u8(0xF000, 0xFE);
-    baseline.write_vram_u8(0xF001, 0x00);
+    vdp.write_vsram_u16(0, 8);
+    vdp.write_vram_u8(0xF000, 0xFE);
+    vdp.write_vram_u8(0xF001, 0x00);
 
-    baseline.step(Vdp::CYCLES_PER_FRAME as u32);
-    assert_eq!(&baseline.frame_buffer()[0..3], &[252, 0, 0]);
-
-    let mut with_quirk = baseline.clone();
-    with_quirk.set_quirk_plane_a_64x32_paged(true);
-    with_quirk.step(Vdp::CYCLES_PER_FRAME as u32);
-    assert_eq!(&with_quirk.frame_buffer()[0..3], &[0, 252, 0]);
+    vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+    assert_eq!(&vdp.frame_buffer()[0..3], &[0, 252, 0]);
 }
 
 #[test]
-fn plane_b_64x32_paged_quirk_changes_second_page_row_addressing() {
-    let mut baseline = Vdp::new();
-    baseline.vram.fill(0);
-    baseline.cram.fill(0);
-    baseline.vsram.fill(0);
+fn plane_b_64x32_paged_changes_second_page_row_addressing() {
+    let mut vdp = Vdp::new();
+    vdp.vram.fill(0);
+    vdp.cram.fill(0);
+    vdp.vsram.fill(0);
 
     // Plane B base @ 0xE000, reg16=0x03 => 128x32 cells.
-    baseline.write_control_port(0x8407);
-    baseline.write_control_port(0x9003);
-    baseline.write_control_port(0x8D3C); // hscroll table @ 0xF000
+    vdp.write_control_port(0x8407);
+    vdp.write_control_port(0x9003);
+    vdp.write_control_port(0x8D3C); // hscroll table @ 0xF000
     let plane_b = 0xE000usize;
 
     // Sample row 1, column 64 at screen origin.
     let linear_addr = plane_b + ((128 + 64) * 2);
     let paged_addr = plane_b + 64 * 32 * 2 + 64 * 2;
-    baseline.write_vram_u8(linear_addr as u16, 0x00);
-    baseline.write_vram_u8((linear_addr + 1) as u16, 0x01);
-    baseline.write_vram_u8(paged_addr as u16, 0x00);
-    baseline.write_vram_u8((paged_addr + 1) as u16, 0x02);
+    vdp.write_vram_u8(linear_addr as u16, 0x00);
+    vdp.write_vram_u8((linear_addr + 1) as u16, 0x01);
+    vdp.write_vram_u8(paged_addr as u16, 0x00);
+    vdp.write_vram_u8((paged_addr + 1) as u16, 0x02);
 
-    baseline.write_cram_u16(1, encode_md_color(7, 0, 0));
-    baseline.write_cram_u16(2, encode_md_color(0, 7, 0));
+    vdp.write_cram_u16(1, encode_md_color(7, 0, 0));
+    vdp.write_cram_u16(2, encode_md_color(0, 7, 0));
     for i in 0..4u16 {
-        baseline.write_vram_u8(32 + i, 0x11);
-        baseline.write_vram_u8(64 + i, 0x22);
+        vdp.write_vram_u8(32 + i, 0x11);
+        vdp.write_vram_u8(64 + i, 0x22);
     }
-    baseline.write_vsram_u16(1, 8);
-    baseline.write_vram_u8(0xF002, 0xFE);
-    baseline.write_vram_u8(0xF003, 0x00);
+    vdp.write_vsram_u16(1, 8);
+    vdp.write_vram_u8(0xF002, 0xFE);
+    vdp.write_vram_u8(0xF003, 0x00);
 
-    baseline.step(Vdp::CYCLES_PER_FRAME as u32);
-    assert_eq!(&baseline.frame_buffer()[0..3], &[252, 0, 0]);
-
-    let mut with_quirk = baseline.clone();
-    with_quirk.set_quirk_plane_a_64x32_paged(true);
-    with_quirk.step(Vdp::CYCLES_PER_FRAME as u32);
-    assert_eq!(&with_quirk.frame_buffer()[0..3], &[0, 252, 0]);
+    vdp.step(Vdp::CYCLES_PER_FRAME as u32);
+    assert_eq!(&vdp.frame_buffer()[0..3], &[0, 252, 0]);
 }
 
 #[test]
