@@ -2,6 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/scripts/release-env.sh"
+megadrive_configure_release_env
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 [--no-egui] <path-to-rom.bin> [--boot-frames N]"
@@ -36,5 +38,7 @@ export MEGADRIVE_BOOT_FRAMES
 # Keep cheat save/load path stable regardless of current working directory.
 : "${MEGADRIVE_CHEAT_DIR:=$SCRIPT_DIR/cheats}"
 export MEGADRIVE_CHEAT_DIR
+
+megadrive_release_env_summary >&2
 
 exec cargo run --release --manifest-path "$SCRIPT_DIR/Cargo.toml" -p megadrive-cli --bin "$BIN_NAME" -- "$ROM_PATH" "$@"

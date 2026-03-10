@@ -2,6 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/scripts/release-env.sh"
+megadrive_configure_release_env
 
 usage() {
   cat <<'USAGE'
