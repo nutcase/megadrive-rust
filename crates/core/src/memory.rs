@@ -488,7 +488,16 @@ impl MemoryMap {
             SRAM_CTRL_ADDR_ODD => {
                 (self.save_ram_enabled as u8) | ((self.save_ram_write_protect as u8) << 1)
             }
+            // Sega mapper bank register reads (0xA130F2..0xA130FF, even bytes)
+            0xA130F2..=0xA130FF if (addr & 1) == 0 => {
+                let reg_index = ((addr - 0xA130F0) >> 1) as usize;
+                self.cartridge.read_bank_register(reg_index)
+            }
             0x000000..=0x3FFFFF => {
+                // EEPROM mapped region
+                if self.cartridge.eeprom_mapped(addr) {
+                    return self.cartridge.read_eeprom(addr);
+                }
                 if self.save_ram_enabled
                     && let Some(value) = self.cartridge.read_save_ram_u8(addr)
                 {
@@ -536,7 +545,19 @@ impl MemoryMap {
                 self.save_ram_enabled = (value & 0x01) != 0;
                 self.save_ram_write_protect = (value & 0x02) != 0;
             }
+            // Sega mapper bank register writes (0xA130F2..0xA130FF, even bytes)
+            0xA130F2..=0xA130FF if (addr & 1) == 0 => {
+                let reg_index = ((addr - 0xA130F0) >> 1) as usize;
+                self.cartridge.write_bank_register(reg_index, value);
+            }
             0x000000..=0x3FFFFF => {
+                // EEPROM: only even byte triggers I2C (odd byte is silently absorbed)
+                if self.cartridge.eeprom_mapped(addr) {
+                    if self.cartridge.eeprom_write_triggers(addr) {
+                        self.cartridge.write_eeprom(addr, value);
+                    }
+                    return;
+                }
                 if self.save_ram_enabled
                     && !self.save_ram_write_protect
                     && self.cartridge.write_save_ram_u8(addr, value)
@@ -1003,6 +1024,136 @@ mod tests {
         assert_eq!(memory.read_u16(0xA130F0), 0x0003);
         memory.write_u8(0x000201, 0x34);
         assert_eq!(memory.read_u8(0x000201), 0x12);
+    }
+
+    #[test]
+    fn eeprom_word_access_toggles_i2c_once() {
+        // Build a ROM that triggers EEPROM detection (NBA Jam product code).
+        let mut rom = vec![0u8; 0x400];
+        rom[0x180..0x18E].copy_from_slice(b"T-81326 -00\x00\x00\x00");
+        let cart = Cartridge::from_bytes(rom).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        let scl: u16 = 0x0002;
+        let sda: u16 = 0x0001;
+        let addr: u32 = 0x200000;
+
+        // Helper: write a word to EEPROM address (only even byte should trigger I2C)
+        let mut i2c_word_write = |m: &mut MemoryMap, val: u16| {
+            m.write_u16(addr, val);
+        };
+
+        // I2C START: SDA falls while SCL high
+        i2c_word_write(&mut memory, (scl | sda) as u16);
+        i2c_word_write(&mut memory, scl as u16); // SDA low, SCL high = START
+
+        // Send device address 0xA0 (write) via word writes — each word write
+        // should toggle I2C exactly once, not twice.
+        let device_byte: u8 = 0xA0;
+        for i in (0..8).rev() {
+            let sda_val = if (device_byte >> i) & 1 != 0 { sda } else { 0 };
+            i2c_word_write(&mut memory, sda_val as u16);           // SCL low
+            i2c_word_write(&mut memory, (sda_val | scl) as u16);   // SCL high
+            i2c_word_write(&mut memory, sda_val as u16);           // SCL low
+        }
+        // ACK clock
+        i2c_word_write(&mut memory, 0);
+        i2c_word_write(&mut memory, scl as u16);
+        i2c_word_write(&mut memory, 0);
+
+        // Send word address 0x00
+        for _ in 0..8 {
+            i2c_word_write(&mut memory, 0);
+            i2c_word_write(&mut memory, scl as u16);
+            i2c_word_write(&mut memory, 0);
+        }
+        i2c_word_write(&mut memory, 0);
+        i2c_word_write(&mut memory, scl as u16);
+        i2c_word_write(&mut memory, 0);
+
+        // Send data 0x55
+        let data_byte: u8 = 0x55;
+        for i in (0..8).rev() {
+            let sda_val = if (data_byte >> i) & 1 != 0 { sda } else { 0 };
+            i2c_word_write(&mut memory, sda_val as u16);
+            i2c_word_write(&mut memory, (sda_val | scl) as u16);
+            i2c_word_write(&mut memory, sda_val as u16);
+        }
+        i2c_word_write(&mut memory, 0);
+        i2c_word_write(&mut memory, scl as u16);
+        i2c_word_write(&mut memory, 0);
+
+        // STOP
+        i2c_word_write(&mut memory, 0);
+        i2c_word_write(&mut memory, scl as u16);
+        i2c_word_write(&mut memory, (scl | sda) as u16);
+
+        // Read back via sequential read: START, dev write, word addr, re-START, dev read
+        i2c_word_write(&mut memory, (scl | sda) as u16);
+        i2c_word_write(&mut memory, scl as u16); // START
+
+        // Device write 0xA0
+        for i in (0..8).rev() {
+            let sda_val = if (0xA0u8 >> i) & 1 != 0 { sda } else { 0 };
+            i2c_word_write(&mut memory, sda_val as u16);
+            i2c_word_write(&mut memory, (sda_val | scl) as u16);
+            i2c_word_write(&mut memory, sda_val as u16);
+        }
+        i2c_word_write(&mut memory, 0);
+        i2c_word_write(&mut memory, scl as u16);
+        i2c_word_write(&mut memory, 0);
+
+        // Word addr 0x00
+        for _ in 0..8 {
+            i2c_word_write(&mut memory, 0);
+            i2c_word_write(&mut memory, scl as u16);
+            i2c_word_write(&mut memory, 0);
+        }
+        i2c_word_write(&mut memory, 0);
+        i2c_word_write(&mut memory, scl as u16);
+        i2c_word_write(&mut memory, 0);
+
+        // Re-START
+        i2c_word_write(&mut memory, sda as u16);
+        i2c_word_write(&mut memory, (scl | sda) as u16);
+        i2c_word_write(&mut memory, scl as u16);
+
+        // Device read 0xA1
+        for i in (0..8).rev() {
+            let sda_val = if (0xA1u8 >> i) & 1 != 0 { sda } else { 0 };
+            i2c_word_write(&mut memory, sda_val as u16);
+            i2c_word_write(&mut memory, (sda_val | scl) as u16);
+            i2c_word_write(&mut memory, sda_val as u16);
+        }
+        i2c_word_write(&mut memory, 0);
+        i2c_word_write(&mut memory, scl as u16);
+        i2c_word_write(&mut memory, 0);
+
+        // Read 8 bits via word reads
+        let mut read_byte = 0u8;
+        for _ in 0..8 {
+            i2c_word_write(&mut memory, 0);
+            i2c_word_write(&mut memory, scl as u16);
+            let word = memory.read_u16(addr);
+            let bit = word & (sda as u16);
+            read_byte = (read_byte << 1) | if bit != 0 { 1 } else { 0 };
+        }
+
+        assert_eq!(read_byte, 0x55, "EEPROM word-access read should return 0x55");
+    }
+
+    #[test]
+    fn sega_mapper_slot0_is_fixed() {
+        let mut rom = vec![0u8; 0x200000];
+        rom[0x000000] = 0xAA;
+        rom[0x080000] = 0xBB;
+
+        let cart = Cartridge::from_bytes(rom).expect("valid cart");
+        let mut memory = MemoryMap::new(cart);
+
+        // Write to mapper reg0 should be ignored
+        memory.write_u16(0xA130F0, 0x0001);
+        assert_eq!(memory.read_u8(0x000000), 0xAA); // still bank 0
     }
 
     #[test]
