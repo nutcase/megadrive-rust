@@ -27,6 +27,8 @@ const REG_DMA_SOURCE_LOW: usize = 21;
 const REG_DMA_SOURCE_MID: usize = 22;
 const REG_DMA_SOURCE_HIGH: usize = 23;
 const STATUS_BASE: u16 = 0x3400;
+const STATUS_FIFO_EMPTY: u16 = 0x0200;
+const STATUS_FIFO_FULL: u16 = 0x0100;
 const STATUS_HBLANK: u16 = 0x0004;
 const STATUS_VBLANK: u16 = 0x0008;
 const STATUS_ODD_FRAME: u16 = 0x0010;
@@ -180,6 +182,10 @@ pub struct Vdp {
     dma_bus_pending: Option<BusDmaRequest>,
     dma_fill_ops: u64,
     dma_copy_ops: u64,
+    /// VDP write FIFO: number of pending entries (0..=4).
+    fifo_count: u8,
+    /// Fractional cycle accumulator for FIFO drain timing.
+    fifo_drain_carry: u64,
     /// Scratch buffer for per-pixel plane metadata (reused across frames).
     render_plane_meta: ScratchBuf<u8>,
     /// Scratch flags for sprite debug rendering options (not serialized).
@@ -257,6 +263,8 @@ impl Vdp {
             dma_bus_pending: None,
             dma_fill_ops: 0,
             dma_copy_ops: 0,
+            fifo_count: 0,
+            fifo_drain_carry: 0,
             render_plane_meta: ScratchBuf(vec![0u8; FRAME_WIDTH * FRAME_HEIGHT]),
             debug_sprite_flags: ScratchBuf(vec![false; 5]),
             render_sprite_filled: ScratchBuf(vec![false; FRAME_WIDTH * FRAME_HEIGHT]),
@@ -305,6 +313,7 @@ impl Vdp {
             let end = self.frame_cycles + advance;
             self.process_scanline_events(start, end);
             self.frame_cycles = end;
+            self.step_fifo(advance);
             self.step_dma(advance);
             remaining -= advance;
 
@@ -395,6 +404,45 @@ impl Vdp {
             || self.dma_bus_pending.is_some()
     }
 
+    /// Returns true when the FIFO is full (4 entries).
+    pub fn fifo_full(&self) -> bool {
+        self.fifo_count >= 4
+    }
+
+    /// Number of CPU wait cycles the 68K should stall if the FIFO was full
+    /// when a data port write occurred.  Returns 0 if not full.
+    pub fn fifo_wait_cycles(&self) -> u32 {
+        // Each FIFO slot drains in ~18 master cycles during active display,
+        // ~8 during blanking.  If full, the CPU stalls until one slot frees.
+        if self.fifo_count >= 4 {
+            if self.vblank_active() || self.hblank_active() { 8 } else { 18 }
+        } else {
+            0
+        }
+    }
+
+    /// Drain FIFO entries based on elapsed cycles.
+    fn step_fifo(&mut self, cycles: u64) {
+        if self.fifo_count == 0 {
+            return;
+        }
+        // Drain rate: ~18 master cycles per slot in active display,
+        // ~8 per slot during blanking.
+        let drain_interval = if self.vblank_active() || self.hblank_active() {
+            8u64
+        } else {
+            18u64
+        };
+        self.fifo_drain_carry += cycles;
+        while self.fifo_drain_carry >= drain_interval && self.fifo_count > 0 {
+            self.fifo_drain_carry -= drain_interval;
+            self.fifo_count -= 1;
+        }
+        if self.fifo_count == 0 {
+            self.fifo_drain_carry = 0;
+        }
+    }
+
     pub fn acknowledge_interrupt(&mut self, level: u8) {
         if level == 6 {
             self.v_interrupt_pending = false;
@@ -415,6 +463,12 @@ impl Vdp {
         }
         if self.interlace_mode_enabled() && (self.frame_count & 1) != 0 {
             status |= STATUS_ODD_FRAME;
+        }
+        if self.fifo_count == 0 {
+            status |= STATUS_FIFO_EMPTY;
+        }
+        if self.fifo_count >= 4 {
+            status |= STATUS_FIFO_FULL;
         }
         if self.dma_busy() {
             status |= STATUS_DMA_BUSY;
@@ -741,6 +795,9 @@ impl Vdp {
 
         self.write_data_value(value);
         self.advance_access_addr();
+        if self.fifo_count < 4 {
+            self.fifo_count += 1;
+        }
     }
 
     fn write_data_value(&mut self, value: u16) {

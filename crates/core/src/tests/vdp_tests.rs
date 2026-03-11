@@ -1946,3 +1946,39 @@ fn shadow_highlight_control_sprite_does_not_occupy_sprite_layer() {
         "normal sprite should render over S/H control sprite"
     );
 }
+
+#[test]
+fn fifo_status_reports_empty_and_full() {
+    let mut vdp = Vdp::default();
+    // Set auto-increment to 2
+    vdp.write_control_port(0x8F02);
+    // Set VRAM write mode
+    vdp.write_control_port(0x4000);
+    vdp.write_control_port(0x0000);
+
+    // Initially FIFO is empty
+    let status = vdp.read_control_port();
+    assert!(status & 0x0200 != 0, "FIFO empty bit should be set initially");
+    assert!(status & 0x0100 == 0, "FIFO full bit should be clear initially");
+
+    // Re-set write mode (read_control_port clears latch)
+    vdp.write_control_port(0x4000);
+    vdp.write_control_port(0x0000);
+
+    // Write 4 words to fill FIFO
+    for i in 0..4u16 {
+        vdp.write_data_port(i);
+    }
+    let status = vdp.read_control_port();
+    assert!(status & 0x0200 == 0, "FIFO empty bit should be clear after writes");
+    assert!(status & 0x0100 != 0, "FIFO full bit should be set after 4 writes");
+
+    // Step enough cycles to drain FIFO (at least 4 * 18 = 72 cycles)
+    vdp.write_control_port(0x4000);
+    vdp.write_control_port(0x0000);
+    vdp.step(100);
+
+    let status = vdp.read_control_port();
+    assert!(status & 0x0200 != 0, "FIFO empty bit should be set after draining");
+    assert!(status & 0x0100 == 0, "FIFO full bit should be clear after draining");
+}

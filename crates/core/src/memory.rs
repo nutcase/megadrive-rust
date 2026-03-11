@@ -432,6 +432,8 @@ impl MemoryMap {
                     self.vdp_data_byte_writes = self.vdp_data_byte_writes.saturating_add(1);
                     self.vdp_data_write_latch = next;
                     if immediate_byte_commit || low_byte_write {
+                        let wait = self.vdp.fifo_wait_cycles();
+                        self.dma_wait_cycles = self.dma_wait_cycles.saturating_add(wait);
                         self.vdp.write_data_port(next);
                     }
                 }
@@ -457,6 +459,9 @@ impl MemoryMap {
                 VdpPort::Data => {
                     self.vdp_data_word_writes = self.vdp_data_word_writes.saturating_add(1);
                     self.vdp_data_write_latch = value;
+                    // Stall CPU if FIFO is full
+                    let wait = self.vdp.fifo_wait_cycles();
+                    self.dma_wait_cycles = self.dma_wait_cycles.saturating_add(wait);
                     self.vdp.write_data_port(value);
                 }
                 VdpPort::Control => {

@@ -4244,3 +4244,43 @@ fn representative_exception_and_privileged_opcodes_do_not_fall_back_to_unknown()
     run_case("line_f", &[0xF000], |_cpu, _memory| {});
     run_case("move_to_sr_imm", &[0x46FC, 0x2700], |_cpu, _memory| {});
 }
+
+#[test]
+fn tas_does_not_write_back_to_memory() {
+    // TAS.B (A0) — opcode 0x4AD0
+    // On real Genesis hardware, TAS reads the byte and sets the N/Z flags,
+    // but the write-back (setting bit 7) does NOT reach external memory.
+    let mut rom = vec![0u8; 0x10400];
+    rom[0x0..0x4].copy_from_slice(&0x00FF_1000u32.to_be_bytes()); // SSP
+    rom[0x4..0x8].copy_from_slice(&0x0000_0100u32.to_be_bytes()); // PC
+
+    // move.l #$00FF0000, a0  (lea work RAM)
+    rom[0x100..0x102].copy_from_slice(&0x207Cu16.to_be_bytes());
+    rom[0x102..0x106].copy_from_slice(&0x00FF_0000u32.to_be_bytes());
+    // tas.b (a0)
+    rom[0x106..0x108].copy_from_slice(&0x4AD0u16.to_be_bytes());
+
+    let cart = Cartridge::from_bytes(rom).expect("valid rom");
+    let mut memory = MemoryMap::new(cart);
+    let mut cpu = M68k::new();
+    cpu.reset(&mut memory);
+
+    // Write a known value to work RAM
+    memory.write_u8(0xFF0000, 0x42);
+
+    // Execute move.l #$00FF0000, a0
+    cpu.step(&mut memory);
+    // Execute tas.b (a0)
+    cpu.step(&mut memory);
+
+    // Memory should NOT be modified (Genesis TAS broken write-back)
+    assert_eq!(
+        memory.read_u8(0xFF0000),
+        0x42,
+        "TAS should not write back to external memory on Genesis"
+    );
+    // Flags should still be set based on the read value (0x42)
+    let sr = cpu.sr();
+    assert!(sr & CCR_Z == 0, "0x42 is not zero");
+    assert!(sr & CCR_N == 0, "bit 7 of 0x42 is not set");
+}

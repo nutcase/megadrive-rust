@@ -2451,7 +2451,10 @@ impl M68k {
         } else {
             let addr = self.resolve_data_alterable_address(mode, reg, 1, memory)?;
             let value = memory.read_u8(addr);
-            memory.write_u8(addr, value | 0x80);
+            // Real Genesis TAS has a broken write cycle on the external bus:
+            // the read-modify-write sequence completes the read but the write
+            // never asserts /LDS+/UDS properly, so memory is NOT updated.
+            // Only register-direct mode (handled above) writes back.
             value
         };
         if mode == 0b000 {
